@@ -1,0 +1,104 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "llama.cpp/Qwen3.6-35B-A3B-APEX-I-Balanced",
+  "provider": {
+    "llama.cpp": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama-server (local, main)",
+      "options": {
+        "baseURL": "http://192.0.2.10:8036/v1",
+        "apiKey": "api-key"
+      },
+      "models": {
+        "Qwen3.6-35B-8037": {
+          "name": "Qwen3.6-35B-8037",
+          "limit": {
+            "context": 240000,
+            "output": 4000
+          },
+          "vision": false
+        },
+        "Qwen3.6-35B-8036": {
+          "name": "Qwen3.6-35B-8036",
+          "limit": {
+            "context":240000,
+            "output": 4000
+          },
+          "vision": false
+        }
+      }
+    },
+    "llama.cpp-vision": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama-server (local, vision)",
+      "options": {
+        "baseURL": "http://192.0.2.10:8038/v1",
+        "apiKey": "api-key"
+      },
+      "models": {
+        "Qwen3.6-35B-A3B-APEX-I-Balanced": {
+          "name": "Qwen3.6-35B-A3B-APEX-I-Balanced",
+          "limit": {
+            "context": 240000,
+            "output": 10000
+          },
+          "vision": true
+        }
+      }
+    },  
+  },
+  "mcp": {
+    "ghidra": {
+      "type": "remote",
+      "url": "http://127.0.0.1:8091/mcp",
+      "enabled": false
+    },
+    "ghidra-headless": {
+     "type": "local",
+       "command": ["uvx", "re-mcp-ghidra"],
+      
+       "environment": {
+         "GHIDRA_INSTALL_DIR": "C\\:\\Users\\User\\Tools\\Ghidra\\ghidra_12.1.2_PUBLIC"
+        },
+        "enabled": false
+      },
+    "relab-web": {
+      "type": "local",
+      "command": ["python", "-m", "relab_web.mcp_server"],
+      "cwd": "C:\\Users\\User\\Dropbox\\Projects2026\\re-lab-web\\backend",
+      "environment": {
+        "RELAB_WEB_MCP_URL": "http://127.0.0.1:8090"
+      },
+      "enabled": true
+    },
+    "firecrawl": {
+      "type": "local",
+      "command": ["npx", "-y", "firecrawl-mcp@3.22.1"],
+      "environment": {
+        "FIRECRAWL_API_KEY": "fc-example-key"
+      },
+      "enabled": false
+    },
+    "pdf-reader": {
+      "type": "local",
+      "command": [
+        "C:\\Users\\User\\.config\\opencode\\mcp\\pdf-reader\\.venv\\Scripts\\python.exe",
+        "server.py"
+      ],
+      "cwd": "C:\\Users\\User\\.config\\opencode\\mcp\\pdf-reader",
+      "enabled": true
+    }
+  },  
+  "permission": { "*": "allow" },
+
+  "compaction": {
+    "auto": true,
+    "prune": true,
+    "reserved": 10000,
+    "model": "llama.cpp-vision/Qwen3.6-35B-A3B-APEX-I-Balanced"
+  },
+
+  "skills": {
+    "paths": ["C:/Users/User/Dropbox/Skills/revised_skills"]
+  }
+}

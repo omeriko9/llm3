@@ -1,0 +1,1987 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LLM3_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Seconds between readiness/shutdown polls. Tests set it to a fraction so the
+# fake backend is not waited on one whole second per iteration.
+QWEN_LLAMA_POLL_SECONDS="${QWEN_LLAMA_POLL_SECONDS:-1}"
+SLOT="${QWEN_LLAMA_SLOT:-slot1}"
+STATE_ROOT="${QWEN_LLAMA_STATE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/qwen_llama}"
+STATE_DIR="${QWEN_LLAMA_STATE_DIR:-}"
+STATE_FILE=""
+DEFAULTS_FILE=""
+PID_FILE=""
+BACKEND_PID_FILE=""
+SERVER_LOG_FILE=""
+TRAFFIC_LOG_FILE=""
+PROXY_LOG_FILE=""
+# Generations of each log kept across launches. A crashing backend gets
+# relaunched fast, so keeping a single .prev.log lost the crash evidence after
+# two more launches. Traffic logs keep fewer generations and are trimmed to
+# their tail first, because they reach hundreds of MB on a busy slot.
+# Opt-in only (QWEN_LLAMA_HIDE_REASONING=1). Tells the proxy to strip
+# reasoning_content from responses. It only has an effect when the backend runs
+# with the think block OPEN, because that is the only case where reasoning is
+# tagged and therefore separable; with thinking off the model emits its
+# reasoning as ordinary content and nothing can reliably distinguish it.
+HIDE_REASONING="${QWEN_LLAMA_HIDE_REASONING:-false}"
+LOG_KEEP="${QWEN_LLAMA_LOG_KEEP:-5}"
+TRAFFIC_KEEP="${QWEN_LLAMA_TRAFFIC_KEEP:-2}"
+TRAFFIC_MAX_MB="${QWEN_LLAMA_TRAFFIC_MAX_MB:-64}"
+
+HOST="${QWEN_LLAMA_HOST:-0.0.0.0}"
+PORT="${QWEN_LLAMA_PORT:-}"
+BACKEND_HOST="${QWEN_LLAMA_BACKEND_HOST:-127.0.0.1}"
+BACKEND_PORT="${QWEN_LLAMA_BACKEND_PORT:-}"
+LLAMA_SERVER_BIN="${QWEN_LLAMA_SERVER:-}"
+DEFAULT_LLAMA_CPP_DIR="${QWEN_LLAMA_SOURCE_DIR:-$HOME/llama.cpp-upstream}"
+UPSTREAM_LLAMA_SERVER_BIN="${QWEN_LLAMA_UPSTREAM_SERVER:-$DEFAULT_LLAMA_CPP_DIR/build/bin/llama-server}"
+MTP_LLAMA_SERVER_BIN="${QWEN_LLAMA_MTP_SERVER:-$UPSTREAM_LLAMA_SERVER_BIN}"
+LLAMA_LAUNCHER_NAME="${QWEN_LLAMA_LAUNCHER_NAME:-llama.cpp}"
+MTP_DRAFT_N_MAX="${QWEN_LLAMA_MTP_DRAFT_N_MAX:-2}"
+# defaults_json() referenced DEFAULT_MTP_DRAFT_N_MAX without it ever being defined, so
+# under `set -u` the whole --defaults-json call died for any slot with no saved defaults
+# file. llm3 swallowed that and silently used its own hardcoded fallback instead.
+DEFAULT_MTP_DRAFT_N_MAX="$MTP_DRAFT_N_MAX"
+MTP_DRAFT_P_MIN="${QWEN_LLAMA_MTP_DRAFT_P_MIN:-0.75}"
+ENV_MTP_DRAFT_N_MAX_SET="${QWEN_LLAMA_MTP_DRAFT_N_MAX+x}"
+ENV_MTP_DRAFT_P_MIN_SET="${QWEN_LLAMA_MTP_DRAFT_P_MIN+x}"
+MTP_DRAFT_FILE=""
+detect_perf_cores() {
+  local value=""
+  value="$(sysctl -n hw.perflevel0.physicalcpu 2>/dev/null || true)"
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  value="$(sysctl -n hw.physicalcpu 2>/dev/null || true)"
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+    return 0
+  fi
+
+  printf '8\n'
+}
+
+PERF_CORES="${QWEN_LLAMA_PERF_CORES:-$(detect_perf_cores)}"
+THREADS="${QWEN_LLAMA_THREADS:-$PERF_CORES}"
+THREADS_BATCH="${QWEN_LLAMA_THREADS_BATCH:-$THREADS}"
+BATCH_SIZE="${QWEN_LLAMA_BATCH_SIZE:-2048}"
+UBATCH_SIZE=""
+GPU_LAYERS="${QWEN_LLAMA_GPU_LAYERS:-999}"
+# Minimum chunk size llama.cpp will KV-shift out of the prompt cache instead of
+# recomputing. Upstream defaults to 0 (= reuse only an exact common prefix), which is
+# the wrong default for agent traffic: agents re-summarise and drop old turns, so their
+# prompts diverge in the MIDDLE and everything downstream gets reprocessed. Measured on
+# slot1 2026-08-20: 503 prompt evals totalling 818 min inside a 3.6 h window (p75 prompt
+# 18,930 tokens, worst single eval 566 s), and decode collapses from ~12 to ~2 tok/s
+# while one runs. Set to 0 to restore upstream behaviour.
+CACHE_REUSE="${QWEN_LLAMA_CACHE_REUSE:-256}"
+# Reuse a slot only for what is plainly the same conversation continuing. See the
+# --slot-prompt-similarity block further down for the measurements behind 0.80.
+SLOT_PROMPT_SIMILARITY="${QWEN_LLAMA_SLOT_PROMPT_SIMILARITY:-0.80}"
+CACHE_TYPE_K="${QWEN_LLAMA_CACHE_TYPE_K:-bf16}"
+CACHE_TYPE_V="${QWEN_LLAMA_CACHE_TYPE_V:-bf16}"
+ENV_CACHE_TYPE_K_SET="${QWEN_LLAMA_CACHE_TYPE_K+x}"
+ENV_CACHE_TYPE_V_SET="${QWEN_LLAMA_CACHE_TYPE_V+x}"
+DEFAULT_CTX_SIZE="${QWEN_LLAMA_CTX_SIZE:-255000}"
+# llama.cpp micro-batch. Bigger is faster for prompt eval in isolation, but a large
+# ubatch is a long non-preemptible Metal command buffer, and while it runs any OTHER
+# llama.cpp process on the same GPU stalls. Measured 2026-08-21 with two slots up:
+# slot1 fell from 10.5 tok/s to 3.7 while slot2 ran a prompt eval. Lower this (256/128)
+# on the slot doing big prompt evals when two models share the GPU.
+DEFAULT_UBATCH_SIZE="${QWEN_LLAMA_UBATCH_SIZE:-512}"
+DEFAULT_PARALLEL="${QWEN_LLAMA_PARALLEL:-1}"
+DEFAULT_ENABLE_THINKING="${QWEN_LLAMA_ENABLE_THINKING:-false}"
+# Thinking-token cap passed to llama-server when thinking is enabled.
+# -1 = unlimited. A finite cap (e.g. 1024) prevents reasoning loops in
+# batch pipelines while keeping brief planning.
+DEFAULT_REASONING_BUDGET="${QWEN_LLAMA_REASONING_BUDGET:--1}"
+# DRY sampler: repetition suppression with far less quality damage than a
+# high repetition_penalty. Maps to llama-server --dry-multiplier 0.8.
+DEFAULT_ENABLE_DRY="${QWEN_LLAMA_ENABLE_DRY:-false}"
+# Per-request context cap for Gemma 4, in tokens. Per parallel slot, like
+# --ctx-size itself; the backend gets ctx x parallel. (It was divided by the
+# parallel count before, which made a 512K request at parallel 2 into 131K.)
+GEMMA4_SAFE_MAX_CONTEXT="${QWEN_LLAMA_GEMMA4_MAX_CONTEXT:-262144}"
+DEFAULT_TINY_GRAMMAR_FILE="${QWEN_LLAMA_TINY_GRAMMAR_FILE:-$HOME/models/grammar/qwen-structured-cot.gbnf}"
+DEFAULT_STRUCTURED_GBNF_FILE="${QWEN_LLAMA_STRUCTURED_GBNF_FILE:-$HOME/models/grammar/qwen3.6-35b-gbnf-structured-cot.gbnf}"
+DEFAULT_TEMPERATURE="${QWEN_LLAMA_TEMPERATURE:-0.6}"
+DEFAULT_TOP_P="${QWEN_LLAMA_TOP_P:-0.95}"
+DEFAULT_TOP_K="${QWEN_LLAMA_TOP_K:-20}"
+DEFAULT_MIN_P="${QWEN_LLAMA_MIN_P:-0.0}"
+DEFAULT_PRESENCE_PENALTY="${QWEN_LLAMA_PRESENCE_PENALTY:-0.0}"
+DEFAULT_REPETITION_PENALTY="${QWEN_LLAMA_REPETITION_PENALTY:-1.0}"
+MMPROJ_OFFLOAD="${QWEN_LLAMA_MMPROJ_OFFLOAD:-true}"
+GRAMMAR_FILE=""
+CHAT_TEMPLATE_FILE=""
+# Set only by --chat-template-file. Kept separate because model_info()/dynamic_model_info()
+# overwrite CHAT_TEMPLATE_FILE from .llm3-hf.json after the arguments are parsed.
+CHAT_TEMPLATE_FILE_OVERRIDE=""
+DEFAULT_ENABLE_TINY_GRAMMAR="false"
+DEFAULT_ENABLE_STRUCTURED_GBNF="false"
+BACKEND_CTX_SIZE=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ~/qwen_llama [--slot slotN] <model> [context_size] [parallel]
+  ~/qwen_llama [--slot slotN] <model> --ctx-size N --parallel N [--ubatch-size N] [--thinking|--no-thinking] [--reasoning-budget N] [--enable-dry|--no-dry] [--mtp-draft-max N] [--temperature F --top-p F --top-k N --min-p F --presence-penalty F --repetition-penalty F] [--grammar-file FNAME|--enable-tiny-grammar|--enable-structured-gbnf|--no-tiny-grammar|--no-structured-gbnf|--no-grammar-file]
+  ~/qwen_llama --list
+  ~/qwen_llama --list-json
+  ~/qwen_llama --defaults-json
+  ~/qwen_llama [--slot slotN] --set-defaults --ctx-size N --parallel N [--ubatch-size N] [--thinking|--no-thinking] [--reasoning-budget N] [--enable-dry|--no-dry] [--mtp-draft-max N] [--temperature F --top-p F --top-k N --min-p F --presence-penalty F --repetition-penalty F] [--enable-tiny-grammar|--enable-structured-gbnf|--no-tiny-grammar|--no-structured-gbnf]
+  ~/qwen_llama [--slot slotN] --status-json
+  ~/qwen_llama [--slot slotN] --stop
+
+Models:
+  qwen-bf16     Qwen3.6 BF16
+  qwen-q8       Qwen3.6 Q8_0
+  qwen-q6       Qwen3.6 UD-Q6_K_XL
+  qwen-mxfp4    Qwen3.6-35B-A3B-MXFP4_MOE
+  gemma4-31b    Gemma 4 31B Q8_0
+
+Environment overrides:
+  QWEN_LLAMA_CTX_SIZE        default context size (default: 255000)
+  QWEN_LLAMA_PARALLEL        default parallel slots (default: 1)
+  QWEN_LLAMA_THREADS         generation threads (default: performance cores)
+  QWEN_LLAMA_THREADS_BATCH   prompt-processing threads (default: threads)
+  QWEN_LLAMA_BATCH_SIZE      llama.cpp batch size (default: 2048)
+  QWEN_LLAMA_UBATCH_SIZE     llama.cpp ubatch size (default: 512; --ubatch-size overrides)
+  QWEN_LLAMA_GPU_LAYERS      GPU layers offloaded to Metal (default: 999)
+  QWEN_LLAMA_CACHE_TYPE_K    KV cache K dtype (default: q8_0 for Qwen 3.6, bf16 otherwise)
+  QWEN_LLAMA_CACHE_TYPE_V    KV cache V dtype (default: q8_0 for Qwen 3.6, bf16 otherwise)
+  QWEN_LLAMA_ENABLE_THINKING true|false (default: false)
+  QWEN_LLAMA_STRUCTURED_GBNF_FILE path to the note-106 structured GBNF grammar
+  QWEN_LLAMA_MTP_DRAFT_N_MAX speculative draft length for MTP models (default: 2)
+  QWEN_LLAMA_MTP_DRAFT_P_MIN speculative minimum probability for MTP models (default: 0.75)
+EOF
+  exit 1
+}
+
+slot_index() {
+  case "$1" in
+    slot[1-9]|slot[1-9][0-9]*)
+      printf '%s\n' "${1#slot}"
+      ;;
+    *)
+      echo "Invalid slot: $1. Use slot1, slot2, slot3, ..." >&2
+      exit 1
+      ;;
+  esac
+}
+
+configure_slot() {
+  local index=""
+  index="$(slot_index "$SLOT")"
+
+  if [ -z "$STATE_DIR" ]; then
+    if [ "$SLOT" = "slot1" ]; then
+      STATE_DIR="$STATE_ROOT"
+    else
+      STATE_DIR="$STATE_ROOT/$SLOT"
+    fi
+  fi
+
+  if [ -z "$PORT" ]; then
+    PORT=$((8036 + index - 1))
+  fi
+  if [ -z "$BACKEND_PORT" ]; then
+    BACKEND_PORT=$((18036 + index - 1))
+  fi
+
+  STATE_FILE="$STATE_DIR/current.json"
+  DEFAULTS_FILE="$STATE_DIR/defaults.json"
+  PID_FILE="$STATE_DIR/llama-proxy.pid"
+  BACKEND_PID_FILE="$STATE_DIR/llama-backend.pid"
+  SERVER_LOG_FILE="$STATE_DIR/llama-server.log"
+  TRAFFIC_LOG_FILE="$STATE_DIR/traffic.log"
+  PROXY_LOG_FILE="$STATE_DIR/proxy.log"
+
+  mkdir -p "$STATE_DIR"
+}
+
+load_defaults() {
+  [ -f "$DEFAULTS_FILE" ] || return 0
+
+  while IFS=$'\t' read -r key value; do
+    case "$key" in
+      ctxSize) if [ -n "$value" ]; then DEFAULT_CTX_SIZE="$value"; fi ;;
+      ubatchSize) if [ -n "$value" ]; then DEFAULT_UBATCH_SIZE="$value"; fi ;;
+      parallel) if [ -n "$value" ]; then DEFAULT_PARALLEL="$value"; fi ;;
+      thinking) if [ -n "$value" ]; then DEFAULT_ENABLE_THINKING="$value"; fi ;;
+      reasoningBudget) if [ -n "$value" ]; then DEFAULT_REASONING_BUDGET="$value"; fi ;;
+      enableDry) if [ -n "$value" ]; then DEFAULT_ENABLE_DRY="$value"; fi ;;
+      mtpDraftMax) if [ -n "$value" ]; then MTP_DRAFT_N_MAX="$value"; ENV_MTP_DRAFT_N_MAX_SET=x; fi ;;
+      enableTinyGrammar) if [ -n "$value" ]; then DEFAULT_ENABLE_TINY_GRAMMAR="$value"; fi ;;
+      enableStructuredGbnf) if [ -n "$value" ]; then DEFAULT_ENABLE_STRUCTURED_GBNF="$value"; fi ;;
+      temperature) if [ -n "$value" ]; then DEFAULT_TEMPERATURE="$value"; fi ;;
+      topP) if [ -n "$value" ]; then DEFAULT_TOP_P="$value"; fi ;;
+      topK) if [ -n "$value" ]; then DEFAULT_TOP_K="$value"; fi ;;
+      minP) if [ -n "$value" ]; then DEFAULT_MIN_P="$value"; fi ;;
+      presencePenalty) if [ -n "$value" ]; then DEFAULT_PRESENCE_PENALTY="$value"; fi ;;
+      repetitionPenalty) if [ -n "$value" ]; then DEFAULT_REPETITION_PENALTY="$value"; fi ;;
+    esac
+  done < <(
+    python3 - <<'PY' "$DEFAULTS_FILE"
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+
+print(f"ctxSize\t{data.get('ctxSize', '')}")
+print(f"parallel\t{data.get('parallel', '')}")
+print(f"thinking\t{str(bool(data.get('thinking', False))).lower()}")
+print(f"reasoningBudget\t{data.get('reasoningBudget', '')}")
+print(f"enableDry\t{str(bool(data.get('enableDry', False))).lower()}")
+print(f"mtpDraftMax\t{data.get('mtpDraftMax', '')}")
+print(f"enableTinyGrammar\t{str(bool(data.get('enableTinyGrammar', False))).lower()}")
+print(f"enableStructuredGbnf\t{str(bool(data.get('enableStructuredGbnf', False))).lower()}")
+print(f"temperature\t{data.get('temperature', '')}")
+print(f"topP\t{data.get('topP', '')}")
+print(f"topK\t{data.get('topK', '')}")
+print(f"minP\t{data.get('minP', '')}")
+print(f"presencePenalty\t{data.get('presencePenalty', '')}")
+print(f"repetitionPenalty\t{data.get('repetitionPenalty', '')}")
+PY
+  )
+}
+
+defaults_json() {
+  # If a defaults file exists, output its content; otherwise output current cached values
+  if [ -f "$DEFAULTS_FILE" ]; then
+    cat "$DEFAULTS_FILE"
+  else
+    cat <<EOF
+{
+  "ctxSize": $DEFAULT_CTX_SIZE,
+  "ubatchSize": $DEFAULT_UBATCH_SIZE,
+  "parallel": $DEFAULT_PARALLEL,
+  "thinking": $DEFAULT_ENABLE_THINKING,
+  "reasoningBudget": $DEFAULT_REASONING_BUDGET,
+  "enableDry": $DEFAULT_ENABLE_DRY,
+  "mtpDraftMax": $DEFAULT_MTP_DRAFT_N_MAX,
+  "enableTinyGrammar": $DEFAULT_ENABLE_TINY_GRAMMAR,
+  "enableStructuredGbnf": $DEFAULT_ENABLE_STRUCTURED_GBNF,
+  "temperature": $DEFAULT_TEMPERATURE,
+  "topP": $DEFAULT_TOP_P,
+  "topK": $DEFAULT_TOP_K,
+  "minP": $DEFAULT_MIN_P,
+  "presencePenalty": $DEFAULT_PRESENCE_PENALTY,
+  "repetitionPenalty": $DEFAULT_REPETITION_PENALTY
+}
+EOF
+  fi
+}
+
+save_defaults() {
+  cat >"$DEFAULTS_FILE" <<EOF
+{
+  "ctxSize": $CTX_SIZE,
+  "ubatchSize": $UBATCH_SIZE,
+  "parallel": $PARALLEL,
+  "thinking": $ENABLE_THINKING,
+  "reasoningBudget": $REASONING_BUDGET,
+  "enableDry": $ENABLE_DRY,
+  "mtpDraftMax": $MTP_DRAFT_N_MAX_VALUE,
+  "enableTinyGrammar": $ENABLE_TINY_GRAMMAR,
+  "enableStructuredGbnf": $ENABLE_STRUCTURED_GBNF,
+  "temperature": $TEMPERATURE,
+  "topP": $TOP_P,
+  "topK": $TOP_K,
+  "minP": $MIN_P,
+  "presencePenalty": $PRESENCE_PENALTY,
+  "repetitionPenalty": $REPETITION_PENALTY
+}
+EOF
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "Missing required command: $1" >&2
+    exit 1
+  }
+}
+
+require_executable() {
+  if [[ "$1" == */* ]]; then
+    [ -x "$1" ] || {
+      echo "Missing required executable: $1" >&2
+      exit 1
+    }
+    return 0
+  fi
+
+  require_cmd "$1"
+}
+
+spawn_detached() {
+  local log_file="$1"
+  shift
+
+  /usr/bin/python3 - "$log_file" "$@" <<'PY'
+import subprocess
+import sys
+
+log_file = sys.argv[1]
+args = sys.argv[2:]
+
+with open("/dev/null", "rb") as stdin, open(log_file, "ab", buffering=0) as log:
+    proc = subprocess.Popen(
+        args,
+        stdin=stdin,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    print(proc.pid)
+PY
+}
+
+format_bytes() {
+  python3 - <<'PY' "$1"
+import sys
+
+value = int(float(sys.argv[1] or 0))
+units = ["B", "KB", "MB", "GB", "TB"]
+amount = float(value)
+index = 0
+while amount >= 1024 and index < len(units) - 1:
+    amount /= 1024
+    index += 1
+print(f"{amount:.2f} {units[index]}" if index else f"{int(amount)} B")
+PY
+}
+
+resolve_dynamic_gguf_file() {
+  local input_path="$1"
+  if [ -f "$input_path" ]; then
+    printf '%s\n' "$input_path"
+    return 0
+  fi
+
+  if [ -d "$input_path" ]; then
+    # Vision projectors ship as mmproj*.gguf or <model>-vision-f16.gguf; neither
+    # is a model, so neither may be picked as one.
+    find "$input_path" -type f -name '*.gguf' \
+      ! -name 'mmproj*.gguf' \
+      ! -iname '*[-_.]vision[-_.]f16.gguf' \
+      ! -iname '*[-_.]vision[-_.]f32.gguf' \
+      ! -iname '*[-_.]vision[-_.]bf16.gguf' \
+      | sort | head -n 1
+    return 0
+  fi
+
+  return 1
+}
+
+load_dynamic_hf_metadata() {
+  python3 - <<'PY' "$1" "$HOME/models/hf"
+import json
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1]).resolve()
+root = Path(sys.argv[2]).resolve()
+current = target.parent if target.is_file() else target
+
+while True:
+    metadata_path = current / ".llm3-hf.json"
+    if metadata_path.exists():
+        try:
+            data = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+        aliases = data.get("aliases") or []
+        if not isinstance(aliases, list):
+            aliases = []
+        chat_template_file = str(data.get("chatTemplateFile") or "").strip()
+        if chat_template_file:
+            chat_template_file = str((current / chat_template_file).resolve())
+        mtp_draft_file = str(data.get("mtpDraftFile") or "").strip()
+        if mtp_draft_file:
+            mtp_draft_file = str((current / mtp_draft_file).resolve())
+        print(f"label\t{data.get('label') or ''}")
+        print(f"family\t{data.get('family') or ''}")
+        print(f"hf_url\t{data.get('hfUrl') or ''}")
+        print(f"chat_template_file\t{chat_template_file}")
+        print(f"mtp_draft_file\t{mtp_draft_file}")
+        print("aliases\t" + ",".join(str(value).strip() for value in aliases if str(value).strip()))
+        raise SystemExit(0)
+    if current == root or current.parent == current or root not in current.parents:
+        break
+    current = current.parent
+
+print("label\t")
+print("family\t")
+print("hf_url\t")
+print("chat_template_file\t")
+print("mtp_draft_file\t")
+print("aliases\t")
+PY
+}
+
+resolve_chat_template_file() {
+  local candidate=""
+  if [ -n "${CHAT_TEMPLATE_FILE_OVERRIDE:-}" ] && [ -f "$CHAT_TEMPLATE_FILE_OVERRIDE" ]; then
+    printf '%s\n' "$CHAT_TEMPLATE_FILE_OVERRIDE"
+    return 0
+  fi
+  if is_gemma4_model; then
+    candidate="$(resolve_gemma4_interleaved_template || true)"
+    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  fi
+  for candidate in \
+    "${CHAT_TEMPLATE_FILE:-}" \
+    "$MODEL_ROOT/.llm3-chat-template.jinja" \
+    "$MODEL_ROOT/chat_template.jinja"
+  do
+    if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+normalize_model_haystack() {
+  printf '%s\n' "$*" \
+    | tr '[:upper:]' '[:lower:]' \
+    | tr '/_.-' '     ' \
+    | tr -s '[:space:]' ' '
+}
+
+looks_like_gemma4() {
+  local normalized=""
+  local compact=""
+
+  normalized="$(normalize_model_haystack "$*")"
+  compact="${normalized// /}"
+
+  [[ "$normalized" == *"gemma 4"* || "$compact" == *"gemma4"* ]]
+}
+
+is_gemma4_model() {
+  looks_like_gemma4 "$MODEL_KEY" "$MODEL_LABEL" "$MODEL_FAMILY" "$MODEL_ALIAS" "$MODEL_FILE" "$MODEL_ROOT"
+}
+
+resolve_server_root_from_binary() {
+  local server_bin="$1"
+  local resolved=""
+  local root=""
+
+  if [ -z "$server_bin" ]; then
+    return 1
+  fi
+
+  if [[ "$server_bin" == */* ]]; then
+    [ -x "$server_bin" ] || return 1
+    resolved="$(cd "$(dirname "$server_bin")" && pwd -P)/$(basename "$server_bin")"
+  else
+    resolved="$(command -v "$server_bin" 2>/dev/null || true)"
+    [ -n "$resolved" ] || return 1
+  fi
+
+  root="$(dirname "$(dirname "$(dirname "$resolved")")")"
+  [ -d "$root" ] || return 1
+
+  printf '%s\n' "$root"
+}
+
+# llama.cpp only treats a gemma4 template as current when it carries its
+# "OpenAI Chat Completions" tool-response section; without it, chat.cpp logs
+# "detected an outdated gemma4 chat template" and pushes tool responses through
+# the convert_tool_responses_gemma4() C++ shim instead of the template's own
+# logic. Upstream ships that section in google-gemma-4-31B-it.jinja but not in
+# the -interleaved variant, and the plain file keeps the same
+# reasoning-between-tool-calls block, so it is a superset. Prefer whichever file
+# actually has the section, and fall back to the first one that exists.
+GEMMA4_TEMPLATE_NAMES="google-gemma-4-31B-it.jinja google-gemma-4-31B-it-interleaved.jinja"
+GEMMA4_TEMPLATE_MARKER='{#- OpenAI Chat Completions:'
+
+resolve_gemma4_interleaved_template() {
+  local candidate=""
+  local root=""
+  local name=""
+  local fallback=""
+  local explicit_fallback=""
+
+  # An explicitly configured llama.cpp checkout wins outright: if the operator
+  # points us at a source tree, its template is the one they mean, whether or
+  # not it carries the marker that identifies an up-to-date upstream copy.
+  if [ -n "${QWEN_LLAMA_SOURCE_DIR:-}" ]; then
+    for name in $GEMMA4_TEMPLATE_NAMES; do
+      candidate="$QWEN_LLAMA_SOURCE_DIR/models/templates/$name"
+      [ -f "$candidate" ] || continue
+      if grep -qF -- "$GEMMA4_TEMPLATE_MARKER" "$candidate" 2>/dev/null; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+      [ -n "$explicit_fallback" ] || explicit_fallback="$candidate"
+    done
+    if [ -n "$explicit_fallback" ]; then
+      printf '%s\n' "$explicit_fallback"
+      return 0
+    fi
+  fi
+
+  for root in \
+    "$(resolve_server_root_from_binary "$LLAMA_SERVER_BIN" || true)" \
+    "$(resolve_server_root_from_binary "$UPSTREAM_LLAMA_SERVER_BIN" || true)" \
+    "$(resolve_server_root_from_binary "$MTP_LLAMA_SERVER_BIN" || true)" \
+    "$DEFAULT_LLAMA_CPP_DIR" \
+    "$LLM3_DIR/vendor/llama.cpp-tq3" \
+    "$LLM3_DIR/vendor/beellama.cpp"
+  do
+    [ -n "$root" ] || continue
+    for name in $GEMMA4_TEMPLATE_NAMES; do
+      candidate="$root/models/templates/$name"
+      [ -f "$candidate" ] || continue
+      if grep -qF -- "$GEMMA4_TEMPLATE_MARKER" "$candidate" 2>/dev/null; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+      [ -n "$fallback" ] || fallback="$candidate"
+    done
+  done
+
+  if [ -n "$fallback" ]; then
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+
+  return 1
+}
+
+dynamic_model_info() {
+  local input_path="$1"
+  local resolved_file=""
+  local metadata=""
+  local meta_label=""
+  local meta_family=""
+  local meta_hf_url=""
+  local meta_chat_template_file=""
+  local meta_mtp_draft_file=""
+  local meta_aliases=""
+  local basename_no_ext=""
+  local size_bytes=""
+
+  resolved_file="$(resolve_dynamic_gguf_file "$input_path")"
+  if [ -z "$resolved_file" ] || [ ! -f "$resolved_file" ]; then
+    echo "Model file not found: $input_path" >&2
+    exit 1
+  fi
+
+  MODEL_FILE="$resolved_file"
+  MODEL_ROOT="$(dirname "$resolved_file")"
+  MODEL_KEY="$resolved_file"
+  basename_no_ext="$(basename "$resolved_file" .gguf)"
+  size_bytes="$(stat -f '%z' "$resolved_file" 2>/dev/null || echo 0)"
+  MODEL_SIZE_LABEL="$(format_bytes "$size_bytes")"
+
+  metadata="$(load_dynamic_hf_metadata "$resolved_file")"
+  while IFS=$'\t' read -r key value; do
+    case "$key" in
+      label) meta_label="$value" ;;
+      family) meta_family="$value" ;;
+      hf_url) meta_hf_url="$value" ;;
+      chat_template_file) meta_chat_template_file="$value" ;;
+      mtp_draft_file) meta_mtp_draft_file="$value" ;;
+      aliases) meta_aliases="$value" ;;
+    esac
+  done <<EOF
+$metadata
+EOF
+
+  MODEL_LABEL="${meta_label:-$basename_no_ext}"
+  MODEL_FAMILY="${meta_family:-Downloaded GGUF}"
+  if [ "$MODEL_FAMILY" = "Gemma" ] && looks_like_gemma4 "$basename_no_ext" "$meta_aliases" "$meta_hf_url"; then
+    MODEL_FAMILY="Gemma 4"
+  fi
+  MODEL_HF_URL="${meta_hf_url:-}"
+  CHAT_TEMPLATE_FILE="${meta_chat_template_file:-}"
+  MTP_DRAFT_FILE="${meta_mtp_draft_file:-}"
+  MODEL_ALIAS="$basename_no_ext"
+  if [ -n "$meta_aliases" ]; then
+    MODEL_ALIAS="$MODEL_ALIAS,$meta_aliases"
+  fi
+}
+
+is_positive_int() {
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;
+    0) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+kill_pid() {
+  local pid="$1"
+  local i
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+
+  kill "$pid" 2>/dev/null || true
+  for i in $(seq 1 30); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+    sleep "$QWEN_LLAMA_POLL_SECONDS"
+  done
+
+  kill -9 "$pid" 2>/dev/null || true
+}
+
+model_info() {
+  local key="$1"
+  CHAT_TEMPLATE_FILE=""
+  MTP_DRAFT_FILE=""
+
+  if [ -f "$key" ] || [ -d "$key" ]; then
+    dynamic_model_info "$key"
+    return 0
+  fi
+
+  case "$key" in
+    qwen-bf16)
+      MODEL_KEY="$key"
+      MODEL_LABEL="Qwen 3.6 BF16"
+      MODEL_ROOT="$HOME/models/qwen36-bf16"
+      MODEL_FILE="$MODEL_ROOT/BF16/Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf"
+      MODEL_ALIAS="qwen36-bf16,Qwen3.6-35B-A3B-BF16"
+      MODEL_HF_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF"
+      MODEL_SIZE_LABEL="64.60 GiB"
+      MODEL_FAMILY="Qwen 3.6"
+      ;;
+    qwen-q8)
+      MODEL_KEY="$key"
+      MODEL_LABEL="Qwen 3.6 Q8_0"
+      MODEL_ROOT="$HOME/models/qwen36-q8"
+      MODEL_FILE="$MODEL_ROOT/Qwen3.6-35B-A3B-Q8_0.gguf"
+      MODEL_ALIAS="qwen36-q8,Qwen3.6-35B-A3B-Q8_0"
+      MODEL_HF_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF"
+      MODEL_SIZE_LABEL="35.82 GiB"
+      MODEL_FAMILY="Qwen 3.6"
+      ;;
+    qwen-q6)
+      MODEL_KEY="$key"
+      MODEL_LABEL="Qwen 3.6 UD-Q6_K_XL"
+      MODEL_ROOT="$HOME/models/qwen36-q6"
+      MODEL_FILE="$MODEL_ROOT/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf"
+      MODEL_ALIAS="qwen36-q6,Qwen3.6-35B-A3B-UD-Q6_K_XL"
+      MODEL_HF_URL="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF"
+      MODEL_SIZE_LABEL="29.21 GiB"
+      MODEL_FAMILY="Qwen 3.6"
+      ;;
+    qwen-mxfp4)
+      MODEL_KEY="$key"
+      MODEL_LABEL="Qwen 3.6 MXFP4_MOE"
+      MODEL_ROOT="$HOME/models/qwen36-mxfp4"
+      MODEL_FILE="$MODEL_ROOT/Qwen3.6-35B-A3B-MXFP4_MOE.gguf"
+      MODEL_ALIAS="qwen36-mxfp4,Qwen3.6-35B-A3B-MXFP4_MOE"
+      MODEL_HF_URL="https://huggingface.co/noctrex/Qwen3.6-35B-A3B-MXFP4_MOE-GGUF"
+      MODEL_SIZE_LABEL="18.88 GiB"
+      MODEL_FAMILY="Qwen 3.6"
+      ;;
+    gemma4-31b|gemma)
+      MODEL_KEY="gemma4-31b"
+      MODEL_LABEL="Gemma 4 31B Q8_0"
+      MODEL_ROOT="$HOME/models/gemma4-31b-q8"
+      MODEL_FILE="$MODEL_ROOT/gemma-4-31B-it-Q8_0.gguf"
+      MODEL_ALIAS="gemma4-31b,gemma-4-31B-it-Q8_0"
+      MODEL_HF_URL="https://huggingface.co/unsloth/gemma-4-31B-it-GGUF"
+      MODEL_SIZE_LABEL="32.64 GiB"
+      MODEL_FAMILY="Gemma 4"
+      ;;
+    *)
+      echo "Unknown model: $key" >&2
+      usage
+      ;;
+  esac
+
+  if [ ! -f "$MODEL_FILE" ]; then
+    echo "Model file not found: $MODEL_FILE" >&2
+    exit 1
+  fi
+}
+
+supports_tiny_grammar() {
+  local haystack=""
+  haystack="$(printf '%s %s %s' "$MODEL_LABEL" "$MODEL_FAMILY" "$MODEL_ALIAS" | tr '[:upper:]' '[:lower:]')"
+  case "$haystack" in
+    *qwen*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_qwen38_model() {
+  local haystack=""
+  haystack="$(printf '%s %s %s %s %s' "$MODEL_KEY" "$MODEL_LABEL" "$MODEL_FAMILY" "$MODEL_ALIAS" "$MODEL_FILE" | tr '[:upper:]' '[:lower:]')"
+  case "$haystack" in
+    *qwen*3.8*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+is_qwen38_dense_model() {
+  local haystack=""
+  haystack="$(printf '%s %s %s %s %s' "$MODEL_KEY" "$MODEL_LABEL" "$MODEL_FAMILY" "$MODEL_ALIAS" "$MODEL_FILE" | tr '[:upper:]' '[:lower:]')"
+  case "$haystack" in
+    *a3b*|*moe*)
+      return 1
+      ;;
+    *qwen*3.8*27b*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+supports_structured_gbnf() {
+  local haystack=""
+  haystack="$(printf '%s %s %s %s %s' "$MODEL_KEY" "$MODEL_LABEL" "$MODEL_FAMILY" "$MODEL_ALIAS" "$MODEL_FILE" | tr '[:upper:]' '[:lower:]')"
+  case "$haystack" in
+    *qwen*3.6*35b*|*qwen*3.6*a3b*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+resolve_gemma4_mtp_stem() {
+  python3 - <<'PY' "$MODEL_FILE"
+import os
+import re
+import sys
+
+name = os.path.basename(sys.argv[1] or "").strip()
+if not name.lower().endswith(".gguf"):
+    raise SystemExit(0)
+
+stem = re.sub(r"\.gguf$", "", name, flags=re.IGNORECASE)
+stem = re.sub(r"-qat(?=-|$)", "", stem, flags=re.IGNORECASE)
+stem = re.sub(r"-(?:UD-[A-Z0-9_]+|IQ\d+[A-Z0-9_]*|Q\d+[A-Z0-9_]*|BF16|F16|FLOAT16)$", "", stem, flags=re.IGNORECASE)
+
+if re.match(r"^gemma-4-.*-it$", stem, flags=re.IGNORECASE):
+    print(stem)
+PY
+}
+
+find_mtp_draft() {
+  local candidate=""
+  local stem=""
+
+  if [ -n "$MTP_DRAFT_FILE" ] && [ -f "$MTP_DRAFT_FILE" ]; then
+    printf '%s\n' "$MTP_DRAFT_FILE"
+    return 0
+  fi
+
+  if is_gemma4_model; then
+    stem="$(resolve_gemma4_mtp_stem || true)"
+    if [ -n "$stem" ]; then
+      for candidate in \
+        "$MODEL_ROOT/mtp-${stem}.gguf" \
+        "$MODEL_ROOT/MTP/${stem}-Q8_0-MTP.gguf" \
+        "$MODEL_ROOT/MTP/${stem}-BF16-MTP.gguf" \
+        "$MODEL_ROOT/MTP/${stem}-F16-MTP.gguf" \
+        "$MODEL_ROOT/MTP/${stem}-MTP-Q8_0.gguf" \
+        "$MODEL_ROOT/MTP/${stem}-MTP-BF16.gguf" \
+        "$MODEL_ROOT/MTP/${stem}-MTP-F16.gguf"
+      do
+        if [ -f "$candidate" ]; then
+          printf '%s\n' "$candidate"
+          return 0
+        fi
+      done
+    fi
+  fi
+
+  candidate="$(find "$MODEL_ROOT" -type f -name '*.gguf' ! -name 'mmproj*.gguf' 2>/dev/null | rg '/MTP/|/.*-MTP-.*\\.gguf$' | sort | head -n 1 || true)"
+  if [ -n "$candidate" ] && [ -f "$candidate" ]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  return 1
+}
+
+# Reads the GGUF's own metadata for an embedded MTP head. This is the only
+# reliable signal: Qwen3.8 ships nextn tensors without "MTP" anywhere in the
+# file name, so a name-based check misses it and the head goes unused.
+# Echoes yes | no | unknown ("unknown" = could not inspect, decide some other way).
+inspect_gguf_mtp() {
+  local stamp="" key="" cache_dir="" cache_path="" result=""
+
+  [ -f "$MODEL_FILE" ] || { printf 'unknown\n'; return 0; }
+  [ -d "$DEFAULT_LLAMA_CPP_DIR/gguf-py" ] || { printf 'unknown\n'; return 0; }
+
+  # Reading the tensor index off a multi-GB GGUF costs ~4.5s, which would be
+  # paid on every launch, so the verdict is cached against size+mtime.
+  stamp="$(stat -f '%z-%m' "$MODEL_FILE" 2>/dev/null || stat -c '%s-%Y' "$MODEL_FILE" 2>/dev/null || printf '')"
+  if [ -n "$stamp" ]; then
+    key="$(printf '%s|%s' "$MODEL_FILE" "$stamp" | shasum -a 256 2>/dev/null | cut -c1-32)"
+    cache_dir="$STATE_ROOT/mtp-detect"
+    cache_path="$cache_dir/$key"
+    if [ -n "$key" ] && [ -f "$cache_path" ]; then
+      result="$(cat "$cache_path" 2>/dev/null || printf '')"
+      case "$result" in
+        yes|no) printf '%s\n' "$result"; return 0 ;;
+      esac
+    fi
+  fi
+
+  result="$(
+    python3 - "$MODEL_FILE" "$DEFAULT_LLAMA_CPP_DIR/gguf-py" <<'PY'
+import sys
+from pathlib import Path
+
+model_path = Path(sys.argv[1]).expanduser()
+gguf_py_path = Path(sys.argv[2]).expanduser()
+sys.path.insert(0, str(gguf_py_path))
+
+try:
+    from gguf import GGUFReader
+except Exception:
+    print("unknown")
+    raise SystemExit(0)
+
+try:
+    reader = GGUFReader(str(model_path))
+except Exception:
+    print("unknown")
+    raise SystemExit(0)
+
+mtp_field = False
+for field in reader.fields:
+    name = str(field)
+    if "nextn_predict_layers" in name:
+        mtp_field = True
+        break
+
+mtp_tensors = any("nextn" in tensor.name.lower() or "mtp" in tensor.name.lower() for tensor in reader.tensors)
+print("yes" if mtp_field or mtp_tensors else "no")
+PY
+  )"
+
+  case "$result" in
+    yes|no)
+      if [ -n "$cache_path" ]; then
+        mkdir -p "$cache_dir" 2>/dev/null || true
+        printf '%s' "$result" > "$cache_path" 2>/dev/null || true
+      fi
+      printf '%s\n' "$result"
+      ;;
+    *)
+      printf 'unknown\n'
+      ;;
+  esac
+}
+
+# Set by is_mtp_model: "draft" (separate drafter file), "embedded" (head inside
+# the GGUF) or "name" (guessed from the file name, unverified).
+MTP_DETECT_SOURCE=""
+MTP_DETECT_RESULT=""
+
+is_mtp_model() {
+  local haystack=""
+  local inspect_result=""
+
+  # Memoised: is_mtp_model is consulted several times per launch.
+  if [ -n "$MTP_DETECT_RESULT" ]; then
+    [ "$MTP_DETECT_RESULT" = "yes" ] && return 0
+    return 1
+  fi
+
+  if find_mtp_draft >/dev/null 2>&1; then
+    MTP_DETECT_SOURCE="draft"
+    MTP_DETECT_RESULT="yes"
+    return 0
+  fi
+
+  inspect_result="$(inspect_gguf_mtp)"
+  case "$inspect_result" in
+    yes)
+      MTP_DETECT_SOURCE="embedded"
+      MTP_DETECT_RESULT="yes"
+      return 0
+      ;;
+    no)
+      MTP_DETECT_SOURCE=""
+      MTP_DETECT_RESULT="no"
+      return 1
+      ;;
+  esac
+
+  # Inspection unavailable (no gguf-py, unreadable file): fall back to the name.
+  haystack="$(printf '%s %s %s %s' "$MODEL_KEY" "$MODEL_LABEL" "$MODEL_ALIAS" "$MODEL_FILE" | tr '[:upper:]' '[:lower:]')"
+  case "$haystack" in
+    *mtp*)
+      MTP_DETECT_SOURCE="name"
+      MTP_DETECT_RESULT="yes"
+      return 0
+      ;;
+    *)
+      MTP_DETECT_SOURCE=""
+      MTP_DETECT_RESULT="no"
+      return 1
+      ;;
+  esac
+}
+
+llama_server_supports_flag() {
+  local server_bin="$1"
+  local flag="$2"
+
+  [ -n "$server_bin" ] || return 1
+  if [[ "$server_bin" == */* ]] && [ ! -x "$server_bin" ]; then
+    return 1
+  fi
+
+  "$server_bin" --help 2>/dev/null | grep -F -- "$flag" >/dev/null 2>&1
+}
+
+llama_server_supports_mtp() {
+  local server_bin="$1"
+  local help_text=""
+  [ -n "$server_bin" ] || return 1
+  if [[ "$server_bin" == */* ]] && [ ! -x "$server_bin" ]; then
+    return 1
+  fi
+
+  help_text="$("$server_bin" --help 2>/dev/null || true)"
+  [[ "$help_text" == *"draft-mtp"* ]] || [[ "$help_text" == *"[none|mtp|"* ]]
+}
+
+llama_server_mtp_spec_type() {
+  local server_bin="$1"
+  local help_text=""
+  [ -n "$server_bin" ] || return 1
+  if [[ "$server_bin" == */* ]] && [ ! -x "$server_bin" ]; then
+    return 1
+  fi
+
+  help_text="$("$server_bin" --help 2>/dev/null || true)"
+  if [[ "$help_text" == *"draft-mtp"* ]]; then
+    printf 'draft-mtp\n'
+    return 0
+  fi
+  if [[ "$help_text" == *"[none|mtp|"* ]]; then
+    printf 'mtp\n'
+    return 0
+  fi
+  return 1
+}
+
+print_model_row() {
+  local key="$1"
+  model_info "$key"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$MODEL_KEY" \
+    "$MODEL_LABEL" \
+    "$MODEL_FILE" \
+    "$MODEL_HF_URL" \
+    "$MODEL_SIZE_LABEL" \
+    "$MODEL_FAMILY" \
+    "$MODEL_ALIAS"
+}
+
+print_model_row_if_available() {
+  local key="$1"
+  (
+    print_model_row "$key" 2>/dev/null
+  ) || true
+}
+
+list_models() {
+  cat <<'EOF'
+qwen-bf16     -> ~/models/qwen36-bf16/BF16/Qwen3.6-35B-A3B-BF16-00001-of-00002.gguf
+qwen-q8       -> ~/models/qwen36-q8/Qwen3.6-35B-A3B-Q8_0.gguf
+qwen-q6       -> ~/models/qwen36-q6/Qwen3.6-35B-A3B-UD-Q6_K_XL.gguf
+qwen-mxfp4    -> ~/models/qwen36-mxfp4/Qwen3.6-35B-A3B-MXFP4_MOE.gguf
+gemma4-31b    -> ~/models/gemma4-31b-q8/gemma-4-31B-it-Q8_0.gguf
+EOF
+}
+
+list_models_json() {
+  {
+    print_model_row_if_available qwen-bf16
+    print_model_row_if_available qwen-q8
+    print_model_row_if_available qwen-q6
+    print_model_row_if_available qwen-mxfp4
+    print_model_row_if_available gemma4-31b
+  } | python3 -c '
+import json
+import sys
+
+rows = []
+for raw in sys.stdin:
+    raw = raw.rstrip("\n")
+    if not raw:
+        continue
+    key, label, path, hf_url, size_label, family, alias = raw.split("\t")
+    rows.append(
+        {
+            "key": key,
+            "label": label,
+            "path": path,
+            "hfUrl": hf_url,
+            "sizeLabel": size_label,
+            "family": family,
+            "aliases": alias.split(","),
+        }
+    )
+print(json.dumps(rows, indent=2))
+'
+}
+
+find_mmproj() {
+  python3 - <<'PY' "$1" "$2" "$HOME/models"
+import re
+import sys
+from pathlib import Path
+
+model_file = Path(sys.argv[1]).expanduser().resolve()
+model_root = Path(sys.argv[2]).expanduser().resolve()
+models_root = Path(sys.argv[3]).expanduser().resolve()
+
+preferred_names = ("mmproj-F16.gguf", "mmproj-BF16.gguf", "mmproj-F32.gguf")
+search_dirs = []
+
+
+# Keep in step with isVisionProjectorFile in src/server.js. Repos also ship the
+# projector as "<model>-vision-f16.gguf"; anchoring on the float type keeps this
+# from swallowing an actual vision-LLM's quantized weights.
+def is_projector(name: str) -> bool:
+    lowered = name.lower()
+    if not lowered.endswith(".gguf"):
+        return False
+    if "mmproj" in lowered:
+        return True
+    return bool(re.search(r"(^|[-_.])(vision|clip|projector)[-_.](f16|f32|bf16|fp16|fp32)\.gguf$", lowered))
+
+def add_dir(value: Path) -> None:
+    try:
+        resolved = value.resolve()
+    except Exception:
+        resolved = value
+    if resolved.is_dir() and resolved not in search_dirs:
+        search_dirs.append(resolved)
+
+for candidate in (model_file.parent, model_root):
+    add_dir(candidate)
+
+current = model_file.parent
+while True:
+    add_dir(current)
+    if current == current.parent or current == models_root:
+        break
+    if models_root not in current.parents and current != models_root:
+        break
+    current = current.parent
+
+for directory in search_dirs:
+    for name in preferred_names:
+        candidate = directory / name
+        if candidate.is_file():
+            print(candidate)
+            raise SystemExit(0)
+
+    wildcard_matches = sorted(
+        (
+            entry for entry in directory.iterdir()
+            if entry.is_file() and is_projector(entry.name)
+        ),
+        key=lambda entry: (entry.name.lower(), entry.stat().st_size),
+    )
+    if wildcard_matches:
+        print(wildcard_matches[0])
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+}
+
+# Rotate FILE through KEEP generations. Generation 1 stays at the historical
+# name <base>.prev.log so existing tooling and habits keep working; older ones
+# are <base>.prev.2.log ... <base>.prev.<KEEP>.log.
+rotate_log() {
+  local file="$1" keep="${2:-5}" base i src dst
+  [ -n "$file" ] || return 0
+  base="${file%.log}"
+  if [ "$keep" -lt 1 ]; then
+    : >"$file"
+    return 0
+  fi
+  rm -f "${base}.prev.${keep}.log" 2>/dev/null || :
+  i="$keep"
+  while [ "$i" -ge 3 ]; do
+    src="${base}.prev.$((i - 1)).log"
+    dst="${base}.prev.${i}.log"
+    if [ -f "$src" ]; then mv -f "$src" "$dst" 2>/dev/null || :; fi
+    i=$((i - 1))
+  done
+  if [ -f "${base}.prev.log" ]; then
+    mv -f "${base}.prev.log" "${base}.prev.2.log" 2>/dev/null || :
+  fi
+  if [ -s "$file" ]; then
+    mv -f "$file" "${base}.prev.log" 2>/dev/null || :
+  fi
+  : >"$file"
+}
+
+# Keep only the last MAX_MB of FILE, so rotating a huge traffic log does not
+# multiply hundreds of MB across generations.
+trim_log_tail() {
+  local file="$1" max_mb="${2:-64}" limit size
+  [ -f "$file" ] || return 0
+  [ "$max_mb" -gt 0 ] || return 0
+  limit=$((max_mb * 1024 * 1024))
+  size=$(wc -c <"$file" 2>/dev/null | tr -d ' ')
+  [ -n "$size" ] || return 0
+  if [ "$size" -gt "$limit" ]; then
+    if tail -c "$limit" "$file" >"${file}.trim" 2>/dev/null; then
+      mv -f "${file}.trim" "$file" 2>/dev/null || rm -f "${file}.trim" 2>/dev/null || :
+    else
+      rm -f "${file}.trim" 2>/dev/null || :
+    fi
+  fi
+}
+
+clear_runtime_files() {
+  # Rotate instead of truncate: backends die by Metal SIGABRT with no other
+  # trace, and the previous logs are the only crash evidence. Keep several
+  # generations -- a crash loop relaunches fast, and a single .prev.log was
+  # overwritten before anyone could read it.
+  rotate_log "$SERVER_LOG_FILE" "$LOG_KEEP"
+  trim_log_tail "$TRAFFIC_LOG_FILE" "$TRAFFIC_MAX_MB"
+  rotate_log "$TRAFFIC_LOG_FILE" "$TRAFFIC_KEEP"
+  rotate_log "$PROXY_LOG_FILE" "$LOG_KEEP"
+}
+
+remove_runtime_state() {
+  rm -f "$PID_FILE" "$BACKEND_PID_FILE" "$STATE_FILE"
+}
+
+kill_known_listener() {
+  local port="$1"
+  local pid=""
+  local port_cmd=""
+
+  if ! command -v lsof >/dev/null 2>&1; then
+    return 0
+  fi
+
+  pid="$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | head -n 1 || true)"
+  if [ -z "$pid" ]; then
+    return 0
+  fi
+
+  port_cmd="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  case "$port_cmd" in
+    *llama-server*|*qwen_llama*|*BaseHTTPRequestHandler*|*ThreadingHTTPServer*)
+      kill_pid "$pid"
+      ;;
+    '')
+      ;;
+    *)
+      echo "Port $port is already in use by PID $pid: $port_cmd" >&2
+      exit 1
+      ;;
+  esac
+}
+
+stop_previous_server() {
+  local old_pid=""
+  local backend_pid=""
+
+  if [ -f "$PID_FILE" ]; then
+    old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+      echo "Stopping previous llm proxy PID $old_pid..."
+      kill_pid "$old_pid"
+    fi
+  fi
+
+  if [ -f "$BACKEND_PID_FILE" ]; then
+    backend_pid="$(cat "$BACKEND_PID_FILE" 2>/dev/null || true)"
+    if [ -n "$backend_pid" ] && kill -0 "$backend_pid" 2>/dev/null; then
+      echo "Stopping previous llama-server PID $backend_pid..."
+      kill_pid "$backend_pid"
+    fi
+  fi
+
+  kill_known_listener "$PORT"
+  kill_known_listener "$BACKEND_PORT"
+  remove_runtime_state
+}
+
+write_state_file() {
+  local proxy_pid="$1"
+  local backend_pid="$2"
+  local mmproj="$3"
+  local mmproj_json="null"
+  local aliases_json=""
+
+  if [ -n "$mmproj" ]; then
+    mmproj_json="\"$mmproj\""
+  fi
+
+  aliases_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1].split(",")))' "$MODEL_ALIAS")"
+
+  cat >"$STATE_FILE" <<EOF
+{
+  "running": true,
+  "slot": "$SLOT",
+  "model": {
+    "key": "$MODEL_KEY",
+    "label": "$MODEL_LABEL",
+    "launcher": "$LLAMA_LAUNCHER_NAME",
+    "runtime": "gguf",
+    "family": "$MODEL_FAMILY",
+    "path": "$MODEL_FILE",
+    "hfUrl": "$MODEL_HF_URL",
+    "sizeLabel": "$MODEL_SIZE_LABEL",
+    "aliases": $aliases_json
+  },
+  "params": {
+    "ctxSize": $CTX_SIZE,
+    "backendCtxSize": $BACKEND_CTX_SIZE,
+    "parallel": $PARALLEL,
+    "thinking": $ENABLE_THINKING,
+    "reasoningBudget": $REASONING_BUDGET,
+    "enableDry": $ENABLE_DRY,
+    "mtpDraftMax": $MTP_DRAFT_N_MAX_VALUE,
+    "enableTinyGrammar": $ENABLE_TINY_GRAMMAR,
+    "enableStructuredGbnf": $ENABLE_STRUCTURED_GBNF,
+    "temperature": $TEMPERATURE,
+    "topP": $TOP_P,
+    "topK": $TOP_K,
+    "minP": $MIN_P,
+    "presencePenalty": $PRESENCE_PENALTY,
+    "repetitionPenalty": $REPETITION_PENALTY,
+    "threads": $THREADS,
+    "threadsBatch": $THREADS_BATCH,
+    "batchSize": $BATCH_SIZE,
+    "ubatchSize": $UBATCH_SIZE,
+    "gpuLayers": $GPU_LAYERS,
+    "cacheTypeK": "$CACHE_TYPE_K",
+    "cacheTypeV": "$CACHE_TYPE_V"
+  },
+  "network": {
+    "publicHost": "$HOST",
+    "publicPort": $PORT,
+    "backendHost": "$BACKEND_HOST",
+    "backendPort": $BACKEND_PORT
+  },
+  "logs": {
+    "server": "$SERVER_LOG_FILE",
+    "traffic": "$TRAFFIC_LOG_FILE",
+    "proxy": "$PROXY_LOG_FILE"
+  },
+  "mmproj": $mmproj_json,
+  "pids": {
+    "proxy": $proxy_pid,
+    "backend": $backend_pid
+  },
+  "startedAt": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+}
+EOF
+}
+
+status_json() {
+  python3 - <<'PY' "$STATE_FILE" "$PID_FILE" "$BACKEND_PID_FILE"
+import json
+import os
+import signal
+import sys
+from pathlib import Path
+
+state_path = Path(sys.argv[1])
+proxy_pid_path = Path(sys.argv[2])
+backend_pid_path = Path(sys.argv[3])
+
+def pid_alive(value):
+    try:
+        os.kill(value, 0)
+    except Exception:
+        return False
+    return True
+
+if not state_path.exists():
+    print(json.dumps({"running": False}, indent=2))
+    raise SystemExit(0)
+
+data = json.loads(state_path.read_text())
+proxy_pid = data.get("pids", {}).get("proxy")
+backend_pid = data.get("pids", {}).get("backend")
+running = bool(proxy_pid and backend_pid and pid_alive(proxy_pid) and pid_alive(backend_pid))
+data["running"] = running
+
+if not running:
+    for path in (proxy_pid_path, backend_pid_path, state_path):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    print(json.dumps({"running": False}, indent=2))
+else:
+    print(json.dumps(data, indent=2))
+PY
+}
+
+start_proxy() {
+  # The public-port proxy lives in src/slot-api-proxy.py (shared with the optiq
+  # launcher). It reads its configuration from the QWEN_PROXY_* environment.
+  local proxy_pid=""
+  local proxy_script="$LLM3_DIR/src/slot-api-proxy.py"
+  if [[ ! -f "$proxy_script" ]]; then
+    echo "Missing proxy script $proxy_script" >&2
+    return 1
+  fi
+
+  proxy_pid="$(spawn_detached "$PROXY_LOG_FILE" \
+    env \
+      QWEN_PROXY_HOST="$HOST" \
+      QWEN_PROXY_PORT="$PORT" \
+      QWEN_PROXY_TARGET_HOST="$BACKEND_HOST" \
+      QWEN_PROXY_TARGET_PORT="$BACKEND_PORT" \
+      QWEN_PROXY_LOG="$TRAFFIC_LOG_FILE" \
+      QWEN_PROXY_DEFAULT_TEMPERATURE="$TEMPERATURE" \
+      QWEN_PROXY_DEFAULT_TOP_P="$TOP_P" \
+      QWEN_PROXY_DEFAULT_TOP_K="$TOP_K" \
+      QWEN_PROXY_DEFAULT_MIN_P="$MIN_P" \
+      QWEN_PROXY_DEFAULT_PRESENCE_PENALTY="$PRESENCE_PENALTY" \
+      QWEN_PROXY_DEFAULT_REPETITION_PENALTY="$REPETITION_PENALTY" \
+      QWEN_PROXY_HIDE_REASONING="${HIDE_REASONING:-false}" \
+      QWEN_PROXY_MAX_CAPTURE="${QWEN_LLAMA_MAX_CAPTURE:-}" \
+      python3 -u "$proxy_script")"
+  echo "$proxy_pid" >"$PID_FILE"
+  printf '%s\n' "$proxy_pid"
+}
+
+MODEL_KEY=""
+CTX_SIZE=""
+PARALLEL=""
+ENABLE_THINKING=""
+REASONING_BUDGET=""
+ENABLE_DRY=""
+ENABLE_TINY_GRAMMAR=""
+ENABLE_STRUCTURED_GBNF=""
+TEMPERATURE=""
+TOP_P=""
+TOP_K=""
+MIN_P=""
+PRESENCE_PENALTY=""
+REPETITION_PENALTY=""
+THINKING_EXPLICIT=0
+NO_MMPROJ=0
+POSITIONAL_INDEX=0
+MODE="start"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      usage
+      ;;
+    -l|--list)
+      list_models
+      exit 0
+      ;;
+    --list-json)
+      list_models_json
+      exit 0
+      ;;
+    --defaults-json)
+      MODE="defaults-json"
+      ;;
+    --set-defaults|--set-default)
+      MODE="set-defaults"
+      ;;
+    --status-json)
+      MODE="status-json"
+      ;;
+    --slot)
+      shift
+      [ "$#" -gt 0 ] || usage
+      SLOT="$1"
+      ;;
+    --stop)
+      MODE="stop"
+      ;;
+    --ctx-size)
+      shift
+      [ "$#" -gt 0 ] || usage
+      CTX_SIZE="$1"
+      ;;
+    --parallel)
+      shift
+      [ "$#" -gt 0 ] || usage
+      PARALLEL="$1"
+      ;;
+    --temperature)
+      shift
+      [ "$#" -gt 0 ] || usage
+      TEMPERATURE="$1"
+      ;;
+    --top-p)
+      shift
+      [ "$#" -gt 0 ] || usage
+      TOP_P="$1"
+      ;;
+    --top-k)
+      shift
+      [ "$#" -gt 0 ] || usage
+      TOP_K="$1"
+      ;;
+    --min-p)
+      shift
+      [ "$#" -gt 0 ] || usage
+      MIN_P="$1"
+      ;;
+    --presence-penalty)
+      shift
+      [ "$#" -gt 0 ] || usage
+      PRESENCE_PENALTY="$1"
+      ;;
+    --repetition-penalty)
+      shift
+      [ "$#" -gt 0 ] || usage
+      REPETITION_PENALTY="$1"
+      ;;
+    --thinking)
+      ENABLE_THINKING=true
+      THINKING_EXPLICIT=1
+      ;;
+    --no-thinking)
+      ENABLE_THINKING=false
+      THINKING_EXPLICIT=1
+      ;;
+    --reasoning-budget)
+      shift
+      [ "$#" -gt 0 ] || usage
+      REASONING_BUDGET="$1"
+      ;;
+    --enable-dry)
+      ENABLE_DRY=true
+      ;;
+    --no-dry)
+      ENABLE_DRY=false
+      ;;
+    --ubatch-size)
+      shift
+      [ "$#" -gt 0 ] || usage
+      UBATCH_SIZE="$1"
+      ;;
+    --mtp-draft-max)
+      shift
+      [ "$#" -gt 0 ] || usage
+      MTP_DRAFT_N_MAX="$1"
+      ENV_MTP_DRAFT_N_MAX_SET=x
+      ;;
+    --chat-template-file)
+      shift
+      [ "$#" -gt 0 ] || usage
+      CHAT_TEMPLATE_FILE_OVERRIDE="$1"
+      ;;
+    --grammar-file)
+      shift
+      [ "$#" -gt 0 ] || usage
+      GRAMMAR_FILE="$1"
+      ENABLE_TINY_GRAMMAR=true
+      ENABLE_STRUCTURED_GBNF=false
+      ;;
+    --no-grammar-file)
+      ENABLE_TINY_GRAMMAR=false
+      ENABLE_STRUCTURED_GBNF=false
+      ;;
+    --enable-tiny-grammar)
+      ENABLE_TINY_GRAMMAR=true
+      ENABLE_STRUCTURED_GBNF=false
+      ;;
+    --no-tiny-grammar)
+      ENABLE_TINY_GRAMMAR=false
+      ;;
+    --enable-structured-gbnf)
+      ENABLE_STRUCTURED_GBNF=true
+      ENABLE_TINY_GRAMMAR=false
+      ;;
+    --no-structured-gbnf)
+      ENABLE_STRUCTURED_GBNF=false
+      ;;
+    --no-mmproj)
+      NO_MMPROJ=1
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage
+      ;;
+    *)
+      POSITIONAL_INDEX=$((POSITIONAL_INDEX + 1))
+      case "$POSITIONAL_INDEX" in
+        1) MODEL_KEY="$1" ;;
+        2) CTX_SIZE="$1" ;;
+        3) PARALLEL="$1" ;;
+        *)
+          echo "Too many positional arguments." >&2
+          usage
+          ;;
+      esac
+      ;;
+  esac
+  shift
+done
+
+configure_slot
+load_defaults
+[ -n "$CTX_SIZE" ] || CTX_SIZE="$DEFAULT_CTX_SIZE"
+[ -n "$UBATCH_SIZE" ] || UBATCH_SIZE="$DEFAULT_UBATCH_SIZE"
+[ -n "$PARALLEL" ] || PARALLEL="$DEFAULT_PARALLEL"
+[ -n "$ENABLE_THINKING" ] || ENABLE_THINKING="$DEFAULT_ENABLE_THINKING"
+[ -n "$REASONING_BUDGET" ] || REASONING_BUDGET="$DEFAULT_REASONING_BUDGET"
+[ -n "$ENABLE_DRY" ] || ENABLE_DRY="$DEFAULT_ENABLE_DRY"
+[ -n "$ENABLE_TINY_GRAMMAR" ] || ENABLE_TINY_GRAMMAR="$DEFAULT_ENABLE_TINY_GRAMMAR"
+[ -n "$ENABLE_STRUCTURED_GBNF" ] || ENABLE_STRUCTURED_GBNF="$DEFAULT_ENABLE_STRUCTURED_GBNF"
+[ -n "$TEMPERATURE" ] || TEMPERATURE="$DEFAULT_TEMPERATURE"
+[ -n "$TOP_P" ] || TOP_P="$DEFAULT_TOP_P"
+[ -n "$TOP_K" ] || TOP_K="$DEFAULT_TOP_K"
+[ -n "$MIN_P" ] || MIN_P="$DEFAULT_MIN_P"
+[ -n "$PRESENCE_PENALTY" ] || PRESENCE_PENALTY="$DEFAULT_PRESENCE_PENALTY"
+[ -n "$REPETITION_PENALTY" ] || REPETITION_PENALTY="$DEFAULT_REPETITION_PENALTY"
+
+require_cmd python3
+
+if [ "$MODE" = "defaults-json" ]; then
+  defaults_json
+  exit 0
+fi
+
+if [ "$MODE" = "status-json" ]; then
+  status_json
+  exit 0
+fi
+
+if [ "$MODE" = "set-defaults" ]; then
+  is_positive_int "$CTX_SIZE" || { echo "Invalid context size: $CTX_SIZE" >&2; exit 1; }
+  is_positive_int "$PARALLEL" || { echo "Invalid parallel value: $PARALLEL" >&2; exit 1; }
+  if [ "$ENABLE_STRUCTURED_GBNF" = "true" ]; then
+    ENABLE_TINY_GRAMMAR=false
+  fi
+  # Ensure state directory and defaults file path are initialized
+  [ -n "$DEFAULTS_FILE" ] || { echo "State path not initialized properly." >&2; exit 1; }
+  mkdir -p "$(dirname "$DEFAULTS_FILE")" || { echo "Failed to create state directory." >&2; exit 1; }
+  # save_defaults serializes MTP_DRAFT_N_MAX_VALUE; the launch path resolves it
+  # later, so mirror the raw value here.
+  MTP_DRAFT_N_MAX_VALUE="$MTP_DRAFT_N_MAX"
+  save_defaults || { echo "Failed to save defaults to $DEFAULTS_FILE." >&2; exit 1; }
+  defaults_json
+  exit 0
+fi
+
+if [ "$MODE" = "stop" ]; then
+  stop_previous_server
+  echo "Stopped."
+  exit 0
+fi
+
+require_cmd curl
+
+[ -n "$MODEL_KEY" ] || usage
+is_positive_int "$CTX_SIZE" || { echo "Invalid context size: $CTX_SIZE" >&2; exit 1; }
+is_positive_int "$PARALLEL" || { echo "Invalid parallel value: $PARALLEL" >&2; exit 1; }
+is_positive_int "$UBATCH_SIZE" || { echo "Invalid ubatch size: $UBATCH_SIZE" >&2; exit 1; }
+
+model_info "$MODEL_KEY"
+
+if [ -z "$LLAMA_SERVER_BIN" ]; then
+  if is_mtp_model && llama_server_supports_mtp "$UPSTREAM_LLAMA_SERVER_BIN"; then
+    LLAMA_SERVER_BIN="$UPSTREAM_LLAMA_SERVER_BIN"
+  elif is_mtp_model && [ -x "$MTP_LLAMA_SERVER_BIN" ]; then
+    LLAMA_SERVER_BIN="$MTP_LLAMA_SERVER_BIN"
+  elif [ -x "$UPSTREAM_LLAMA_SERVER_BIN" ]; then
+    LLAMA_SERVER_BIN="$UPSTREAM_LLAMA_SERVER_BIN"
+  else
+    LLAMA_SERVER_BIN="llama-server"
+  fi
+fi
+require_executable "$LLAMA_SERVER_BIN"
+
+if is_mtp_model && ! llama_server_supports_mtp "$LLAMA_SERVER_BIN"; then
+  if [ "$MTP_DETECT_SOURCE" = "embedded" ]; then
+    # An embedded head is a bonus baked into the weights, not the reason this
+    # model was chosen. Refusing to launch would break models that ran fine
+    # before they were detected as MTP-capable, so degrade instead.
+    echo "Note: $MODEL_LABEL embeds an MTP head but $LLAMA_SERVER_BIN does not advertise MTP support; launching without speculative decoding." >&2
+    MTP_DETECT_RESULT="no"
+    MTP_DETECT_SOURCE=""
+  else
+    echo "Selected llama-server does not advertise MTP speculative decoding support: $LLAMA_SERVER_BIN" >&2
+    exit 1
+  fi
+fi
+
+MTP_SPEC_TYPE=""
+MTP_DRAFT_PATH=""
+MTP_DRAFT_N_MAX_VALUE="$MTP_DRAFT_N_MAX"
+if is_mtp_model; then
+  MTP_SPEC_TYPE="$(llama_server_mtp_spec_type "$LLAMA_SERVER_BIN" || true)"
+  if [ -z "$MTP_SPEC_TYPE" ]; then
+    echo "Unable to determine the MTP spec type supported by: $LLAMA_SERVER_BIN" >&2
+    exit 1
+  fi
+  MTP_DRAFT_PATH="$(find_mtp_draft || true)"
+  # Gemma 4 draft acceptance measures ~0.46-0.65 locally (vs ~0.94 for Qwen
+  # MTP), so long draft runs waste verification work: n-max 2 benchmarked
+  # 55.5 tok/s vs 48.8 at n-max 4 on gemma-4-26B-A4B (2026-06-10 A/B).
+  if [ -n "$MTP_DRAFT_PATH" ] && is_gemma4_model && [ -z "$ENV_MTP_DRAFT_N_MAX_SET" ]; then
+    MTP_DRAFT_N_MAX_VALUE="2"
+  fi
+  # Qwen 3.8 27B is a dense hybrid-SSM model (arch qwen35, full_attention_interval
+  # 4, 49 of 65 blocks recurrent). Its target forward pass is ~62 ms and already
+  # runs at ~82% of the M4 Max memory-bandwidth ceiling, while each extra draft
+  # step costs ~13 ms of speculation bookkeeping (SSM state save/restore plus a
+  # wider verify batch). Past depth 1 that overhead outruns the longer accepted
+  # runs. Measured on Qwen3.8-27B-UD-Q8_K_L, M4 Max, no-think, 2x400 tok
+  # (2026-08-20 A/B): n-max 1 -> 23.5 tok/s, 2 -> 22.6, 3 -> 18.3, 4 -> 14.6.
+  # --spec-draft-p-min softens the deep cases but never catches n-max 1
+  # (n3/p0.75 -> 21.2, n4/p0.90 -> 20.1).
+  if is_qwen38_dense_model && [ -z "$ENV_MTP_DRAFT_N_MAX_SET" ]; then
+    MTP_DRAFT_N_MAX_VALUE="1"
+  fi
+fi
+
+if [ "$ENABLE_STRUCTURED_GBNF" = "true" ]; then
+  ENABLE_TINY_GRAMMAR=false
+fi
+
+if [ "$ENABLE_STRUCTURED_GBNF" = "true" ]; then
+  if [ -z "$GRAMMAR_FILE" ]; then
+    if supports_structured_gbnf; then
+      GRAMMAR_FILE="$DEFAULT_STRUCTURED_GBNF_FILE"
+    else
+      echo "Structured GBNF is only supported for Qwen 3.6 35B GGUF models, not $MODEL_LABEL." >&2
+      exit 1
+    fi
+  fi
+
+  if [ ! -f "$GRAMMAR_FILE" ]; then
+    echo "Structured GBNF file not found: $GRAMMAR_FILE" >&2
+    exit 1
+  fi
+fi
+
+if [ "$ENABLE_TINY_GRAMMAR" = "true" ]; then
+  if [ -z "$GRAMMAR_FILE" ]; then
+    if supports_tiny_grammar; then
+      GRAMMAR_FILE="$DEFAULT_TINY_GRAMMAR_FILE"
+    else
+      echo "Tiny Grammar is not supported for $MODEL_LABEL." >&2
+      exit 1
+    fi
+  fi
+
+  if [ ! -f "$GRAMMAR_FILE" ]; then
+    echo "Tiny Grammar file not found: $GRAMMAR_FILE" >&2
+    exit 1
+  fi
+fi
+
+if is_gemma4_model; then
+  if is_positive_int "$GEMMA4_SAFE_MAX_CONTEXT"; then
+    safe_per_request_ctx="$GEMMA4_SAFE_MAX_CONTEXT"
+    if [ "$CTX_SIZE" -gt "$safe_per_request_ctx" ]; then
+      echo "Requested context size $CTX_SIZE exceeds the Gemma 4 per-request cap $safe_per_request_ctx (QWEN_LLAMA_GEMMA4_MAX_CONTEXT); clamping." >&2
+      CTX_SIZE="$safe_per_request_ctx"
+    fi
+  fi
+  if [ -z "$ENV_CACHE_TYPE_K_SET" ]; then
+    CACHE_TYPE_K="q8_0"
+  fi
+  if [ -z "$ENV_CACHE_TYPE_V_SET" ]; then
+    CACHE_TYPE_V="q8_0"
+  fi
+fi
+
+BACKEND_CTX_SIZE="$CTX_SIZE"
+if [ "$PARALLEL" -gt 1 ]; then
+  expanded_ctx_size=$((CTX_SIZE * PARALLEL))
+  if [ "$expanded_ctx_size" -gt 0 ]; then
+    BACKEND_CTX_SIZE="$expanded_ctx_size"
+  fi
+fi
+
+if [ "$MODEL_FAMILY" = "Qwen 3.6" ] || is_qwen38_model; then
+  # Qwen 3.8 (arch qwen35) carries an unusually fat KV cache: key_length and
+  # value_length are both 256 (double the usual 128) and 16 of the 65 blocks are
+  # full attention, so a token costs 64 KiB at bf16 against ~16 KiB for a typical
+  # 27B. At the shipped ctxSize 524288 x parallel 2 that is 64 GiB of cache for an
+  # 11 GiB model. q8_0 halves it to 34 KiB/token. Measured on M4 Max, Ridge 3.7bpw,
+  # backend ctx 1048576 (2026-08-20): RSS 75.9 -> 45.9 GiB, and generation speed is
+  # unaffected (23.42 vs 23.51 tok/s on Q8_K_L, -0.4%).
+  if [ -z "$ENV_CACHE_TYPE_K_SET" ]; then
+    CACHE_TYPE_K="q8_0"
+  fi
+  if [ -z "$ENV_CACHE_TYPE_V_SET" ]; then
+    CACHE_TYPE_V="q8_0"
+  fi
+fi
+
+MMPROJ=""
+if [ "$NO_MMPROJ" -eq 0 ]; then
+  MMPROJ="$(find_mmproj "$MODEL_FILE" "$MODEL_ROOT" || true)"
+fi
+CHAT_TEMPLATE_FILE="$(resolve_chat_template_file || true)"
+
+stop_previous_server
+clear_runtime_files
+
+# ── Prompt cache budget ────────────────────────────────────────────────
+# llama.cpp's --cache-ram defaults to 8192 MiB per server and nothing scales
+# that by how many servers are running, so two loaded slots quietly commit up
+# to 16 GiB of prompt cache on top of weights, KV and compute buffers.
+#
+# The budget is taken here, after stop_previous_server, so this slot's own
+# previous instance has already released its memory and the reading reflects
+# what is genuinely free. Every slot sizes itself from live availability, so a
+# slot starting second sees what the first one took without either knowing
+# about the other.
+#
+# src/llm3_cache_budget.py never plans above llama.cpp's own 8192 default, so
+# this can only ever lower memory pressure, never raise it.
+CACHE_BUDGET_TOOL="$LLM3_DIR/src/llm3_cache_budget.py"
+CACHE_RAM_MIB=""
+MEMORY_BASELINE_FILE=""
+if [ -f "$CACHE_BUDGET_TOOL" ] && llama_server_supports_flag "$LLAMA_SERVER_BIN" "--cache-ram"; then
+  MEMORY_BASELINE_FILE="$STATE_DIR/memory-baseline.json"
+  python3 "$CACHE_BUDGET_TOOL" baseline >"$MEMORY_BASELINE_FILE" 2>/dev/null || MEMORY_BASELINE_FILE=""
+  CACHE_RAM_MIB="$(
+    python3 "$CACHE_BUDGET_TOOL" plan \
+      --model-file "$MODEL_FILE" \
+      --mmproj-file "${MMPROJ:-}" \
+      --ctx "$BACKEND_CTX_SIZE" \
+      --cache-type-k "$CACHE_TYPE_K" \
+      --cache-type-v "$CACHE_TYPE_V" \
+      --state-root "$STATE_ROOT" 2>/dev/null || true
+  )"
+  case "$CACHE_RAM_MIB" in
+    ''|*[!0-9]*) CACHE_RAM_MIB="" ;;
+    *) echo "Prompt cache budget: --cache-ram $CACHE_RAM_MIB MiB (llama.cpp default is 8192 per server)" ;;
+  esac
+fi
+
+CMD=(
+  "$LLAMA_SERVER_BIN"
+  --model "$MODEL_FILE"
+  --alias "$MODEL_ALIAS"
+  --host "$BACKEND_HOST"
+  --port "$BACKEND_PORT"
+  --ctx-size "$BACKEND_CTX_SIZE"
+  --parallel "$PARALLEL"
+  --threads "$THREADS"
+  --threads-batch "$THREADS_BATCH"
+  --n-gpu-layers "$GPU_LAYERS"
+  --flash-attn on
+  --batch-size "$BATCH_SIZE"
+  --ubatch-size "$UBATCH_SIZE"
+  --cache-type-k "$CACHE_TYPE_K"
+  --cache-type-v "$CACHE_TYPE_V"
+  --metrics
+  --jinja
+  --log-prefix
+  --log-timestamps
+  # OLD: --chat-template-kwargs (moved below for conditional)
+)
+
+if is_positive_int "$CACHE_REUSE" && llama_server_supports_flag "$LLAMA_SERVER_BIN" "--cache-reuse"; then
+  CMD+=(--cache-reuse "$CACHE_REUSE")
+fi
+
+if [ -n "$CACHE_RAM_MIB" ]; then
+  CMD+=(--cache-ram "$CACHE_RAM_MIB")
+fi
+
+# --parallel only isolates clients if a slot is reused for the SAME conversation.
+# llama.cpp picks a slot by longest-common-prefix ratio and its default threshold is
+# 0.10, which is low enough that two unrelated agents sharing a system prompt match
+# each other. Measured on slot1 (parallel 3) 2026-08-24: 325 of 358 launches were
+# LCP-selected, matches as weak as 0.148, and f_keep down to 0.082 -- i.e. a request
+# matching 15% of its own prompt evicted 92% of another conversation's cache. That is
+# why "parallel 3" behaved like one shared slot.
+#
+# A genuine continuation scores ~0.8-1.0 (everything but the new user turn), so a
+# threshold in that band keeps real reuse and refuses cross-conversation stealing;
+# anything below it falls through to least-recently-used, which is what a fresh
+# conversation should get. 0 would disable similarity entirely and force LRU even for
+# a real continuation, throwing away its cache -- so this is deliberately not 0.
+if llama_server_supports_flag "$LLAMA_SERVER_BIN" "--slot-prompt-similarity"; then
+  CMD+=(--slot-prompt-similarity "$SLOT_PROMPT_SIMILARITY")
+fi
+
+if is_mtp_model; then
+  CMD+=(--spec-type "$MTP_SPEC_TYPE" --spec-draft-n-max "$MTP_DRAFT_N_MAX_VALUE")
+  if [ -n "$MTP_DRAFT_PATH" ]; then
+    CMD+=(--model-draft "$MTP_DRAFT_PATH")
+  fi
+  if llama_server_supports_flag "$LLAMA_SERVER_BIN" "--spec-draft-p-min" && { [ -z "$MTP_DRAFT_PATH" ] || [ -n "$ENV_MTP_DRAFT_P_MIN_SET" ]; }; then
+    CMD+=(--spec-draft-p-min "$MTP_DRAFT_P_MIN")
+  fi
+fi
+
+  if [ -n "$CHAT_TEMPLATE_FILE" ]; then
+    CMD+=(--chat-template-file "$CHAT_TEMPLATE_FILE")
+  fi
+
+  # Conditional: Gemma 4 uses its native template and does not accept Qwen's enable_thinking kwargs.
+  if ! is_gemma4_model; then
+    CMD+=(--chat-template-kwargs "{\"enable_thinking\":$ENABLE_THINKING}")
+  fi
+
+if llama_server_supports_flag "$LLAMA_SERVER_BIN" "--reasoning"; then
+  if [ "$ENABLE_THINKING" = "true" ]; then
+    CMD+=(--reasoning on --reasoning-budget "$REASONING_BUDGET" --reasoning-format deepseek)
+  else
+    CMD+=(--reasoning off --reasoning-budget 0 --reasoning-format deepseek)
+  fi
+fi
+
+if [ -n "$MMPROJ" ]; then
+  CMD+=(--mmproj "$MMPROJ")
+  if [ "$MMPROJ_OFFLOAD" = "true" ]; then
+    CMD+=(--mmproj-offload)
+  else
+    CMD+=(--no-mmproj-offload)
+  fi
+fi
+
+if [ -n "$GRAMMAR_FILE" ]; then
+  CMD+=(--grammar-file "$GRAMMAR_FILE")
+fi
+
+if [ "$ENABLE_DRY" = "true" ] && llama_server_supports_flag "$LLAMA_SERVER_BIN" "--dry-multiplier"; then
+  CMD+=(--dry-multiplier 0.8)
+fi
+
+if supports_tiny_grammar; then
+  if [ "$CTX_SIZE" -gt 262144 ]; then
+    CMD+=(--override-kv "qwen35.context_length=int:$CTX_SIZE,qwen35moe.context_length=int:$CTX_SIZE")
+  fi
+fi
+
+echo "Starting $MODEL_KEY..."
+printf '%q ' "${CMD[@]}"
+printf '\n'
+
+BACKEND_PID="$(spawn_detached "$SERVER_LOG_FILE" "${CMD[@]}")"
+echo "$BACKEND_PID" >"$BACKEND_PID_FILE"
+
+READY=0
+for _ in $(seq 1 180); do
+  if ! kill -0 "$BACKEND_PID" 2>/dev/null; then
+    echo "llama-server exited during startup. See $SERVER_LOG_FILE" >&2
+    tail -n 80 "$SERVER_LOG_FILE" >&2 || true
+    remove_runtime_state
+    exit 1
+  fi
+
+  if curl -fsS "http://127.0.0.1:$BACKEND_PORT/v1/models" >/dev/null 2>&1; then
+    READY=1
+    break
+  fi
+
+  sleep "$QWEN_LLAMA_POLL_SECONDS"
+done
+
+if [ "$READY" -eq 1 ] && [ -n "$MEMORY_BASELINE_FILE" ] && [ -f "$MEMORY_BASELINE_FILE" ]; then
+  # The backend answers only once the weights, KV and compute buffers are in
+  # place, and the prompt cache is still empty at this point -- so the delta
+  # against the baseline is this configuration's real footprint, which is the
+  # number no amount of GGUF metadata will give you. It sizes the next launch.
+  python3 "$CACHE_BUDGET_TOOL" record \
+    --model-file "$MODEL_FILE" \
+    --mmproj-file "${MMPROJ:-}" \
+    --ctx "$BACKEND_CTX_SIZE" \
+    --cache-type-k "$CACHE_TYPE_K" \
+    --cache-type-v "$CACHE_TYPE_V" \
+    --state-root "$STATE_ROOT" \
+    --baseline-file "$MEMORY_BASELINE_FILE" >/dev/null 2>&1 || true
+  rm -f "$MEMORY_BASELINE_FILE"
+fi
+
+if [ "$READY" -ne 1 ]; then
+  echo "Timed out waiting for llama-server backend. See $SERVER_LOG_FILE" >&2
+  # Carry the reason out with the failure, not just the path to it. llama-server
+  # tags its error lines with " E " and exits within a second on a bad model, so
+  # the interesting lines are already in the log by now. Without this llm3 shows
+  # a bare "Failed to launch <model>" and the actual cause -- "unknown model
+  # architecture", a missing mmproj, an out-of-memory -- is only visible to
+  # someone who knows to open the slot log.
+  if [ -f "$SERVER_LOG_FILE" ]; then
+    LAST_ERRORS="$(grep -E " E " "$SERVER_LOG_FILE" 2>/dev/null | tail -4 | sed 's/^[0-9.]* *E *//')"
+    if [ -n "$LAST_ERRORS" ]; then
+      echo "llama-server reported:" >&2
+      echo "$LAST_ERRORS" >&2
+    fi
+  fi
+  kill_pid "$BACKEND_PID"
+  remove_runtime_state
+  exit 1
+fi
+
+PROXY_PID="$(start_proxy)"
+READY=0
+for _ in $(seq 1 60); do
+  if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+    echo "Proxy exited during startup. See $PROXY_LOG_FILE" >&2
+    tail -n 80 "$PROXY_LOG_FILE" >&2 || true
+    stop_previous_server
+    exit 1
+  fi
+
+  if curl -fsS "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
+    READY=1
+    break
+  fi
+
+  sleep "$QWEN_LLAMA_POLL_SECONDS"
+done
+
+if [ "$READY" -ne 1 ]; then
+  echo "Timed out waiting for llm proxy. See $PROXY_LOG_FILE" >&2
+  stop_previous_server
+  remove_runtime_state
+  exit 1
+fi
+
+write_state_file "$PROXY_PID" "$BACKEND_PID" "$MMPROJ"
+
+echo "Ready on http://$HOST:$PORT/v1"
+echo "Model aliases: $MODEL_ALIAS"
+echo "Proxy PID: $PROXY_PID"
+echo "Backend PID: $BACKEND_PID"
+echo "Server log: $SERVER_LOG_FILE"
+echo "Traffic log: $TRAFFIC_LOG_FILE"

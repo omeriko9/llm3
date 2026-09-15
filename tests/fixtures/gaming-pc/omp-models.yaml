@@ -1,0 +1,14 @@
+providers:
+  myco:
+    baseUrl: http://192.0.2.10:8036
+    apiKey: api-key
+    api: openai-responses
+    auth: apiKey
+    models:
+      - id: myco-large
+        name: MyCo Large
+        reasoning: true
+        input: [text, image]
+        contextWindow: 450000
+        maxTokens: 50000
+        cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 }

@@ -1,0 +1,50 @@
+# ── Secrets / machine-specific config ──────────────────────────────────
+# Real LAN addresses, SSH identities and paths live here. Never commit it.
+.env
+.env.local
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+pass.txt
+
+# ── Dependencies / build output ────────────────────────────────────────
+node_modules/
+dist/
+
+# ── Native backends built or cloned locally (multi-GB) ─────────────────
+vendor/
+public/vendor/
+
+# ── Local state and databases ──────────────────────────────────────────
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# ── Benchmark runs and telemetry (machine-specific results) ────────────
+benchmarks/results/
+benchmarks/saved-results/
+benchmarks/voxel-results/
+benchmarks/.session/
+benchmarks/.deepeval/
+benchmarks/*.json
+benchmarks/SUMMARY.md
+.deepeval/
+
+# ── Logs, pids, runtime leftovers ──────────────────────────────────────
+*.log
+*.pid
+
+# ── Editor / OS / hand-made backups ────────────────────────────────────
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.bak
+*.bak[0-9]
+*.bak.*

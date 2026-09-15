@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+  <link rel="icon" type="image/png" sizes="180x180" href="/favicon-180.png">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>llm3 -- Control Plane</title>
+  <!-- KaTeX, vendored under /vendor/katex so model formulas typeset with no
+       network. woff2 fonts only: KaTeX's @font-face lists woff2 first, so the
+       woff/ttf fallbacks are never requested. -->
+  <link rel="stylesheet" href="/vendor/katex/katex.min.css">
+  <link rel="stylesheet" href="/vendor/markdown-it-texmath/texmath.css">
+  <link rel="stylesheet" href="/styles.css?v=20260910-embed-fix2">
+  <link rel="stylesheet" href="/benchmarks-tab.css?v=20260820-rowdel">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+  <button class="mobile-menu-btn" aria-label="Menu">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+  </button>
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="brand-icon">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+            <path d="M2 17l10 5 10-5"/>
+            <path d="M2 12l10 5 10-5"/>
+          </svg>
+        </div>
+        <div>
+          <h1>llm3</h1>
+          <span class="brand-sub">control plane</span>
+        </div>
+      </div>
+
+      <nav class="sidebar-nav">
+        <button class="nav-item active" data-section="models">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="5"/><path d="M7 7h.01M17 7h.01M7 17h.01M17 17h.01"/></svg>
+          <span>Models</span>
+        </button>
+        <button class="nav-item" data-section="voice">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
+          <span>Voice</span>
+        </button>
+        <button class="nav-item" data-section="huggingface-models">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v20"/><path d="M2 12h20"/><circle cx="12" cy="12" r="9"/></svg>
+          <span>Huggingface Models</span>
+        </button>
+        <button class="nav-item" data-section="status">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          <span>Status</span>
+        </button>
+        <button class="nav-item" data-section="system">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>
+          <span>System</span>
+        </button>
+        <button class="nav-item" data-section="logs">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <span>Logs</span>
+        </button>
+        <button class="nav-item" data-section="diagnostics">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          <span>Diagnostics</span>
+        </button>
+        <button class="nav-item" data-section="applications">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 8h10"/><path d="M7 12h4"/><path d="M17 12h.01"/><path d="M7 16h6"/></svg>
+          <span>Applications</span>
+        </button>
+        <button class="nav-item" data-section="benchmarks">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20V10"/><path d="M18 20V4"/><path d="M6 20v-6"/></svg>
+          <span>Benchmarks</span>
+        </button>
+        <button class="nav-item" data-section="voice-benchmark">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v10"/><path d="M8 7a4 4 0 0 1 8 0"/><path d="M5 21h14"/><path d="M7 17h10"/><path d="M4 11a8 8 0 0 0 16 0"/></svg>
+          <span>Voice Benchmark</span>
+        </button>
+        <button class="nav-item" data-section="websites">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          <span>Websites</span>
+        </button>
+        <button class="nav-item" data-section="pm2">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 8h10"/><path d="M7 12h10"/><path d="M7 16h6"/></svg>
+          <span>PM2</span>
+        </button>
+      </nav>
+
+      <!-- Mobile-only quick actions -->
+      <div class="sidebar-mobile-actions" id="sidebarMobileActions">
+        <div class="sidebar-mobile-actions-title">Quick Actions</div>
+        <div class="sidebar-mobile-actions-grid">
+          <button id="refreshBtnMobile" class="btn btn-icon mobile-action-btn" title="Refresh">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+            <span>Refresh</span>
+          </button>
+          <button id="restartHermesBtnMobile" class="btn btn-secondary mobile-action-btn" title="Restart Hermes">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><polyline points="21 3 21 9 15 9"/></svg>
+            <span>Restart Hermes</span>
+          </button>
+          <button id="restartVoiceBtnMobile" class="btn btn-secondary mobile-action-btn" title="Restart Voice Models">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><polyline points="21 12 21 18 15 18"/></svg>
+            <span>Restart Voice</span>
+          </button>
+          <button id="stopBtnMobile" class="btn btn-danger mobile-action-btn" title="Stop All">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12"/></svg>
+            <span>Stop All</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="sidebar-footer">
+        <div id="connectionStatus" class="connection-badge">
+          <span class="status-dot"></span>
+          <span class="status-text">connecting...</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content">
+      <!-- Top bar -->
+      <header class="topbar">
+        <div class="topbar-left">
+          <div class="topbar-left-stack">
+            <h2 id="pageTitle">Models</h2>
+            <div id="hermesIndicatorsMobile" class="hermes-indicators hermes-indicators-mobile" aria-label="Hermes activity">
+              <div id="topbarBusyIndicatorMobile" class="topbar-busy-indicator" title="Background activity in progress" hidden>
+                <span class="topbar-busy-spinner" aria-hidden="true"></span>
+                <span class="sr-only">Background activity in progress</span>
+              </div>
+              <div id="hermesRemoteIndicatorMobile" class="hermes-indicator offline" title="Hermes Agent status unavailable">
+                <span class="hermes-indicator-dot" aria-hidden="true"></span>
+                <span class="hermes-indicator-label">.155</span>
+              </div>
+              <div id="hermesLocalIndicatorMobile" class="hermes-indicator offline" title="Hermes M4 status unavailable">
+                <span class="hermes-indicator-dot" aria-hidden="true"></span>
+                <span class="hermes-indicator-label">M4</span>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div id="topbarMetrics" class="topbar-metrics" aria-label="System indicators">
+          <div class="topbar-metric">
+            <div class="topbar-metric-head">
+              <span class="topbar-metric-label">Memory</span>
+              <span id="topbarRamPct" class="topbar-metric-value">--%</span>
+            </div>
+            <div class="progress-bar topbar-progress">
+              <div id="topbarRamBar" class="progress-fill muted"></div>
+            </div>
+          </div>
+          <div class="topbar-metric">
+            <div class="topbar-metric-head">
+              <span class="topbar-metric-label">CPU</span>
+              <span id="topbarCpuPct" class="topbar-metric-value">--%</span>
+            </div>
+            <div class="progress-bar topbar-progress">
+              <div id="topbarCpuBar" class="progress-fill muted"></div>
+            </div>
+          </div>
+          <div class="topbar-metric">
+            <div class="topbar-metric-head">
+              <span class="topbar-metric-label">GPU</span>
+              <span id="topbarGpuPct" class="topbar-metric-value">--</span>
+            </div>
+            <div class="progress-bar topbar-progress">
+              <div id="topbarGpuBar" class="progress-fill muted"></div>
+            </div>
+          </div>
+          <div class="topbar-metric topbar-metric-wide">
+            <div class="topbar-metric-head">
+              <span class="topbar-metric-label">HDD</span>
+              <span id="topbarDiskPct" class="topbar-metric-value">--</span>
+            </div>
+            <div class="progress-bar topbar-progress">
+              <div id="topbarDiskBar" class="progress-fill muted"></div>
+            </div>
+          </div>
+          <div class="topbar-metric">
+            <div class="topbar-metric-head">
+              <span class="topbar-metric-label">Uptime</span>
+              <span id="topbarUptime" class="topbar-metric-value">--</span>
+            </div>
+          </div>
+        </div>
+        <div class="topbar-right">
+          <div id="hermesIndicators" class="hermes-indicators" aria-label="Hermes activity">
+            <div id="topbarBusyIndicator" class="topbar-busy-indicator" title="Background activity in progress" hidden>
+              <span class="topbar-busy-spinner" aria-hidden="true"></span>
+              <span class="sr-only">Background activity in progress</span>
+            </div>
+            <div id="hermesRemoteIndicator" class="hermes-indicator offline" title="Hermes Agent status unavailable">
+              <span class="hermes-indicator-dot" aria-hidden="true"></span>
+              <span class="hermes-indicator-label">.155</span>
+            </div>
+            <div id="hermesLocalIndicator" class="hermes-indicator offline" title="Hermes M4 status unavailable">
+              <span class="hermes-indicator-dot" aria-hidden="true"></span>
+              <span class="hermes-indicator-label">M4</span>
+            </div>
+          </div>
+          <button id="launchersBtn" class="btn btn-icon" title="Launchers">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 9V5a3 3 0 0 0-6 0v4"/><path d="M6 15h12"/><path d="M7 21h10"/><path d="M12 15v6"/><path d="m5 12 7-7 7 7"/></svg>
+          </button>
+          <button id="restartLlm3Btn" class="btn btn-icon" title="Restart llm3">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01"/><path d="M7 17h.01"/><path d="M17 7h2"/><path d="M15 17h4"/></svg>
+          </button>
+          <button id="refreshBtn" class="btn btn-icon" title="Refresh">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          </button>
+          <button id="stopBtn" class="btn btn-danger">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12"/></svg>
+            Stop All
+          </button>
+        </div>
+      </header>
+
+      <!-- Toast notification -->
+      <div id="toast" class="toast hidden"></div>
+
+      <!-- Models Section -->
+      <section id="sec-models" class="section active">
+        <div id="modelsSurfaceTabs" class="models-surface-tabs"></div>
+        <div id="modelsSlotStrip" class="models-slot-strip"></div>
+        <div id="modelFilterBar" class="filter-bar">
+          <div id="filterChips" class="filter-chips"></div>
+          <div class="filter-bar-actions">
+            <label class="field-label model-search-field">
+              <span>Search Models</span>
+              <input id="modelSearchInput" type="text" placeholder="Search local GGUF and MLX models" spellcheck="false" />
+            </label>
+            <div id="modelViewToggles" class="view-toggles"></div>
+          </div>
+        </div>
+        <div id="modelGrid" class="model-grid"></div>
+      </section>
+
+      <section id="sec-huggingface-models" class="section">
+        <div id="hfMobilePaneToggles" class="hf-mobile-pane-toggles" aria-label="Hugging Face panes">
+          <button class="btn btn-secondary active" type="button" data-hf-mobile-pane="results">Search Results</button>
+          <button class="btn btn-secondary" type="button" data-hf-mobile-pane="downloads">Downloads</button>
+        </div>
+        <div id="hfLayout" class="hf-layout">
+          <div class="hf-panel hf-results-panel">
+            <div class="hf-toolbar">
+              <label class="field-label hf-search-field">
+                <span>Search Hugging Face</span>
+                <input id="hfSearchInput" type="text" placeholder="Search owner/model/quant (e.g. unsloth/Qwen3.6-27-BF16)" spellcheck="false" />
+              </label>
+              <button id="hfFavoritesToggleBtn" class="btn btn-secondary hf-filter-toggle" type="button" aria-pressed="false">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" aria-hidden="true"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>
+                Favorites
+              </button>
+              <button id="hfSearchBtn" class="btn btn-primary">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+                Search
+              </button>
+            </div>
+            <div id="hfSummaryBar" class="hf-summary-bar"></div>
+            <div id="hfResults" class="table-shell"></div>
+          </div>
+
+          <div id="hfSplitter" class="hf-splitter" role="separator" aria-orientation="vertical" aria-label="Resize Hugging Face panels" tabindex="0"></div>
+
+          <div class="hf-panel hf-downloads-panel">
+            <div class="panel-heading-row">
+              <div>
+                <h3>Downloads</h3>
+                <p>Progress persists across page refresh.</p>
+              </div>
+              <div class="panel-heading-actions">
+                <button id="hfDownloadsToggleBtn" class="btn btn-sm btn-secondary hf-downloads-toggle" type="button" aria-controls="hfDownloads" aria-expanded="true">
+                  Hide downloads
+                </button>
+               <button id="hfClearFinishedBtn" class="btn btn-sm" type="button">
+                  Clear finished
+                </button>
+                <button id="hfDeleteFailedBtn" class="btn btn-sm btn-danger" type="button">
+                  Delete failed
+                </button>
+              </div>
+            </div>
+            <div id="hfDownloads" class="hf-downloads-list"></div>
+            <details class="hf-companion-panel">
+              <summary>Attach companion file (MTP draft / mmproj / template / QAT sidecar)</summary>
+              <form id="hfCompanionForm" class="hf-companion-form">
+                <label class="field-label">
+                  <span>Target model directory</span>
+                  <select id="hfCompanionTarget" name="targetDir" required></select>
+                </label>
+                <label class="field-label">
+                  <span>Source repo (owner/repo)</span>
+                  <input name="repoId" type="text" placeholder="e.g. unsloth/Qwen3.6-35BA3B-MTP-GGUF" spellcheck="false" required />
+                </label>
+                <label class="field-label">
+                  <span>File path inside repo</span>
+                  <input name="filePath" type="text" placeholder="e.g. MTP/Qwen3.6-35BA3B-MTP-Q8_0.gguf" spellcheck="false" required />
+                </label>
+                <label class="field-label">
+                  <span>Kind</span>
+                  <select name="kind">
+                    <option value="mtp">MTP / speculative draft</option>
+                    <option value="mmproj">Vision projector (mmproj)</option>
+                    <option value="template">Chat template</option>
+                    <option value="other">Other sidecar (QAT, tokenizer, …)</option>
+                  </select>
+                </label>
+                <div class="hf-companion-actions">
+                  <button class="btn btn-primary btn-sm" type="submit">Download into model dir</button>
+                  <span id="hfCompanionStatus" class="status-text"></span>
+                </div>
+              </form>
+            </details>
+          </div>
+        </div>
+      </section>
+
+      <!-- Status Section -->
+      <section id="sec-status" class="section">
+        <div id="statusContent" class="status-content">
+          <div class="empty-state">
+            <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            <h3>No Runtime Active</h3>
+            <p>Launch a model to see runtime details here.</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- System Section -->
+      <section id="sec-system" class="section">
+        <div class="system-grid">
+          <div class="system-card">
+            <div class="system-card-header">
+              <span class="system-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+              </span>
+              <div>
+                <h4>Memory</h4>
+                <span id="ramPct" class="metric-value">--%</span>
+              </div>
+            </div>
+            <div class="progress-bar"><div id="ramBar" class="progress-fill"></div></div>
+            <p id="ramDetail" class="metric-detail">Loading...</p>
+          </div>
+
+          <div class="system-card">
+            <div class="system-card-header">
+              <span class="system-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 9h6v6H9z"/></svg>
+              </span>
+              <div>
+                <h4>CPU</h4>
+                <span id="cpuPct" class="metric-value">--%</span>
+              </div>
+            </div>
+            <div class="progress-bar"><div id="cpuBar" class="progress-fill"></div></div>
+            <p id="cpuDetail" class="metric-detail">Loading...</p>
+          </div>
+
+          <div class="system-card">
+            <div class="system-card-header">
+              <span class="system-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+              </span>
+              <div>
+                <h4>GPU</h4>
+                <span id="gpuPct" class="metric-value">--</span>
+              </div>
+            </div>
+            <div class="progress-bar"><div id="gpuBar" class="progress-fill muted"></div></div>
+            <p id="gpuDetail" class="metric-detail">Waiting for telemetry...</p>
+          </div>
+
+          <div class="system-card">
+            <div class="system-card-header">
+              <span class="system-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M7 10h10"/><path d="M6 14h12"/><path d="M8 18h8"/></svg>
+              </span>
+              <div>
+                <h4>Disk</h4>
+                <span id="diskPct" class="metric-value">--</span>
+              </div>
+            </div>
+            <div class="progress-bar"><div id="diskBar" class="progress-fill muted"></div></div>
+            <p id="diskDetail" class="metric-detail">Loading...</p>
+          </div>
+
+          <div class="system-card">
+            <div class="system-card-header">
+              <span class="system-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+              </span>
+              <div>
+                <h4>Uptime</h4>
+                <span id="uptimeValue" class="metric-value">--</span>
+              </div>
+            </div>
+            <div class="progress-bar"><div id="uptimeBar" class="progress-fill muted"></div></div>
+            <p id="uptimeDetail" class="metric-detail">Loading...</p>
+          </div>
+        </div>
+
+        <div id="processGrid" class="process-grid"></div>
+      </section>
+
+      <!-- Logs Section -->
+      <section id="sec-logs" class="section">
+        <div class="logs-toolbar">
+          <div id="logSlotTabs" class="log-tabs"></div>
+          <div id="logKindTabs" class="log-tabs secondary"></div>
+          <div class="log-actions">
+            <button id="pauseLogsBtn" class="btn btn-sm">Pause</button>
+            <button id="downloadLogsBtn" class="btn btn-sm">Download</button>
+            <button id="clearLogsBtn" class="btn btn-sm">Clear</button>
+            <label class="checkbox-label small">
+              <input id="autoScrollInput" type="checkbox" checked />
+              <span>Auto-scroll</span>
+            </label>
+          </div>
+        </div>
+        <div class="logs-container">
+          <div id="thinkingPanel" class="log-panel active">
+            <div id="thinkingStatus" class="log-status">waiting</div>
+            <pre id="thinkingLog" class="log-content raw"></pre>
+          </div>
+          <div id="trafficPanel" class="log-panel">
+            <div id="trafficStatus" class="log-status">waiting</div>
+            <div id="trafficLog" class="log-content"></div>
+          </div>
+          <div id="serverPanel" class="log-panel">
+            <div id="serverStatus" class="log-status">waiting</div>
+            <pre id="serverLog" class="log-content raw"></pre>
+          </div>
+          <div id="proxyPanel" class="log-panel">
+            <div id="proxyStatus" class="log-status">waiting</div>
+            <pre id="proxyLog" class="log-content raw"></pre>
+          </div>
+          <div id="llm3Panel" class="log-panel">
+            <div id="llm3Status" class="log-status">waiting</div>
+            <pre id="llm3Log" class="log-content raw"></pre>
+          </div>
+        </div>
+      </section>
+
+      <section id="sec-diagnostics" class="section">
+        <div class="diag-tabs" role="tablist" aria-label="Diagnostics views">
+          <button class="diag-tab active" type="button" role="tab" data-diag-tab="chat" aria-selected="true">Model chat</button>
+          <button class="diag-tab" type="button" role="tab" data-diag-tab="feed" aria-selected="false">Curated diagnostics</button>
+        </div>
+
+        <div class="diag-pane" data-diag-pane="chat">
+          <div class="chat-shell">
+            <div class="chat-main">
+              <div class="chat-head">
+                <label class="chat-field">
+                  <span class="chat-field-label">Slot</span>
+                  <select id="chatSlotSelect"></select>
+                </label>
+                <div class="chat-model" id="chatModelLabel">no running model</div>
+                <div class="chat-head-actions">
+                  <button class="btn btn-secondary btn-sm" type="button" id="chatCopyAll" title="Copy the whole transcript as markdown">Copy chat</button>
+                  <button class="btn btn-secondary btn-sm" type="button" id="chatRegenerate" title="Discard the last reply and ask again" disabled>Regenerate</button>
+                  <button class="btn btn-secondary btn-sm" type="button" id="chatClear">Clear</button>
+                  <button class="btn btn-danger btn-sm" type="button" id="chatStop" disabled>Stop</button>
+                </div>
+              </div>
+              <div class="chat-log-wrap">
+                <div class="chat-log" id="chatLog" aria-live="polite"></div>
+                <button class="chat-jump hidden" type="button" id="chatJumpLatest">New output ↓</button>
+              </div>
+              <form class="chat-composer" id="chatComposer">
+                <!-- Pending attachments live above the textarea so they are
+                     visible before send, and each one is individually removable. -->
+                <div class="chat-attachments hidden" id="chatAttachments"></div>
+                <div class="chat-composer-row">
+                  <button class="btn btn-secondary btn-icon chat-attach-btn" type="button" id="chatAttach" title="Attach an image (or paste / drop one)" aria-label="Attach an image">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+                  </button>
+                  <input type="file" id="chatFileInput" accept="image/*" multiple hidden>
+                  <textarea id="chatInput" rows="3" placeholder="Message the model&#10;Enter to send · Shift+Enter newline · ↑ previous prompt · paste or drop an image" spellcheck="false"></textarea>
+                  <button class="btn btn-primary" type="submit" id="chatSend">Send</button>
+                </div>
+                <div class="chat-drop-hint" id="chatDropHint">Drop the image to attach it</div>
+              </form>
+            </div>
+
+            <aside class="chat-diag" id="chatDiag">
+              <div class="chat-diag-card">
+                <h4>Live</h4>
+                <div class="chat-diag-grid" id="chatLiveGrid"></div>
+              </div>
+              <div class="chat-diag-card">
+                <h4>Last turn</h4>
+                <div class="chat-diag-grid" id="chatTurnGrid"></div>
+              </div>
+              <div class="chat-diag-card">
+                <h4>Session</h4>
+                <div class="chat-diag-grid" id="chatSessionGrid"></div>
+              </div>
+              <div class="chat-diag-card">
+                <h4>Request</h4>
+                <div class="chat-params">
+                  <label class="chat-param"><span>Temperature</span><input id="chatTemp" type="number" min="0" max="2" step="0.05" value="0.7" /></label>
+                  <label class="chat-param"><span>Top P</span><input id="chatTopP" type="number" min="0" max="1" step="0.05" value="0.8" /></label>
+                  <label class="chat-param"><span>Top K</span><input id="chatTopK" type="number" min="0" max="200" step="1" value="20" /></label>
+                  <label class="chat-param"><span>Max tokens</span><input id="chatMaxTokens" type="number" min="1" max="131072" step="256" value="2048" /></label>
+                  <label class="chat-param"><span>Thinking</span>
+                    <select id="chatThinking">
+                      <option value="default">Model default</option>
+                      <option value="off">Off</option>
+                      <option value="low">Low</option>
+                      <option value="medium">Medium</option>
+                      <option value="xhigh">Extra high</option>
+                    </select>
+                  </label>
+                  <label class="chat-param chat-param-wide"><span>System prompt</span>
+                    <textarea id="chatSystem" rows="3" spellcheck="false" placeholder="(none)"></textarea>
+                  </label>
+                </div>
+              </div>
+              <div class="chat-diag-card">
+                <h4>Runtime reported</h4>
+                <pre class="chat-native" id="chatNative">—</pre>
+              </div>
+            </aside>
+          </div>
+        </div>
+
+        <div class="diag-pane hidden" data-diag-pane="feed">
+          <div class="diagnostics-shell">
+            <div class="diagnostics-toolbar">
+              <div>
+                <h3>Curated diagnostics</h3>
+                <p>Focused Hermes and runtime failures relevant to tool-call debugging.</p>
+              </div>
+            </div>
+            <div id="diagnosticsStatus" class="log-status">waiting</div>
+            <div id="diagnosticsFeed" class="diagnostics-feed"></div>
+          </div>
+        </div>
+      </section>
+
+      <section id="sec-applications" class="section">
+        <div id="applicationsContent" class="applications-content"></div>
+      </section>
+
+      <section id="sec-benchmarks" class="section benchmarks-section">
+        <llm3-benchmarks-tab></llm3-benchmarks-tab>
+      </section>
+
+      <section id="sec-voice-benchmark" class="section voice-benchmark-section">
+        <div id="voiceBenchmarkContent" class="voice-benchmark-content"></div>
+      </section>
+
+      <!-- Websites Section -->
+      <section id="sec-websites" class="section websites-section">
+        <div class="section-header">
+          <h3>Websites</h3>
+          <p>Open local and remote sites, and use the original website directory controls.</p>
+        </div>
+        <div id="websitesToolbar" class="websites-toolbar">
+          <div id="websitesCategories" class="websites-categories"></div>
+          <div id="websitesViewControls" class="websites-view-controls">
+            <label class="field-label websites-search-field">
+              <span>Search Websites</span>
+              <input id="websitesSearchInput" type="text" placeholder="Search name, URL, or category" spellcheck="false" autocomplete="off" />
+            </label>
+            <button id="viewToggleBoxes" class="btn btn-sm btn-icon active" type="button" title="Boxes view">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
+            </button>
+            <button id="viewToggleTable" class="btn btn-sm btn-icon" type="button" title="Table view">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M3 12h18"/><path d="M3 18h18"/><path d="M9 6v12"/><path d="M15 6v12"/></svg>
+            </button>
+          </div>
+        </div>
+        <div id="websitesGrid" class="websites-grid"></div>
+        <div id="websitesTable" class="websites-table hidden"></div>
+      </section>
+
+      <!-- PM2 Section -->
+      <section id="sec-pm2" class="section websites-section">
+        <div class="section-header">
+          <h3>PM2</h3>
+          <p>Control website processes, inspect live status, and tune PM2 memory caps.</p>
+        </div>
+        <div class="websites-toolbar">
+          <div id="pm2Categories" class="websites-categories"></div>
+        </div>
+        <div id="pm2Table" class="websites-table"></div>
+      </section>
+
+      <!-- Voice Section -->
+      <section id="sec-voice" class="section voice-section">
+        <div class="section-header">
+          <h3>Voice Models</h3>
+        </div>
+        <div id="voiceFilterChips" class="filter-chips voice-filter-chips"></div>
+        <div id="voiceModelGrid" class="voice-model-grid"></div>
+        <div id="voiceStatusSection" class="voice-status-section"></div>
+      </section>
+    </main>
+  </div>
+
+  <div id="launchModal" class="modal-shell hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-modal-close="true"></div>
+    <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="launchModalTitle">
+      <div class="modal-header">
+        <div class="modal-header-main">
+          <h3 id="launchModalTitle">Launch Model</h3>
+          <p id="launchModalSubtitle" class="modal-subtitle">Configure the selected model and slot.</p>
+        </div>
+        <div class="modal-header-right">
+          <div id="launchModalHeaderActions" class="modal-header-actions"></div>
+          <button id="launchModalCloseBtn" class="btn btn-icon" type="button" aria-label="Close launch modal">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div id="launchModalContent" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="actionResultModal" class="modal-shell hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-action-result-close="true"></div>
+    <div class="modal-dialog modal-dialog-action-result" role="dialog" aria-modal="true" aria-labelledby="actionResultModalTitle">
+      <div class="modal-header">
+        <div class="modal-header-main">
+          <h3 id="actionResultModalTitle">Launch Result</h3>
+          <p id="actionResultModalSubtitle" class="modal-subtitle">Launcher output stays here until you close it.</p>
+        </div>
+        <div class="modal-header-right">
+          <button id="actionResultModalCloseBtn" class="btn btn-icon" type="button" aria-label="Close launch result modal">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div id="actionResultModalContent" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="hfConvertModal" class="modal-shell hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-hf-convert-close="true"></div>
+    <div class="modal-dialog modal-dialog-hf-convert" role="dialog" aria-modal="true" aria-labelledby="hfConvertModalTitle">
+      <div class="modal-header">
+        <div class="modal-header-main">
+          <h3 id="hfConvertModalTitle">Convert to GGUF</h3>
+          <p id="hfConvertModalSubtitle" class="modal-subtitle">Pick a quantization for the converted model.</p>
+        </div>
+        <div class="modal-header-right">
+          <button id="hfConvertModalCloseBtn" class="btn btn-icon" type="button" aria-label="Close convert modal">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="modal-body hf-convert-body">
+        <label class="field-label">
+          <span>Quantization</span>
+          <select id="hfConvertQuantSelect"></select>
+        </label>
+        <p id="hfConvertQuantHint" class="hf-convert-hint"></p>
+        <p id="hfConvertSourceNote" class="hf-convert-note hidden"></p>
+        <p class="hf-convert-note">Conversion downloads the original weights, runs llama.cpp&rsquo;s converter, and quantizes the result. It can take a long time for big models and temporarily needs roughly 2&ndash;3&times; the model size in free disk space.</p>
+        <div class="hf-convert-actions">
+          <button id="hfConvertConfirmBtn" class="btn btn-primary" type="button">Start conversion</button>
+          <button id="hfConvertCancelBtn" class="btn" type="button">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="voiceTuningModal" class="modal-shell hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-voice-tuning-close="true"></div>
+    <div class="modal-dialog modal-dialog-voice-tuning" role="dialog" aria-modal="true" aria-labelledby="voiceTuningModalTitle">
+      <div class="modal-header">
+        <div class="modal-header-main">
+          <h3 id="voiceTuningModalTitle">Voice Settings</h3>
+          <p id="voiceTuningModalSubtitle" class="modal-subtitle">Adjust TTS generation parameters.</p>
+        </div>
+        <div class="modal-header-right">
+          <div id="voiceTuningModalHeaderActions" class="modal-header-actions"></div>
+          <button id="voiceTuningModalCloseBtn" class="btn btn-icon" type="button" aria-label="Close voice settings modal">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div id="voiceTuningModalContent" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="profileModal" class="modal-shell hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-profile-modal-close="true"></div>
+    <div class="modal-dialog modal-dialog-profile" role="dialog" aria-modal="true" aria-labelledby="profileModalTitle">
+      <div class="modal-header">
+        <div class="modal-header-main">
+          <h3 id="profileModalTitle">Profiles</h3>
+          <p id="profileModalSubtitle" class="modal-subtitle">Configure all four slots together and save them as a reusable startup profile.</p>
+        </div>
+        <div class="modal-header-right">
+          <div id="profileModalHeaderActions" class="modal-header-actions"></div>
+          <button id="profileModalCloseBtn" class="btn btn-icon" type="button" aria-label="Close profile modal">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div id="profileModalContent" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="saveLayoutModal" class="modal-shell hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-save-layout-close="true"></div>
+    <div class="modal-dialog modal-dialog-confirm" role="dialog" aria-modal="true" aria-labelledby="saveLayoutModalTitle">
+      <div class="modal-header">
+        <div class="modal-header-main">
+          <h3 id="saveLayoutModalTitle">Save the current layout as a profile</h3>
+          <p id="saveLayoutModalSubtitle" class="modal-subtitle">The models loaded right now, with their launch settings.</p>
+        </div>
+        <div class="modal-header-right">
+          <button id="saveLayoutModalCloseBtn" class="btn btn-icon" type="button" aria-label="Close save layout modal">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div id="saveLayoutModalContent" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="hermesFeedModal" class="modal-shell hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-hermes-feed-close="true"></div>
+    <div class="modal-dialog modal-dialog-hermes-feed" role="dialog" aria-modal="true" aria-labelledby="hermesFeedModalTitle">
+      <div class="modal-header">
+        <div class="modal-header-main">
+          <h3 id="hermesFeedModalTitle">Hermes Activity</h3>
+          <p id="hermesFeedModalSubtitle" class="modal-subtitle">Live internal activity feed.</p>
+        </div>
+        <div class="modal-header-right">
+          <div id="hermesFeedModalHeaderActions" class="modal-header-actions">
+            <label class="checkbox-label small hermes-feed-autoscroll">
+              <input id="hermesFeedAutoScrollInput" type="checkbox" checked />
+              <span>Auto-scroll</span>
+            </label>
+          </div>
+          <button id="hermesFeedModalCloseBtn" class="btn btn-icon" type="button" aria-label="Close Hermes activity modal">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div id="hermesFeedModalContent" class="modal-body hermes-feed-modal-body"></div>
+    </div>
+  </div>
+
+  <div id="launchersModal" class="modal-shell hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-launchers-modal-close="true"></div>
+    <div class="modal-dialog modal-dialog-launchers" role="dialog" aria-modal="true" aria-labelledby="launchersModalTitle">
+      <div class="modal-header">
+        <div class="modal-header-main">
+          <h3 id="launchersModalTitle">Launchers</h3>
+          <p id="launchersModalSubtitle" class="modal-subtitle">GGUF and MLX launcher inventory, upstream update controls, and exact launch command templates.</p>
+        </div>
+        <div class="modal-header-right">
+          <button id="launchersModalCloseBtn" class="btn btn-icon" type="button" aria-label="Close launchers modal">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div id="launchersModalContent" class="modal-body"></div>
+    </div>
+  </div>
+
+  <div id="hermesIndicatorsFloating" class="hermes-indicators hermes-indicators-floating" aria-label="Hermes activity shortcuts">
+    <div id="topbarBusyIndicatorFloating" class="topbar-busy-indicator" title="Background activity in progress" hidden>
+      <span class="topbar-busy-spinner" aria-hidden="true"></span>
+      <span class="sr-only">Background activity in progress</span>
+    </div>
+    <div id="hermesRemoteIndicatorFloating" class="hermes-indicator offline" title="Hermes Agent status unavailable">
+      <span class="hermes-indicator-dot" aria-hidden="true"></span>
+      <span class="hermes-indicator-label">.155</span>
+    </div>
+    <div id="hermesLocalIndicatorFloating" class="hermes-indicator offline" title="Hermes M4 status unavailable">
+      <span class="hermes-indicator-dot" aria-hidden="true"></span>
+      <span class="hermes-indicator-label">M4</span>
+    </div>
+  </div>
+
+  <!-- Context menu for websites -->
+  <!-- In-page frame for embedded sites (LLM3_EMBED_SITES). Proxied on llm3's
+       own origin, so it loads over the same login as the dashboard. -->
+  <div id="embedOverlay" class="embed-overlay" hidden>
+    <div class="embed-overlay-bar">
+      <span class="embed-overlay-title">Embedded site</span>
+      <a class="embed-overlay-open" href="#" target="_blank" rel="noopener" title="Open in a new tab">Open in tab ↗</a>
+      <button type="button" class="embed-overlay-close" id="embedOverlayClose" title="Close">✕</button>
+    </div>
+    <iframe class="embed-overlay-frame" title="Embedded site" src="about:blank"
+            allow="autoplay; microphone; clipboard-read; clipboard-write"></iframe>
+  </div>
+
+  <div id="websiteContextMenu" class="context-menu hidden">
+    <button id="ctxAdd" class="ctx-item">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
+      Add Website
+    </button>
+    <div class="ctx-sep"></div>
+    <button id="ctxSettings" class="ctx-item">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      Settings
+    </button>
+    <button id="ctxStart" class="ctx-item">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+      Start
+    </button>
+    <button id="ctxStop" class="ctx-item ctx-danger">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12"/></svg>
+      Stop
+    </button>
+    <div class="ctx-sep"></div>
+    <button id="ctxRename" class="ctx-item">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>
+      Rename
+    </button>
+    <button id="ctxInternal" class="ctx-item">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+      Internal URL
+    </button>
+    <button id="ctxExternal" class="ctx-item">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+      External URL
+    </button>
+    <button id="ctxEmbed" class="ctx-item hidden">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18"/><rect x="7" y="12" width="10" height="5"/></svg>
+      Open inside llm3
+    </button>
+    <button id="ctxControl" class="ctx-item">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <span id="ctxControlText">Restart</span>
+    </button>
+    <button id="ctxDelete" class="ctx-item ctx-danger">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>
+      Delete
+    </button>
+  </div>
+
+  <div id="launcherCommandPreview" class="launcher-command-preview hidden" aria-hidden="true"></div>
+
+  <!-- Add Website Modal -->
+  <div id="addWebsiteModal" class="modal-shell hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-modal-close="true"></div>
+    <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="addWebsiteModalTitle">
+      <div class="modal-header">
+        <div class="modal-header-main">
+
+          <h3 id="addWebsiteModalTitle">Add Website</h3>
+          <p id="addWebsiteModalSubtitle" class="modal-subtitle">Add a new website to the list.</p>
+        </div>
+        <div class="modal-header-right">
+          <button id="addWebsiteModalCloseBtn" class="btn btn-icon" type="button" aria-label="Close">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div class="add-website-form">
+          <div class="form-group">
+            <label for="addWebsiteName">Name</label>
+            <input id="addWebsiteName" type="text" placeholder="Website name" spellcheck="false" />
+          </div>
+          <div class="form-group">
+            <label for="addWebsiteInternal">Internal URL</label>
+            <input id="addWebsiteInternal" type="text" placeholder="http://127.0.0.1:PORT" spellcheck="false" />
+          </div>
+          <div class="form-group">
+            <label for="addWebsiteExternal">External URL (optional)</label>
+            <input id="addWebsiteExternal" type="text" placeholder="https://domain.com" spellcheck="false" />
+          </div>
+          <div class="form-group">
+            <label for="addWebsiteCategory">Category</label>
+            <select id="addWebsiteCategory">
+              <option value="general">General</option>
+              <option value="Local">Local</option>
+              <option value="Remote">Remote</option>
+              <option value="nginx">Nginx</option>
+            </select>
+          </div>
+          <div class="form-actions">
+            <button id="addWebsiteCancel" class="btn btn-secondary">Cancel</button>
+            <button id="addWebsiteSubmit" class="btn btn-primary">Add</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings Modal -->
+  <div id="websiteSettingsModal" class="modal-shell hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-modal-close="true"></div>
+    <div class="modal-dialog" role="dialog" aria-modal="true" aria-labelledby="websiteSettingsModalTitle">
+      <div class="modal-header">
+        <div class="modal-header-main">
+          <h3 id="websiteSettingsModalTitle">Website Settings</h3>
+          <p id="websiteSettingsModalSubtitle" class="modal-subtitle">Configure port and control.</p>
+        </div>
+        <div class="modal-header-right">
+          <button id="websiteSettingsModalCloseBtn" class="btn btn-icon" type="button" aria-label="Close">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <div id="websiteSettingsContent" class="website-settings-form">
+          <div class="form-group">
+            <label for="websiteSettingsPort">Port</label>
+            <input id="websiteSettingsPort" type="number" placeholder="Port number" spellcheck="false" />
+          </div>
+          <div class="form-actions">
+            <button id="websiteSettingsApply" class="btn btn-primary">Apply Port</button>
+            <button id="websiteSettingsStart" class="btn btn-secondary">Start</button>
+            <button id="websiteSettingsStop" class="btn btn-danger">Stop</button>
+            <button id="websiteSettingsRestart" class="btn btn-secondary">Restart</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/benchmarks-tab.js?v=20260904-session"></script>
+  <script src="/vendor/katex/katex.min.js"></script>
+  <script src="/vendor/markdown-it/markdown-it.umd.min.js"></script>
+  <script src="/vendor/markdown-it-texmath/texmath.js"></script>
+  <script src="/app.js?v=20260915-neutral-apps"></script>
+</body>
+</html>

@@ -1,0 +1,35 @@
+{
+  "providers": {
+    "local-server": {
+      "apiKey": "api-key",
+      "api": "openai-completions",
+      "models": [
+        {
+          "input": [
+            "text"
+          ],
+          "id": "Qwen3.6-35B-A3B-APEX-I-Balanced",
+          "maxTokens": 20000,
+          "contextWindow": 480000
+        }
+      ],
+      "baseUrl": "http://192.0.2.10:8036/v1"
+    },
+    "local-vision-server": {
+      "apiKey": "api-key",
+      "api": "openai-completions",
+      "models": [
+        {
+          "input": [
+            "text",
+            "image"
+          ],
+          "id": "Qwen3.5-4B-UD-Q4_K_XL",
+          "maxTokens": 30000,
+          "contextWindow": 220000
+        }
+      ],
+      "baseUrl": "http://192.0.2.10:8039/v1"
+    }
+  }
+}

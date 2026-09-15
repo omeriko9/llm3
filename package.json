@@ -1,0 +1,35 @@
+{
+  "name": "llm3",
+  "version": "1.0.0",
+  "description": "Modern LLM management dashboard",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node scripts/check-syntax.js",
+    "test": "node --test tests/*.test.js && npm run test:py",
+    "vendor": "node scripts/sync-vendor.js",
+    "postinstall": "node scripts/sync-vendor.js",
+    "lint": "oxlint src public scripts tests ecosystem.config.cjs && python3 benchmarks/check_use_before_assign.py --selftest && python3 benchmarks/check_use_before_assign.py benchmarks/benchmark_runner.py benchmarks/quality_eval.py src/llm3_voice_common.py src/llm3_cache_budget.py",
+    "test:py": "python3 -m unittest discover -s benchmarks -p 'test_*.py'",
+    "render-check": "node scripts/render-check.js",
+    "css-audit": "node scripts/css-audit.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "better-sqlite3": "^12.11.1",
+    "express": "^5.2.1",
+    "js-yaml": "^5.4.1"
+  },
+  "devDependencies": {
+    "katex": "^0.18.5",
+    "markdown-it": "^15.0.1",
+    "markdown-it-texmath": "^1.0.0",
+    "oxlint": "^1.81.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

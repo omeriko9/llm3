@@ -1,0 +1,9 @@
+{
+  "lastChangelogVersion": "0.84.2",
+  "defaultProvider": "local-server",
+  "defaultModel": "Qwen3.6-35B-A3B-APEX-I-Balanced",
+  "theme": "dark",
+  "packages": [
+    "npm:pi-docparser"
+  ]
+}
