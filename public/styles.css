@@ -8119,6 +8119,9 @@ a { color: var(--accent); text-decoration: none; }
   overflow-wrap: anywhere;
   max-height: 14rem;
   overflow-y: auto;
+  /* The panel keeps the wheel to itself: reaching its end must not start
+     scrolling the transcript behind it. */
+  overscroll-behavior: contain;
   font-size: 0.8rem;
   line-height: 1.45;
 }

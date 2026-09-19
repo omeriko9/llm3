@@ -13318,6 +13318,84 @@ function chatTurnSummary(stats) {
   return bits.join(" · ");
 }
 
+// --- Thinking-panel scroll ---------------------------------------------------
+//
+// The reasoning block (.chat-think pre) is capped at 14rem, so it is a scroll
+// container of its own, and it needs the same rule as the transcript: follow the
+// newest line until the reader scrolls away, then hold where the reader left it.
+//
+// Two things were wrong. The panel never followed the tail, so a long think sat
+// on its first line while the text grew out of sight. And every chunk rewrote the
+// whole log, which destroyed the element mid-scroll and put it back at the top,
+// so the reader could not move it at all. The streaming turn is updated in place
+// now: the element survives the chunk, and a drag on its scrollbar survives too.
+const CHAT_THINK_SLACK_PX = 24;
+const chatThinkPin = new Map();   // slotId -> the reader still follows the tail
+
+function chatThinkFollows(slotId) {
+  return chatThinkPin.get(String(slotId)) !== false;
+}
+
+function chatThinkPre(log) {
+  return log ? log.querySelector('[data-chat-stream="1"] [data-think-body]') : null;
+}
+
+// Read the reader's intent from the live element, before anything writes to it.
+// A closed or empty panel reports nothing useful, so it leaves the flag alone.
+function chatThinkReadPin(log) {
+  const pre = chatThinkPre(log);
+  if (!pre || !pre.clientHeight) return;
+  const atTail = pre.scrollHeight - pre.scrollTop - pre.clientHeight <= CHAT_THINK_SLACK_PX;
+  chatThinkPin.set(String(chatState.slotId), atTail);
+}
+
+function chatThinkFollowTail(log) {
+  const pre = chatThinkPre(log);
+  if (!pre || !chatThinkFollows(chatState.slotId)) return;
+  pre.scrollTop = pre.scrollHeight;
+}
+
+// Write only what a delta can change on the streaming turn: the reasoning text,
+// its character count and the reply body. It returns false when the turn's shape
+// changed -- the think block just appeared, an error arrived, the stream ended --
+// and the caller then does the full render.
+function chatUpdateStreamInPlace(log, conv) {
+  const last = conv && conv.messages ? conv.messages[conv.messages.length - 1] : null;
+  if (!last || last.role !== "assistant" || !last.streaming || last.error) return false;
+  const node = log.querySelector('[data-chat-stream="1"]');
+  if (!node || node !== log.lastElementChild) return false;
+  const pre = node.querySelector("[data-think-body]");
+  if (Boolean(pre) !== Boolean(last.reasoning)) return false;
+  const body = node.querySelector(".chat-bubble.chat-md");
+  if (!body) return false;
+
+  const wasPinned = chatScrollPinned(log);
+  const previousHeight = log.scrollHeight;
+  if (pre) {
+    chatThinkReadPin(log);
+    const shown = pre.textContent || "";
+    // Append the new characters instead of replacing the text: the element is
+    // never rebuilt from empty, so the reader's offset cannot jump.
+    if (last.reasoning.length > shown.length && last.reasoning.startsWith(shown)) {
+      pre.append(last.reasoning.slice(shown.length));
+    } else if (last.reasoning !== shown) {
+      pre.textContent = last.reasoning;
+    }
+    const summary = node.querySelector("[data-think-summary]");
+    if (summary) summary.textContent = `thinking · ${last.reasoning.length} chars`;
+    chatThinkFollowTail(log);
+  }
+  if (last.content) {
+    body.innerHTML = renderMarkdown(last.content);
+  }
+  if (wasPinned) {
+    log.scrollTop = log.scrollHeight;
+  } else if (log.scrollHeight > previousHeight) {
+    chatMarkUnread(true);
+  }
+  return true;
+}
+
 function renderChatLog() {
   const els = chatEls();
   if (!els.log) return;
@@ -13331,6 +13409,9 @@ function renderChatLog() {
       : "Launch a model in a slot to start chatting."}</div>`;
     return;
   }
+  // A delta only ever extends the last turn. Updating that turn in place keeps
+  // the reasoning panel and its scrollbar alive between chunks.
+  if (chatUpdateStreamInPlace(els.log, conv)) return;
   // Scroll ownership. Every streamed chunk rewrites innerHTML, and replacing a
   // scroll container's contents resets scrollTop to 0 -- so reading back "am I
   // at the bottom" after the write is useless, and doing nothing threw the
@@ -13339,6 +13420,7 @@ function renderChatLog() {
   const wasPinned = chatScrollPinned(els.log);
   const previousTop = els.log.scrollTop;
   const previousHeight = els.log.scrollHeight;
+  chatThinkReadPin(els.log);
 
   els.log.innerHTML = conv.messages.map((m, index) => {
     if (m.role === "user") {
@@ -13356,7 +13438,7 @@ function renderChatLog() {
       return `<div class="chat-msg user">${thumbs}<div class="chat-bubble">${esc(m.content)}</div>${actions}</div>`;
     }
     const think = m.reasoning
-      ? `<details class="chat-think"${m.streaming ? " open" : ""}><summary>thinking · ${m.reasoning.length} chars</summary><pre>${esc(m.reasoning)}</pre></details>`
+      ? `<details class="chat-think"${m.streaming ? " open" : ""}><summary data-think-summary>thinking · ${m.reasoning.length} chars</summary><pre data-think-body>${esc(m.reasoning)}</pre></details>`
       : "";
     // Model replies go through markdown-it (html:false, so any raw HTML in the
     // reply is escaped) with texmath+KaTeX for the maths. User messages stay
@@ -13372,7 +13454,7 @@ function renderChatLog() {
       : `<div class="chat-msg-actions">
         <button type="button" class="chat-act" data-chat-act="copy" data-chat-index="${index}" title="Copy this reply as markdown">Copy</button>
       </div>`;
-    return `<div class="chat-msg assistant">${think}${body}${foot}${actions}</div>`;
+    return `<div class="chat-msg assistant"${m.streaming ? ' data-chat-stream="1"' : ""}>${think}${body}${foot}${actions}</div>`;
   }).join("");
 
   if (wasPinned) {
@@ -13386,6 +13468,9 @@ function renderChatLog() {
       chatMarkUnread(true);
     }
   }
+  // The panel is a new element after the rewrite, so put it back on the tail
+  // unless the reader had scrolled away from it.
+  chatThinkFollowTail(els.log);
 }
 
 // "Pinned" means the reader is following the tail and wants new output to keep
@@ -13465,6 +13550,8 @@ async function sendChatMessage(text, images) {
   const assistant = { role: "assistant", content: "", reasoning: "", streaming: true, stats: null, error: "" };
   conv.messages.push(assistant);
   conv.streaming = true;
+  // A new turn starts on the tail again, whatever the reader did on the last one.
+  chatThinkPin.delete(String(slotId));
 
   const els = chatEls();
   if (isVisible()) {
@@ -13639,6 +13726,7 @@ function initDiagnosticsChat() {
     conv.session = newChatSession();
     conv.lastStats = null;
     chatScrollState.pinned = null;
+    chatThinkPin.delete(String(chatState.slotId));
     chatMarkUnread(false);
     renderChatAll();
   });
