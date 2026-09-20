@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import atexit
 import base64
+import ctypes
 import gc
 import io
 import json
 import logging
 import os
 import re
+import resource
 import signal
 import subprocess
 import sys
@@ -34,6 +36,7 @@ from flask_cors import CORS
 from phonikud import lexicon
 from phonikud_onnx import Phonikud
 from tqdm import tqdm
+from transformers.cache_utils import StaticCache
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
 from transformers.generation.logits_process import (
     MinPLogitsWarper,
@@ -77,6 +80,78 @@ MAX_NEW_TOKENS = _MAX_NEW_TOKENS_ENV if _MAX_NEW_TOKENS_ENV > 0 else None
 SLOW_TAIL_TOKEN_THRESHOLD = max(0, int(os.getenv("PHONIKUD_UPSTREAM_SLOW_TAIL_TOKEN_THRESHOLD", "420") or "420"))
 SLOW_TAIL_MAX_SECONDS = max(0.0, float(os.getenv("PHONIKUD_UPSTREAM_SLOW_TAIL_MAX_SECONDS", "120") or "120"))
 FFMPEG_PATH = os.getenv("FFMPEG_PATH") or "/opt/homebrew/bin/ffmpeg"
+# Round the prefill up to a multiple of this many positions before the decode.
+# Metal keeps a compiled graph per tensor shape and never evicts one
+# (pytorch/pytorch#181213), so a server that meets a new sequence length on
+# every request grows for its whole life: this process reached 44 GB over about
+# a thousand chunks, and measured +24.8 MB for a request that changed only its
+# seed, against +4.6 MB for a repeat of one it had already seen. Padding to a
+# bucket makes every request reuse the graphs of the one before it. 0 = off.
+PREFILL_BUCKET = max(0, int(os.getenv("PHONIKUD_UPSTREAM_PREFILL_BUCKET", "64") or "64"))
+# The same for the vocoder, whose input length is the speech-token count.
+# MEASURED 2026-09-16: it does change what the listener hears. The flow-matching
+# vocoder conditions on the whole token sequence, so padded tokens alter the
+# audio inside the kept region too (max sample difference 32647 of 32768 on a
+# short clip). Keep this at 0 until a padding the vocoder truly ignores is found.
+SPEECH_TOKEN_BUCKET = max(0, int(os.getenv("PHONIKUD_UPSTREAM_SPEECH_TOKEN_BUCKET", "0") or "0"))
+# A decode cache of this fixed length. The prefill bucket removes one shape
+# dimension; this removes the other. With a growing cache every step has the
+# shape (padded prefill + step), so a request that generates a token count no
+# earlier request reached compiles a new graph per step -- 129 distinct token
+# counts in a 191-chunk episode. A fixed cache makes every step one shape.
+# 0 = off (a growing cache, the upstream behaviour).
+STATIC_CACHE_LEN = max(0, int(os.getenv("PHONIKUD_UPSTREAM_STATIC_CACHE_LEN", "0") or "0"))
+# Run the vocoder on this device. The graph-cache growth is an MPS bug
+# (pytorch/pytorch#181213), and the vocoder cannot be padded to a fixed shape
+# (its flow conditions on the whole token sequence, so padding changes the
+# sound), so "cpu" trades vocoder speed for a process that stops growing.
+VOCODER_DEVICE = str(os.getenv("PHONIKUD_UPSTREAM_VOCODER_DEVICE", "") or "").strip().lower()
+# Log how much memory each stage of a request adds, so the growth can be
+# attributed to the decode or to the vocoder.
+STAGE_MEMORY_LOG = os.getenv("PHONIKUD_UPSTREAM_STAGE_MEMORY_LOG", "true").strip().lower() in {"1", "true", "yes"}
+
+
+def _bucket_length(length: int, bucket: int) -> int:
+    """Round a sequence length up, so few distinct shapes reach Metal."""
+    if bucket <= 1 or length <= 0:
+        return length
+    return ((length + bucket - 1) // bucket) * bucket
+
+
+class _RUsageInfoV2(ctypes.Structure):
+    _fields_ = [
+        ("ri_uuid", ctypes.c_uint8 * 16),
+        ("ri_user_time", ctypes.c_uint64),
+        ("ri_system_time", ctypes.c_uint64),
+        ("ri_pkg_idle_wkups", ctypes.c_uint64),
+        ("ri_interrupt_wkups", ctypes.c_uint64),
+        ("ri_pageins", ctypes.c_uint64),
+        ("ri_wired_size", ctypes.c_uint64),
+        ("ri_resident_size", ctypes.c_uint64),
+        ("ri_phys_footprint", ctypes.c_uint64),
+        ("ri_proc_start_abstime", ctypes.c_uint64),
+        ("ri_proc_exit_abstime", ctypes.c_uint64),
+        ("ri_child_user_time", ctypes.c_uint64),
+        ("ri_child_system_time", ctypes.c_uint64),
+        ("ri_child_pkg_idle_wkups", ctypes.c_uint64),
+        ("ri_child_interrupt_wkups", ctypes.c_uint64),
+        ("ri_child_pageins", ctypes.c_uint64),
+        ("ri_child_elapsed_abstime", ctypes.c_uint64),
+        ("ri_diskio_bytesread", ctypes.c_uint64),
+        ("ri_diskio_byteswritten", ctypes.c_uint64),
+    ]
+
+
+def _process_footprint_mb() -> float:
+    """This process's physical footprint, the figure Activity Monitor shows."""
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        info = _RUsageInfoV2()
+        if libproc.proc_pid_rusage(os.getpid(), 2, ctypes.byref(info)) == 0:
+            return info.ri_phys_footprint / (1024 * 1024)
+    except Exception:  # noqa: BLE001 -- a measurement must never fail a request
+        pass
+    return float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) / (1024 * 1024)
 
 # --- Speed knobs (all default to legacy behavior) ---------------------------
 # T3 backbone dtype: float32 (legacy) | float16 | bfloat16. The s3gen vocoder
@@ -351,12 +426,24 @@ def _patched_backend_forward(
     return_dict=True,
     attention_mask=None,
     position_ids=None,
+    cache_position=None,
 ):
     is_large_input = inputs_embeds.size(1) != 1
-    has_cache = past_key_values is not None and len(past_key_values) > 0
+    # len() counts a fixed-length cache's layers, which exist before anything is
+    # written, so ask how much of it is filled.
+    if past_key_values is None:
+        has_cache = False
+    else:
+        try:
+            has_cache = int(past_key_values.get_seq_length()) > 0
+        except Exception:  # noqa: BLE001 -- a cache without that method
+            has_cache = len(past_key_values) > 0
     assert not (is_large_input and has_cache)
     assert return_dict
 
+    model_kwargs = {}
+    if cache_position is not None:
+        model_kwargs["cache_position"] = cache_position
     tfmr_out = self.model(
         inputs_embeds=inputs_embeds,
         past_key_values=past_key_values,
@@ -366,6 +453,7 @@ def _patched_backend_forward(
         return_dict=True,
         attention_mask=attention_mask,
         position_ids=position_ids,
+        **model_kwargs,
     )
     hidden_states = tfmr_out.hidden_states[-1] if output_hidden_states else tfmr_out.last_hidden_state
     logits = self.speech_head(hidden_states)
@@ -651,7 +739,11 @@ def _batched_t3_decode(t3: T3, job_embeds: list[torch.Tensor], params: dict[str,
     embed_dtype = job_embeds[0].dtype
     dim = job_embeds[0].size(-1)
     lengths = [e.size(1) for e in job_embeds]
-    max_len = max(lengths)
+    # Left padding is already part of this path, so widening the batch to a
+    # bucket costs one masked column block and buys a shape Metal has compiled
+    # before. Without it every request is a new shape and its graphs are kept
+    # for the life of the process (pytorch/pytorch#181213).
+    max_len = _bucket_length(max(lengths), PREFILL_BUCKET)
     rows = 2 * n_jobs
 
     inputs = torch.zeros(rows, max_len, dim, dtype=embed_dtype, device=device)
@@ -678,15 +770,39 @@ def _batched_t3_decode(t3: T3, job_embeds: list[torch.Tensor], params: dict[str,
         prefill_mask[rows_idx, 0, query_idx, 0] = 0
 
     backend = _get_or_create_t3_backend(t3)
+    # A fixed-length cache keeps every decode step at one shape. Without it the
+    # key length is (prefill + step) and each token count an earlier request
+    # never reached compiles a new graph that Metal keeps forever.
+    static_cache = None
+    cache_len = 0
+    static_key_valid = None
+    prefill_positions = None
+    if STATIC_CACHE_LEN and (max_len + int(t3.hp.max_speech_tokens)) >= STATIC_CACHE_LEN >= max_len + 2:
+        try:
+            static_cache = StaticCache(config=t3.tfmr.config, max_cache_len=STATIC_CACHE_LEN)
+            cache_len = STATIC_CACHE_LEN
+        except Exception as exc:  # noqa: BLE001 -- fall back to the growing cache
+            logger.warning("Static cache unavailable (%s); using the growing cache.", exc)
+            static_cache = None
+    if static_cache is not None:
+        # The prefill occupies slots [0, max_len); everything beyond is unwritten
+        # and must stay masked until a step fills it.
+        wide = torch.full((rows, 1, max_len, cache_len), mask_min, dtype=embed_dtype, device=device)
+        wide[:, :, :, :max_len] = prefill_mask
+        prefill_mask = wide
+        static_key_valid = torch.zeros(rows, cache_len, dtype=embed_dtype, device=device)
+        static_key_valid[:, :max_len] = attention_mask.to(embed_dtype)
+        prefill_positions = torch.arange(max_len, device=device)
     output = backend(
         inputs_embeds=inputs,
-        past_key_values=None,
+        past_key_values=static_cache,
         use_cache=True,
         output_attentions=False,
         output_hidden_states=False,
         return_dict=True,
         attention_mask=prefill_mask,
         position_ids=position_ids,
+        cache_position=prefill_positions,
     )
     past = output.past_key_values
     row_real_len = attention_mask.sum(dim=1)  # (2B,) positions consumed so far
@@ -698,6 +814,9 @@ def _batched_t3_decode(t3: T3, job_embeds: list[torch.Tensor], params: dict[str,
     max_tokens = int(t3.hp.max_speech_tokens)
     if MAX_NEW_TOKENS is not None:
         max_tokens = min(max_tokens, MAX_NEW_TOKENS)
+    if static_cache is not None:
+        # The cache cannot grow, so the decode has to stop inside it.
+        max_tokens = min(max_tokens, cache_len - max_len - 1)
 
     bos_column = torch.full((n_jobs, 1), t3.hp.start_speech_token, dtype=torch.long, device=device)
     generated_ids = bos_column.clone()  # (B, 1+steps) for the repetition processor
@@ -760,6 +879,14 @@ def _batched_t3_decode(t3: T3, job_embeds: list[torch.Tensor], params: dict[str,
 
         sampled_steps.append(next_token)
         generated_ids = torch.cat([generated_ids, next_token], dim=1)
+        if STAGE_MEMORY_LOG and i == 7:
+            # The first tokens are the cheapest way to tell the two cache paths
+            # apart: a wrong prefill shows up immediately, a wrong step mask later.
+            logger.info(
+                "First tokens (static_cache=%s prefill=%s): %s",
+                bool(static_cache is not None), max_len,
+                torch.cat(sampled_steps[:8], dim=1).cpu().tolist(),
+            )
 
         if (i + 1) % FAST_SAMPLING_SYNC_EVERY == 0 or (i + 1) >= max_tokens:
             if _sync_window(i + 1):
@@ -786,10 +913,19 @@ def _batched_t3_decode(t3: T3, job_embeds: list[torch.Tensor], params: dict[str,
 
         next_embed = t3.speech_emb(next_token) + t3.speech_pos_emb.get_fixed_embedding(i + 1)  # (B, 1, D)
         step_inputs = next_embed.repeat_interleave(2, dim=0).to(dtype=embed_dtype)  # (2B, 1, D)
-        step_attention = torch.cat(
-            [step_attention, torch.ones(rows, 1, dtype=torch.long, device=device)], dim=1
-        )
         step_positions = (row_real_len + i).unsqueeze(1)  # (2B, 1)
+        if static_cache is not None:
+            # One shape for every step: a full-width mask over the fixed cache,
+            # with the slot this step writes marked valid.
+            static_key_valid[:, max_len + i] = 1
+            step_mask = ((1 - static_key_valid) * mask_min)[:, None, None, :]  # (2B,1,1,cache_len)
+            step_cache_position = torch.tensor([max_len + i], device=device)
+        else:
+            step_attention = torch.cat(
+                [step_attention, torch.ones(rows, 1, dtype=torch.long, device=device)], dim=1
+            )
+            step_mask = step_attention
+            step_cache_position = None
         output = backend(
             inputs_embeds=step_inputs,
             past_key_values=past,
@@ -797,8 +933,9 @@ def _batched_t3_decode(t3: T3, job_embeds: list[torch.Tensor], params: dict[str,
             output_attentions=False,
             output_hidden_states=False,
             return_dict=True,
-            attention_mask=step_attention,
+            attention_mask=step_mask,
             position_ids=step_positions,
+            cache_position=step_cache_position,
         )
         past = output.past_key_values
 
@@ -870,14 +1007,115 @@ def _prepare_job_prefill_embeds(model: ChatterboxMultilingualTTS, normalized_tex
 def _vocode_speech_tokens(model: ChatterboxMultilingualTTS, speech_tokens: torch.Tensor, conds) -> torch.Tensor:
     """speech tokens -> waveform, mirroring the serial generate() tail."""
     speech_tokens = drop_invalid_tokens(speech_tokens)
-    speech_tokens = speech_tokens.to(model.device)
-    wav, _ = model.s3gen.inference(speech_tokens=speech_tokens, ref_dict=conds.gen)
-    wav = wav.squeeze(0).detach().cpu().numpy()
+    target_device = VOCODER_DEVICE or model.device
+    speech_tokens = speech_tokens.to(target_device)
     n_tokens = int(speech_tokens.shape[-1])
+    token_lens = None
+    if SPEECH_TOKEN_BUCKET > 1 and n_tokens > 0:
+        padded_len = _bucket_length(n_tokens, SPEECH_TOKEN_BUCKET)
+        if padded_len > n_tokens:
+            # s3gen.inference takes speech_token_lens, the argument that exists so
+            # a padded batch still decodes each row at its own length, so the
+            # padding here is masked rather than spoken. Without it the vocoder
+            # sees a new shape per token count -- 96% of what this process still
+            # grows by once the decode cache is fixed.
+            tail = speech_tokens[..., -1:].expand(*speech_tokens.shape[:-1], padded_len - n_tokens)
+            speech_tokens = torch.cat([speech_tokens, tail], dim=-1)
+            token_lens = torch.tensor([n_tokens], dtype=torch.long, device=speech_tokens.device)
+    ref_dict = conds.gen
+    if VOCODER_DEVICE:
+        ref_dict = {
+            key: (value.to(target_device) if torch.is_tensor(value) else value)
+            for key, value in dict(ref_dict).items()
+        }
+    wav, _ = model.s3gen.inference(speech_tokens=speech_tokens, ref_dict=ref_dict, speech_token_lens=token_lens)
+    wav = wav.squeeze(0).detach().cpu().numpy()
     st_len = max(1, n_tokens - 1)
     wav = wav[: st_len * (S3GEN_SR // S3_TOKEN_RATE)]
     watermarked = model.watermarker.apply_watermark(wav, sample_rate=model.sr)
     return torch.from_numpy(watermarked).unsqueeze(0)
+
+
+def _patched_flow_inference(
+    self,
+    token,
+    token_len,
+    prompt_token,
+    prompt_token_len,
+    prompt_feat,
+    prompt_feat_len,
+    embedding,
+    finalize,
+    n_timesteps=10,
+    noised_mels=None,
+    meanflow=False,
+):
+    """s3gen's flow inference, with its masks built at the padded width.
+
+    Upstream builds both masks from the lengths alone, so their width is the
+    longest TRUE length in the batch. That matches when a batch is padded to its
+    own longest row, and fails the moment a row is padded further ("The size of
+    tensor a (350) must match the size of tensor b (310)"). Padding every request
+    to a bucket is what keeps Metal from compiling a graph per token count
+    (pytorch/pytorch#181213), so the two masks are built at the padded width here
+    and the padding is masked out exactly as a shorter row in a batch would be.
+    """
+    from torch.nn import functional as F
+    from chatterbox.models.s3gen.flow import _repeat_batch_dim
+    from chatterbox.models.s3gen.utils.mask import make_pad_mask
+
+    B = token.size(0)
+
+    embedding = torch.atleast_2d(embedding)
+    embedding = F.normalize(embedding, dim=1)
+    embedding = self.spk_embed_affine_layer(embedding)
+
+    prompt_token = _repeat_batch_dim(prompt_token, B, ndim=2)
+    prompt_token_len = _repeat_batch_dim(prompt_token_len, B, ndim=1)
+    prompt_feat = _repeat_batch_dim(prompt_feat, B, ndim=3)
+    prompt_feat_len = _repeat_batch_dim(prompt_feat_len, B, ndim=1)
+    embedding = _repeat_batch_dim(embedding, B, ndim=2)
+
+    token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+    mask = (~make_pad_mask(token_len, max_len=token.size(1))).unsqueeze(-1).to(embedding)
+
+    token = self.input_embedding(token.long()) * mask
+
+    h, h_masks = self.encoder(token, token_len)
+    if finalize is False:
+        h = h[:, :-self.pre_lookahead_len * self.token_mel_ratio]
+
+    h_lengths = h_masks.sum(dim=-1).squeeze(dim=-1)
+    mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
+    h = self.encoder_proj(h)
+
+    conds = torch.zeros([B, mel_len1 + mel_len2, self.output_size], device=token.device).to(h.dtype)
+    conds[:, :mel_len1] = prompt_feat
+    conds = conds.transpose(1, 2)
+
+    mask = (~make_pad_mask(h_lengths, max_len=h.shape[1])).unsqueeze(1).to(h)
+    if mask.shape[0] != B:
+        mask = mask.repeat(B, 1, 1)
+
+    feat, _ = self.decoder(
+        mu=h.transpose(1, 2).contiguous(),
+        mask=mask,
+        spks=embedding,
+        cond=conds,
+        n_timesteps=n_timesteps,
+        noised_mels=noised_mels,
+        meanflow=meanflow,
+    )
+    feat = feat[:, :, mel_len1:]
+    assert feat.shape[2] == mel_len2
+    return feat, None
+
+
+if SPEECH_TOKEN_BUCKET > 1:
+    from chatterbox.models.s3gen.flow import CausalMaskedDiffWithXvec as _FlowWithXvec
+
+    _FlowWithXvec.inference = torch.inference_mode()(_patched_flow_inference)
+    logger.info("Vocoder padding enabled: flow masks are built at the padded width.")
 
 
 class _TTSBatchJob:
@@ -949,17 +1187,34 @@ class _TTSBatcher:
         try:
             with _TTS_INFERENCE_SEMAPHORE:
                 params = batch[0].params
+                started_mb = _process_footprint_mb() if STAGE_MEMORY_LOG else 0.0
                 job_embeds = [
                     _prepare_job_prefill_embeds(self.model, job.normalized, job.conds, float(params["cfg_weight"]))
                     for job in batch
                 ]
+                prefill_len = max(int(e.size(1)) for e in job_embeds) if job_embeds else 0
                 decoded = _batched_t3_decode(self.model.t3, job_embeds, params)
+                decoded_mb = _process_footprint_mb() if STAGE_MEMORY_LOG else 0.0
                 for job, (tokens, stats) in zip(batch, decoded):
                     try:
                         job.result = _vocode_speech_tokens(self.model, tokens, job.conds)
                         job.stats = stats
                     except Exception as exc:  # vocoder failure should not sink siblings
                         job.error = exc
+                if STAGE_MEMORY_LOG:
+                    # Metal keeps one compiled graph per shape, so this line says
+                    # which stage met a new shape (pytorch/pytorch#181213).
+                    vocoded_mb = _process_footprint_mb()
+                    logger.info(
+                        "Stage memory: jobs=%s prefill=%s padded=%s tokens=%s decode=%+.1fMB vocode=%+.1fMB total=%.0fMB",
+                        len(batch),
+                        prefill_len,
+                        _bucket_length(prefill_len, PREFILL_BUCKET),
+                        [int(t.size(0)) for t, _ in decoded],
+                        decoded_mb - started_mb,
+                        vocoded_mb - decoded_mb,
+                        vocoded_mb,
+                    )
         except Exception as exc:
             for job in batch:
                 if job.error is None and job.result is None:
@@ -1400,6 +1655,10 @@ def main() -> None:
     if EXIT_MARKER_PATH is not None:
         EXIT_MARKER_PATH.unlink(missing_ok=True)
     ensure_models()
+    if VOCODER_DEVICE and MODEL is not None:
+        # The decode keeps the GPU; only the vocoder moves.
+        MODEL.s3gen.to(VOCODER_DEVICE)
+        logger.info("Vocoder moved to %s (the decode stays on %s)", VOCODER_DEVICE, pick_device())
     logger.info("Phonikud upstream models preloaded successfully on %s", pick_device())
     app.run(host=args.host, port=args.port, threaded=True)
 

@@ -20,8 +20,9 @@
 # tensors -- REAP pruning dropped it). Pass --draft-model/--draft-kind for a
 # target that does ship one.
 #
-# The server speaks /v1 directly, so like mlx-dspark there is no proxy layer and
-# it binds the slot's public port itself.
+# The server speaks /v1, but like mlx-dspark it runs on a backend port behind
+# src/slot-api-proxy.py (with --no-sampling-defaults). Binding the public port
+# itself left llm3's Logs -> Thinking and Traffic tabs empty.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
@@ -39,6 +40,7 @@ STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/mlx_vlm"
 SLOT="slot1"
 STATE_DIR=""
 PORT=""
+BACKEND_PORT=""
 HOST="0.0.0.0"
 LOG_FILE=""
 PID_FILE=""
@@ -54,6 +56,9 @@ REPETITION_PENALTY=""
 DRAFT_MODEL="${MLX_VLM_DRAFT_MODEL:-}"
 DRAFT_KIND="${MLX_VLM_DRAFT_KIND:-}"
 REASONING_EFFORT=""
+# 1 once --reasoning-effort was passed. "" then means "use the template default",
+# which must not fall back to the slot's saved effort (it may be a level = on).
+REASONING_EFFORT_GIVEN=0
 ACTION=""
 FOREGROUND=0
 SKIP_STOP=0
@@ -88,7 +93,11 @@ configure_slot() {
   # at a time, so they deliberately share 8036+n and llm3's slot plumbing needs
   # no per-launcher knowledge.
   [[ -n "${PORT}" ]] || PORT="$((8036 + index - 1))"
+  # llm3's MLX backend port base (MLX_BACKEND_PORT_BASE in src/server.js).
+  [[ -n "${BACKEND_PORT}" ]] || BACKEND_PORT="$((18136 + index - 1))"
   [[ -n "${LOG_FILE}" ]] || LOG_FILE="${STATE_DIR}/mlx-vlm-api.log"
+  PROXY_LOG_FILE="${STATE_DIR}/proxy.log"
+  TRAFFIC_LOG_FILE="${STATE_DIR}/traffic.log"
   [[ -n "${PID_FILE}" ]] || PID_FILE="${STATE_DIR}/mlx-vlm-api.pid"
   STATE_FILE="${STATE_DIR}/current.json"
   DEFAULTS_FILE="${STATE_DIR}/defaults.json"
@@ -141,7 +150,7 @@ save_defaults() {
   "minP": ${MIN_P:-$DEFAULT_MIN_P},
   "presencePenalty": ${PRESENCE_PENALTY:-$DEFAULT_PRESENCE_PENALTY},
   "repetitionPenalty": ${REPETITION_PENALTY:-$DEFAULT_REPETITION_PENALTY},
-  "reasoningEffort": "${REASONING_EFFORT:-$DEFAULT_REASONING_EFFORT}",
+  "reasoningEffort": "$( (( REASONING_EFFORT_GIVEN )) && printf '%s' "${REASONING_EFFORT}" || printf '%s' "${DEFAULT_REASONING_EFFORT}" )",
   "draftModel": "${DRAFT_MODEL:-$DEFAULT_DRAFT_MODEL}",
   "draftKind": "${DRAFT_KIND:-$DEFAULT_DRAFT_KIND}"
 }
@@ -209,10 +218,11 @@ PY
 }
 
 status_json() {
-  /usr/bin/python3 - "${STATE_FILE}" "${PID_FILE}" "${LOG_FILE}" <<'PY'
+  /usr/bin/python3 - "${STATE_FILE}" "${PID_FILE}" "${LOG_FILE}" "${PROXY_LOG_FILE}" "${TRAFFIC_LOG_FILE}" <<'PY'
 import json, os, sys
 from pathlib import Path
 state_path, pid_path, log_file = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+idle_logs = {"server": log_file, "proxy": sys.argv[4], "traffic": sys.argv[5]}
 
 def alive(pid):
     try:
@@ -222,7 +232,7 @@ def alive(pid):
     return True
 
 if not state_path.exists():
-    print(json.dumps({"running": False, "logs": {"server": log_file}}, indent=2))
+    print(json.dumps({"running": False, "logs": idle_logs}, indent=2))
     raise SystemExit(0)
 data = json.loads(state_path.read_text())
 pid = (data.get("pids") or {}).get("server")
@@ -235,7 +245,7 @@ else:
             Path(path).unlink()
         except FileNotFoundError:
             pass
-    print(json.dumps({"running": False, "logs": {"server": log_file}}, indent=2))
+    print(json.dumps({"running": False, "logs": idle_logs}, indent=2))
 PY
 }
 
@@ -284,12 +294,12 @@ write_state_file() {
     "publicHost": "${HOST}",
     "publicPort": ${PORT},
     "backendHost": "127.0.0.1",
-    "backendPort": ${PORT}
+    "backendPort": ${BACKEND_PORT}
   },
   "logs": {
     "server": "${LOG_FILE}",
-    "traffic": "",
-    "proxy": "${LOG_FILE}"
+    "traffic": "${TRAFFIC_LOG_FILE}",
+    "proxy": "${PROXY_LOG_FILE}"
   },
   "pids": {
     "server": ${server_pid}
@@ -310,16 +320,11 @@ stop_instance() {
     done
     kill -0 "${pid}" 2>/dev/null && kill -9 "${pid}" 2>/dev/null || true
   fi
-  # Anything still holding the slot port (a crashed predecessor) has to go, or
-  # the next start silently binds nothing. netstat, never lsof: lsof walks every
-  # descriptor on the box and stalls on a hung network mount.
-  local holder=""
-  holder="$(netstat -anv -p tcp 2>/dev/null | awk -v port="${PORT}" '$6=="LISTEN" && $4 ~ ("\\."port"$") {print $11}' | sed 's/.*://' | head -1 || true)"
-  if [[ -n "${holder}" && "${holder}" != "0" ]] && kill -0 "${holder}" 2>/dev/null; then
-    kill "${holder}" 2>/dev/null || true
-    sleep 1
-    kill -0 "${holder}" 2>/dev/null && kill -9 "${holder}" 2>/dev/null || true
-  fi
+  # Anything still holding the slot's two ports (a crashed predecessor, or a
+  # proxy/backend left behind by a killed wrapper) has to go, or the next start
+  # silently binds nothing.
+  kill_port_listener "${PORT}"
+  kill_port_listener "${BACKEND_PORT}"
   rm -f "${PID_FILE}" "${STATE_FILE}"
 }
 
@@ -335,12 +340,13 @@ while [[ $# -gt 0 ]]; do
     --min-p) MIN_P="$2"; shift 2 ;;
     --presence-penalty) PRESENCE_PENALTY="$2"; shift 2 ;;
     --repetition-penalty) REPETITION_PENALTY="$2"; shift 2 ;;
-    --reasoning-effort) REASONING_EFFORT="$2"; shift 2 ;;
+    --reasoning-effort) REASONING_EFFORT="$2"; REASONING_EFFORT_GIVEN=1; shift 2 ;;
     --draft-model) DRAFT_MODEL="$2"; shift 2 ;;
     --draft-kind) DRAFT_KIND="$2"; shift 2 ;;
     --mode) shift 2 ;;   # accepted and ignored: mlx-vlm has no mode registry
     --host) HOST="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
+    --backend-port) BACKEND_PORT="$2"; shift 2 ;;
     --state-dir) STATE_DIR="$2"; shift 2 ;;
     --log-file) LOG_FILE="$2"; shift 2 ;;
     --pid-file) PID_FILE="$2"; shift 2 ;;
@@ -386,7 +392,7 @@ TOP_K="${TOP_K:-$DEFAULT_TOP_K}"
 MIN_P="${MIN_P:-$DEFAULT_MIN_P}"
 PRESENCE_PENALTY="${PRESENCE_PENALTY:-$DEFAULT_PRESENCE_PENALTY}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-$DEFAULT_REPETITION_PENALTY}"
-REASONING_EFFORT="${REASONING_EFFORT:-$DEFAULT_REASONING_EFFORT}"
+(( REASONING_EFFORT_GIVEN )) || REASONING_EFFORT="${DEFAULT_REASONING_EFFORT}"
 DRAFT_MODEL="${DRAFT_MODEL:-$DEFAULT_DRAFT_MODEL}"
 DRAFT_KIND="${DRAFT_KIND:-$DEFAULT_DRAFT_KIND}"
 
@@ -429,10 +435,11 @@ if (( FOREGROUND )); then
 
   # --max-kv-size is mlx-vlm's context bound; there is no --context-window here.
   # --max-num-seqs is its continuous-batching width, i.e. llm3's "parallel".
-  exec "${PY_BIN}" -m mlx_vlm.server \
+  serve_behind_slot_proxy "${BACKEND_PORT}" "${HOST}" "${PORT}" "${PROXY_LOG_FILE}" "${TRAFFIC_LOG_FILE}" -- \
+    "${PY_BIN}" -m mlx_vlm.server \
     --model "${MODEL_DIR}" \
-    --host "${HOST}" \
-    --port "${PORT}" \
+    --host 127.0.0.1 \
+    --port "${BACKEND_PORT}" \
     --max-kv-size "${CONTEXT_SIZE}" \
     --max-num-seqs "${PARALLEL}" \
     "${think_args[@]}" \
@@ -442,7 +449,7 @@ fi
 
 server_pid="$(
   spawn_detached "${LOG_FILE}" "$0" --foreground --skip-stop --slot "${SLOT}" --model "${MODEL_DIR}" \
-    --host "${HOST}" --port "${PORT}" --state-dir "${STATE_DIR}" --log-file "${LOG_FILE}" --pid-file "${PID_FILE}" \
+    --host "${HOST}" --port "${PORT}" --backend-port "${BACKEND_PORT}" --state-dir "${STATE_DIR}" --log-file "${LOG_FILE}" --pid-file "${PID_FILE}" \
     --context-size "${CONTEXT_SIZE}" --parallel "${PARALLEL}" \
     --reasoning-effort "${REASONING_EFFORT}" \
     --draft-model "${DRAFT_MODEL}" --draft-kind "${DRAFT_KIND}" \
@@ -454,7 +461,9 @@ echo "${server_pid}" > "${PID_FILE}"
 
 # 68GB of 4-bit weights loaded in 12s warm here, but a cold page-in off the SSD
 # is the case that matters; the other MLX launchers allow 180-300s.
-if ! wait_for_http "http://127.0.0.1:${PORT}/v1/models" 300; then
+# The public port answers only once the backend is up (300s inside) and the proxy
+# has started, hence a little more.
+if ! wait_for_http "http://127.0.0.1:${PORT}/v1/models" 330; then
   echo "Timed out waiting for mlx-vlm on ${HOST}:${PORT} (see ${LOG_FILE})" >&2
   exit 1
 fi
@@ -463,6 +472,7 @@ write_state_file "${server_pid}"
 echo "Started mlx-vlm on ${HOST}:${PORT}"
 echo "PID: ${server_pid}"
 echo "Log: ${LOG_FILE}"
+echo "Proxy log: ${PROXY_LOG_FILE} (backend 127.0.0.1:${BACKEND_PORT})"
 echo "Model: ${MODEL_DIR}"
 echo "Context size: ${CONTEXT_SIZE} tokens"
 if [[ -n "${DRAFT_KIND}" ]]; then

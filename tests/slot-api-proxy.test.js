@@ -175,6 +175,39 @@ test("env-configured (qwen_llama) mode injects sampling defaults and passes /v1/
   assert.equal(log[0].model, "m");
 });
 
+test("--no-sampling-defaults (mlx-dspark, mlx-vlm) forwards the body unchanged and still logs thinking", async (t) => {
+  const backend = await startBackend(t);
+  const proxy = await startProxy(t, {
+    backendPort: backend.port,
+    args: ["--no-sampling-defaults"],
+    env: { QWEN_PROXY_DEFAULT_TEMPERATURE: "0.3" },
+  });
+
+  // Exact bytes, including spacing JSON.stringify would not produce.
+  const raw = '{"model": "m", "messages": [], "top_p": 0.5}';
+  const response = await fetch(`${proxy.base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: raw,
+  });
+  assert.equal(response.status, 200);
+  await response.json();
+  assert.equal(backend.seen.at(-1).body, raw, "no sampling keys added, body not re-encoded");
+
+  // A non-streamed completion used to leave the Thinking tab empty.
+  assert.match(proxy.output(), /\[thinking\] hmm\n/);
+  assert.match(proxy.output(), /\[answer\] hello\n/);
+
+  const streamed = await chat(proxy.base, { model: "m", messages: [], stream: true });
+  await streamed.text();
+  const deadline = Date.now() + 5000;
+  while (!/\[stream done\]/.test(proxy.output()) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  assert.equal(proxy.output().match(/\[thinking\] hmm/g).length, 2);
+  assert.match(proxy.output(), /\[stream done\]/);
+});
+
 test("--hide-reasoning strips reasoning from JSON and SSE responses but keeps it in the logs", async (t) => {
   const backend = await startBackend(t);
   const proxy = await startProxy(t, { backendPort: backend.port, env: { QWEN_PROXY_HIDE_REASONING: "true" } });
@@ -249,4 +282,53 @@ test("missing configuration is rejected with a usage error", async (t) => {
   const code = await new Promise((resolve) => child.on("exit", resolve));
   assert.equal(code, 2);
   assert.match(stderr, /--port, --backend-port and --traffic-log are required/);
+});
+
+// The dashboard spinner used to be driven only by a decode counter moving
+// between two polls, which is blind to prefill, to a queued request and to a
+// stall -- all of which are the model working. The proxy holds every generation
+// request, so it can answer "is something open right now".
+test("/llm3/activity reports the generation requests the proxy is holding", async (t) => {
+  const backend = await startBackend(t);
+  // A backend that holds the request open, so the probe can observe it in flight.
+  const held = http.createServer((req, res) => {
+    if (req.url.split("?")[0] === "/v1/chat/completions") {
+      setTimeout(() => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ choices: [{ message: { role: "assistant", content: "ok" } }] }));
+      }, 1500);
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  await new Promise((resolve) => held.listen(0, "127.0.0.1", resolve));
+  t.after(() => held.close());
+
+  const proxy = await startProxy(t, { backendPort: held.address().port });
+
+  const idle = await (await fetch(`${proxy.base}/llm3/activity`)).json();
+  assert.equal(idle.inflight, 0, "nothing open yet");
+  assert.equal(idle.busy, false);
+
+  const generation = fetch(`${proxy.base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+  });
+  await new Promise((r) => setTimeout(r, 400));
+
+  const during = await (await fetch(`${proxy.base}/llm3/activity`)).json();
+  assert.equal(during.inflight, 1, "the open generation is counted while it runs");
+  assert.equal(during.busy, true);
+  assert.ok(during.openForMs > 0, "it reports how long it has been open");
+
+  await generation;
+  await new Promise((r) => setTimeout(r, 200));
+  const after = await (await fetch(`${proxy.base}/llm3/activity`)).json();
+  assert.equal(after.inflight, 0, "the counter must come back down");
+  assert.equal(after.busy, false);
+  assert.equal(after.openForMs, 0);
+  // The probe itself is not a generation, so it must never count itself.
+  assert.equal(backend.seen.length, 0, "the probe is answered locally, never proxied");
 });

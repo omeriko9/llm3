@@ -9,6 +9,13 @@ const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 
+// perf-dashboard-routes requires src/voxel-test.js, which reads PORT at import
+// and POSTs slot launches to http://127.0.0.1:<PORT>/api/start. Left alone that
+// is the LIVE dashboard on 7075: the run logged "Unknown model: fake-model" in
+// the real server log, and a key that happened to resolve would have launched a
+// real model. Point it at a port nothing listens on.
+process.env.PORT = process.env.LLM3_TEST_PORT || "9738";
+
 const MODULE_PATH = require.resolve("../src/perf-dashboard-routes.js");
 
 const FAKE_RUNNER = `#!/usr/bin/env python3

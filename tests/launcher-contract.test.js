@@ -23,6 +23,7 @@ const MODEL_LAUNCHERS = [
   "qwen_llama",
   "qwen_llama_beellama",
   "qwen_llama_tq3",
+  "qwen_llama_prism",
   "run-gpt-oss-turboquant-api.sh",
   "run-mlx-dspark-api.sh",
   "run-mlx-vlm-api.sh",

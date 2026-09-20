@@ -107,6 +107,111 @@ wait_for_http() {
   return 1
 }
 
+# serve_behind_slot_proxy BACKEND_PORT PUBLIC_HOST PUBLIC_PORT PROXY_LOG TRAFFIC_LOG -- COMMAND [ARGS...]
+# For a launcher's --foreground process. Starts COMMAND (a server that must bind
+# 127.0.0.1:BACKEND_PORT) in the background, waits for its /v1/models, then puts
+# src/slot-api-proxy.py on the slot's public port in front of it.
+#
+# The proxy is what writes the "[thinking]" / "[answer]" stream lines that llm3's
+# Logs -> Thinking tab reads, and the request/response pairs of the Traffic tab.
+# A server that bound the public port itself (mlx-dspark, mlx-vlm) left both tabs
+# empty. --no-sampling-defaults keeps the proxy from adding sampling keys the
+# client did not send, so the backend decodes exactly as it did without a proxy.
+#
+# COMMAND keeps this process's stdout (the launcher's server log); the proxy
+# writes to PROXY_LOG, so server output never lands inside a thinking block.
+# Never returns: when either process exits, or this process gets INT/TERM, both
+# are stopped and the function exits (non-zero unless stopped by a signal).
+serve_behind_slot_proxy() {
+  local backend_port="$1" public_host="$2" public_port="$3" proxy_log="$4" traffic_log="$5"
+  shift 5
+  [[ "${1:-}" == "--" ]] && shift
+  # SCRIPT_DIR is the launcher's bin/ (set before this file is sourced); $0 in a
+  # zsh function is the function name, so it cannot locate the repo.
+  local proxy_script="${SCRIPT_DIR:h}/src/slot-api-proxy.py"
+  if [[ ! -f "${proxy_script}" ]]; then
+    echo "Missing proxy script ${proxy_script}" >&2
+    exit 1
+  fi
+
+  typeset -g _SLOT_PAIR_BACKEND_PID="" _SLOT_PAIR_PROXY_PID=""
+  # Not an EXIT trap: in zsh an EXIT trap set inside a function fires when the
+  # function returns, not when the script exits. Every exit path below calls the
+  # cleanup itself; signals go through INT/TERM.
+  _slot_pair_stop() {
+    local pid="" waited=0
+    for pid in "${_SLOT_PAIR_PROXY_PID}" "${_SLOT_PAIR_BACKEND_PID}"; do
+      [[ -n "${pid}" ]] && kill "${pid}" 2>/dev/null || true
+    done
+    # An MLX server can take seconds to release its weights; wait for it, so a
+    # relaunch right after a stop does not load a second copy next to the first.
+    while (( waited < 30 )); do
+      kill -0 "${_SLOT_PAIR_BACKEND_PID:-0}" 2>/dev/null || kill -0 "${_SLOT_PAIR_PROXY_PID:-0}" 2>/dev/null || break
+      sleep 0.5
+      waited=$(( waited + 1 ))
+    done
+    for pid in "${_SLOT_PAIR_PROXY_PID}" "${_SLOT_PAIR_BACKEND_PID}"; do
+      [[ -n "${pid}" ]] && kill -9 "${pid}" 2>/dev/null || true
+    done
+  }
+  trap '_slot_pair_stop; exit 143' INT TERM
+
+  "$@" &
+  _SLOT_PAIR_BACKEND_PID=$!
+  local count=0
+  until curl -fsS -m 5 "http://127.0.0.1:${backend_port}/v1/models" >/dev/null 2>&1; do
+    if ! kill -0 "${_SLOT_PAIR_BACKEND_PID}" 2>/dev/null; then
+      echo "Backend exited before it served 127.0.0.1:${backend_port}" >&2
+      _slot_pair_stop
+      exit 1
+    fi
+    if (( count >= 300 )); then
+      echo "Backend did not serve 127.0.0.1:${backend_port} within 300s" >&2
+      _slot_pair_stop
+      exit 1
+    fi
+    sleep 1
+    count=$(( count + 1 ))
+  done
+
+  "${LLM3_HELPER_PYTHON}" -u "${proxy_script}" \
+    --host "${public_host}" \
+    --port "${public_port}" \
+    --backend-host 127.0.0.1 \
+    --backend-port "${backend_port}" \
+    --traffic-log "${traffic_log}" \
+    --no-sampling-defaults \
+    >>"${proxy_log}" 2>&1 &
+  _SLOT_PAIR_PROXY_PID=$!
+  echo "Proxy ${public_host}:${public_port} -> 127.0.0.1:${backend_port} (log ${proxy_log})"
+
+  while kill -0 "${_SLOT_PAIR_BACKEND_PID}" 2>/dev/null && kill -0 "${_SLOT_PAIR_PROXY_PID}" 2>/dev/null; do
+    sleep 1
+  done
+  if kill -0 "${_SLOT_PAIR_BACKEND_PID}" 2>/dev/null; then
+    echo "Slot proxy on ${public_port} exited; stopping the backend" >&2
+  else
+    echo "Backend on ${backend_port} exited; stopping the slot proxy" >&2
+  fi
+  _slot_pair_stop
+  exit 1
+}
+
+# kill_port_listener PORT
+# Stops whatever listens on PORT. netstat, never lsof: lsof walks every
+# descriptor on the box and stalls on a hung network mount.
+kill_port_listener() {
+  local port="$1" holder=""
+  [[ -n "${port}" ]] || return 0
+  holder="$(netstat -anv -p tcp 2>/dev/null | awk -v port="${port}" '$6=="LISTEN" && $4 ~ ("\\."port"$") {print $11}' | sed 's/.*://' | head -1 || true)"
+  if [[ -n "${holder}" && "${holder}" != "0" ]] && kill -0 "${holder}" 2>/dev/null; then
+    kill "${holder}" 2>/dev/null || true
+    sleep 1
+    kill -0 "${holder}" 2>/dev/null && kill -9 "${holder}" 2>/dev/null || true
+  fi
+  return 0
+}
+
 # spawn_detached LOG_FILE COMMAND [ARGS...]
 # Starts COMMAND in its own session with stdout+stderr appended to LOG_FILE and
 # prints its pid. The child survives the launcher (and a pm2 restart of the

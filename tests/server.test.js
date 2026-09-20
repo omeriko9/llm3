@@ -269,7 +269,7 @@ test("launcher metadata exposes grouped launchers and exact command templates", 
 
   assert.deepEqual(
     definitions.map((entry) => entry.key),
-    ["gguf", "gguf-tq3", "beellama", "mlx", "rapid-mlx", "mtplx", "mlx-dspark", "mlx-vlm", "ds4", "optiq"],
+    ["gguf", "gguf-prism", "gguf-tq3", "beellama", "mlx", "rapid-mlx", "mtplx", "mlx-dspark", "mlx-vlm", "ds4", "optiq"],
   );
   assert.equal(definitions.find((entry) => entry.key === "gguf")?.family, "gguf");
   assert.equal(definitions.find((entry) => entry.key === "mtplx")?.accent, "mtplx");
@@ -280,6 +280,10 @@ test("launcher metadata exposes grouped launchers and exact command templates", 
   assert.equal(definitions.find((entry) => entry.key === "mlx-vlm")?.family, "mlx");
   assert.match(buildLauncherCommandTemplate("mlx-vlm"), /run-mlx-vlm-api\.sh --slot <slot-id> --model <model-path>/);
   assert.match(buildLauncherCommandTemplate("gguf"), /qwen_llama .*<model-path> --ctx-size <ctx-size>/);
+  // gguf-prism is bin/qwen_llama pointed at the PrismML fork, so it takes the
+  // same arguments as the plain gguf launcher.
+  assert.equal(definitions.find((entry) => entry.key === "gguf-prism")?.family, "gguf");
+  assert.match(buildLauncherCommandTemplate("gguf-prism"), /qwen_llama_prism --slot <slot-id> <model-path> --ctx-size <ctx-size>/);
   assert.match(buildLauncherCommandTemplate("rapid-mlx"), /run-qwen36-rapid-mlx-api\.sh --slot <slot-id> --model <model-path>/);
   assert.match(buildLauncherCommandTemplate("mtplx"), /--port <public-port>/);
   assert.match(buildLauncherCommandTemplate("optiq"), /run-optiq-api\.sh --slot <slot-id> --model <model-path>/);
@@ -337,6 +341,78 @@ test("normalizeLaunchParamsForModel caps Gemma 4 context per request, not divide
   assert.equal(params.ctxSize, 262144);
   assert.equal(params.parallel, 2);
   assert.equal(params.thinking, true);
+});
+
+test("mlx-dspark thinking follows reasoning effort, not the thinking flag", async (t) => {
+  t.after(() => {
+    delete require.cache[SERVER_MODULE_PATH];
+  });
+
+  // mlx-dspark has no thinking flag: "off" is --no-thinking, anything else thinks.
+  // A stale thinking:false from before the launch modal offered the toggle must not
+  // report a thinking launch as non-thinking.
+  const { normalizeLaunchParamsForModel, parseLauncherRequestBody } = await loadServerWithEnv();
+  const model = { key: "/tmp/Qwen3.8-27B-8bit", label: "Qwen3.8 27B 8bit", runtime: "mlx", launcher: "mlx-dspark" };
+  const launch = (body) => normalizeLaunchParamsForModel(model, parseLauncherRequestBody({ launcher: "mlx-dspark", ...body }));
+  if (launch({}).launcher !== "mlx-dspark") {
+    t.skip("mlx-dspark is not installed on this machine");
+    return;
+  }
+  assert.equal(launch({ thinking: false, reasoningEffort: "" }).thinking, true);
+  assert.equal(launch({ thinking: true, reasoningEffort: "low" }).thinking, true);
+  assert.equal(launch({ thinking: true, reasoningEffort: "off" }).thinking, false);
+  assert.equal(launch({ thinking: false, reasoningEffort: "off" }).reasoningEffort, "off");
+});
+
+test("reasoningEffort: absent keeps the slot default, empty string means model default", async (t) => {
+  t.after(() => {
+    delete require.cache[SERVER_MODULE_PATH];
+  });
+
+  // Absent must stay null so the launcher keeps the slot's saved effort; "" must
+  // survive as "" so "Model default" is not silently replaced by a saved "off".
+  const { parseLauncherRequestBody, normalizeProfileSlotConfig } = await loadServerWithEnv();
+  assert.equal(parseLauncherRequestBody({}).reasoningEffort, null);
+  assert.equal(parseLauncherRequestBody({ reasoningEffort: null }).reasoningEffort, null);
+  assert.equal(parseLauncherRequestBody({ reasoningEffort: "" }).reasoningEffort, "");
+  assert.equal(parseLauncherRequestBody({ reasoningEffort: "OFF" }).reasoningEffort, "off");
+  assert.equal(parseLauncherRequestBody({ reasoningEffort: "high" }).reasoningEffort, null);
+
+  // Saved profiles keep the value; a profile saved before the field existed has none.
+  const slot = { enabled: true, modelKey: "/tmp/Qwen3.8-27B-8bit", launcher: "mlx-dspark" };
+  assert.equal(normalizeProfileSlotConfig("slot1", { ...slot, reasoningEffort: "low" }).reasoningEffort, "low");
+  assert.equal(normalizeProfileSlotConfig("slot1", { ...slot, reasoningEffort: "off" }).reasoningEffort, "off");
+  assert.equal(normalizeProfileSlotConfig("slot1", { ...slot, reasoningEffort: "" }).reasoningEffort, "");
+  assert.equal(normalizeProfileSlotConfig("slot1", slot).reasoningEffort, null);
+
+  // The speculation mode is kept the same way; an old profile has none.
+  assert.equal(normalizeProfileSlotConfig("slot1", { ...slot, dsparkMode: "dflash" }).dsparkMode, "dflash");
+  assert.equal(normalizeProfileSlotConfig("slot1", { ...slot, dsparkMode: "bogus" }).dsparkMode, null);
+  assert.equal(normalizeProfileSlotConfig("slot1", slot).dsparkMode, null);
+});
+
+test("mlx-vlm thinking is on only for an effort level", async (t) => {
+  t.after(() => {
+    delete require.cache[SERVER_MODULE_PATH];
+  });
+
+  // mlx-vlm turns a level into --enable-thinking; "" and "off" pass no flag, and
+  // mlx_vlm.server then renders enable_thinking=false.
+  // mlx-vlm is offered only for a model type that mlx-lm lacks and mlx-dspark
+  // cannot serve, so the fixture needs a real config.json.
+  const modelDir = await fs.mkdtemp(path.join(os.tmpdir(), "llm3-mlx-vlm-"));
+  t.after(() => fs.rm(modelDir, { recursive: true, force: true }));
+  await fs.writeFile(path.join(modelDir, "config.json"), JSON.stringify({ model_type: "mage_vl" }));
+  const { normalizeLaunchParamsForModel, parseLauncherRequestBody } = await loadServerWithEnv();
+  const model = { key: modelDir, label: "vlm-only fixture", runtime: "mlx", launcher: "mlx-vlm" };
+  const launch = (body) => normalizeLaunchParamsForModel(model, parseLauncherRequestBody({ launcher: "mlx-vlm", ...body }));
+  if (launch({}).launcher !== "mlx-vlm") {
+    t.skip("mlx-vlm is not offered for this model on this machine");
+    return;
+  }
+  assert.equal(launch({ reasoningEffort: "" }).thinking, false);
+  assert.equal(launch({ reasoningEffort: "off" }).thinking, false);
+  assert.equal(launch({ reasoningEffort: "xhigh" }).thinking, true);
 });
 
 test("QWEN_LLAMA_GEMMA4_MAX_CONTEXT raises the Gemma 4 cap", async (t) => {
@@ -830,6 +906,40 @@ test("getFailedIntegrationSyncMessages reports only failed application syncs", a
     "claudecode sync failed: launchctl service missing",
     "librechat sync failed: container restart failed",
   ]);
+});
+
+test("a PrismML ternary GGUF offers only the gguf-prism launcher", async () => {
+  const { getLaunchersForModel } = await loadServerWithEnv();
+  const prism = {
+    key: "/models/hf/dealignai__Bonsai-2-27B-Ternary-CRACK-GGUF/Bonsai-2-27B-PQ2_0-CRACK.gguf",
+    label: "Bonsai 2 27B PQ2 0 CRACK",
+    runtime: "gguf",
+  };
+  // ggml types 142/143 exist only in the PrismML fork, so no other launcher can
+  // load these files -- upstream llama.cpp refuses them at load time.
+  assert.deepEqual(getLaunchersForModel(prism), ["gguf-prism"]);
+  assert.deepEqual(
+    getLaunchersForModel({ ...prism, key: "/models/hf/x/Bonsai-2-27B-PTQ1_0-CRACK.gguf", label: "Bonsai 1bit" }),
+    ["gguf-prism"],
+  );
+  assert.deepEqual(
+    getLaunchersForModel({ key: "/models/hf/y/Qwen3.8-27B-Q8_0.gguf", label: "Qwen3.8 27B Q8 0", runtime: "gguf" }),
+    ["gguf"],
+  );
+});
+
+test("extractThinkingLogContent splits a stamped line glued to stream text", async () => {
+  const { extractThinkingLogContent } = await loadServerWithEnv();
+  const log = [
+    "2026-09-16T16:24:39Z [thinking] first",
+    "second2026-09-16T16:24:40Z [response] POST /v1/chat/completions status=200",
+    "2026-09-16T16:24:41Z [answer] hi2026-09-16T16:24:42Z [thinking] third",
+  ].join("\n");
+
+  assert.equal(
+    extractThinkingLogContent(Buffer.from(log), 0, 0),
+    "2026-09-16T16:24:39Z [thinking] first\nsecond\n2026-09-16T16:24:42Z [thinking] third"
+  );
 });
 
 test("readThinkingClearOffset drops stale marker offsets after log truncation", async (t) => {

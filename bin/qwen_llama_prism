@@ -1,0 +1,58 @@
+#!/bin/bash
+# PrismML llama.cpp fork, for the ternary Bonsai quantizations (PQ2_0, PTQ1_0).
+#
+# Those files store 402 of their 851 tensors as ggml types 142/143, which exist
+# only in this fork (upstream stops at 42), so upstream llama-server refuses
+# them at load: "tensor 'output.weight' has invalid ggml type 142".
+#
+# Measured here (M4 Max, Bonsai-2-27B-PQ2_0-CRACK, 6.7 GB, 128 tokens):
+#   -ngl 99  62 t/s prompt, 11.5-14.0 t/s generation
+#   -ngl 0   10.6 t/s prompt,      9.9 t/s generation
+# So Metal carries the prompt and helps generation a little: keep it on.
+#
+# Everything else is bin/qwen_llama; this only points it at the fork's build,
+# its own state root and its own backend port.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LLM3_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SLOT="${QWEN_LLAMA_SLOT:-slot1}"
+ARGS=("$@")
+
+for ((i = 0; i < ${#ARGS[@]}; i++)); do
+  if [[ "${ARGS[$i]}" == "--slot" && $((i + 1)) -lt ${#ARGS[@]} ]]; then
+    SLOT="${ARGS[$((i + 1))]}"
+    break
+  fi
+done
+
+case "$SLOT" in
+  slot[1-9]|slot[1-9][0-9]*)
+    SLOT_INDEX="${SLOT#slot}"
+    ;;
+  *)
+    echo "Invalid slot: $SLOT. Use slot1, slot2, slot3, ..." >&2
+    exit 1
+    ;;
+esac
+
+STATE_ROOT="${QWEN_LLAMA_PRISM_STATE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/qwen_llama_prism}"
+if [[ -z "${QWEN_LLAMA_STATE_DIR:-}" ]]; then
+  if [[ "$SLOT" == "slot1" ]]; then
+    export QWEN_LLAMA_STATE_DIR="$STATE_ROOT"
+  else
+    export QWEN_LLAMA_STATE_DIR="$STATE_ROOT/$SLOT"
+  fi
+fi
+
+export QWEN_LLAMA_PORT="${QWEN_LLAMA_PORT:-$((8036 + SLOT_INDEX - 1))}"
+export QWEN_LLAMA_BACKEND_PORT="${QWEN_LLAMA_BACKEND_PORT:-$((18936 + SLOT_INDEX - 1))}"
+export QWEN_LLAMA_SERVER="${QWEN_LLAMA_PRISM_SERVER:-$LLM3_DIR/vendor/prism-llama.cpp/build/bin/llama-server}"
+export QWEN_LLAMA_UPSTREAM_SERVER="$QWEN_LLAMA_SERVER"
+export QWEN_LLAMA_MTP_SERVER="$QWEN_LLAMA_SERVER"
+export QWEN_LLAMA_LAUNCHER_NAME="llama.cpp-prism"
+export QWEN_LLAMA_CTX_SIZE="${QWEN_LLAMA_CTX_SIZE:-8192}"
+export QWEN_LLAMA_PARALLEL="${QWEN_LLAMA_PARALLEL:-1}"
+export QWEN_LLAMA_GPU_LAYERS="${QWEN_LLAMA_GPU_LAYERS:-999}"
+
+exec "$SCRIPT_DIR/qwen_llama" "$@"

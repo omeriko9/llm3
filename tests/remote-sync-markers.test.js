@@ -12,7 +12,15 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
+
+// src/server.js resolves SERVER_LOG_PATH from LLM3_STATE_DIR at import time, so
+// this must be set BEFORE the require below. Without it the logging test wrote
+// its fake failures ("Unknown model: x", "boom") straight into the real
+// ~/.local/state/llm3/server.log, and 28 of the 51 errors in it were ours.
+const TEST_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "llm3-log-test-"));
+process.env.LLM3_STATE_DIR = TEST_STATE_DIR;
 
 const {
   extractMarkerPayload,
@@ -222,12 +230,12 @@ test("every failed action is logged, and successes and polls are not", () => {
     const after = fs.readFileSync(SERVER_LOG, "utf8");
     lines.push(after.slice(before).trim());
   };
-  const SERVER_LOG = path.join(
-    process.env.LLM3_STATE_DIR || path.join(require("node:os").homedir(), ".local", "state", "llm3"),
-    "server.log",
-  );
+  const SERVER_LOG = path.join(TEST_STATE_DIR, "server.log");
+  // The writer creates the file on first append; seed it so the delta reads
+  // below have something to measure from.
+  fs.mkdirSync(TEST_STATE_DIR, { recursive: true });
   if (!fs.existsSync(SERVER_LOG)) {
-    return; // no state dir on this machine; the parsing tests above still cover the format
+    fs.writeFileSync(SERVER_LOG, "", "utf8");
   }
 
   capture({ method: "GET", originalUrl: "/api/overview" }, stub(404), { error: "nope" });
