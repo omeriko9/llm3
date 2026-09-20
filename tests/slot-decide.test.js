@@ -50,10 +50,10 @@ async function startBackend(t, answer) {
   return { port: server.address().port, seen };
 }
 
-async function startProxy(t, backendPort) {
+async function startProxy(t, backendPort, extraArgs = []) {
   const port = await freePort();
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "llm3-decide-test-"));
-  const child = spawn("python3", ["-u", PROXY, "--no-sampling-defaults"], {
+  const child = spawn("python3", ["-u", PROXY, "--no-sampling-defaults", ...extraArgs], {
     env: {
       PATH: process.env.PATH,
       QWEN_PROXY_HOST: "127.0.0.1",
@@ -193,6 +193,17 @@ test("capabilities?probe=1 sends one probe call and then uses the stored result"
   assert.equal(backend.seen.length, 1);
   await fetch(`${base}/llm3/capabilities?probe=1`);
   assert.equal(backend.seen.length, 1);
+});
+
+test("--decide-slot pins decision calls to one llama-server slot, and the default does not", async (t) => {
+  const backend = await startBackend(t, () => ({ content: "A", top: [["A", 0.9], ["B", 0.1]] }));
+  const plain = await startProxy(t, backend.port);
+  await decide(plain, { question: "q?", choices: ["yes", "no"] });
+  assert.equal("id_slot" in backend.seen[0].body, false);
+
+  const pinned = await startProxy(t, backend.port, ["--decide-slot", "1"]);
+  await decide(pinned, { question: "q?", choices: ["yes", "no"], rotations: 2 });
+  assert.deepEqual(backend.seen.slice(1).map((s) => s.body.id_slot), [1, 1]);
 });
 
 test("requests that the caller must correct give status 400", async (t) => {

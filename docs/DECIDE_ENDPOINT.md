@@ -127,6 +127,56 @@ Measured 2026-09-20 on the M4 Max:
 | 2, `gguf` | Gemma4 31B QAT Q4_K_M | 0.999 | 0.66 s (89 prompt tokens) |
 | 1, `mlx-dspark` dflash + shim | Qwen3.8 27B MLX 8-bit | 0.96 to 0.98 | about 0.4 s |
 
+## Decision calls and the prompt cache (llama-server)
+
+A burst of decision calls can delete the long context of an agent that uses the
+same slot. Measured 2026-09-20 on a `gguf` slot (Gemma4 31B, `--parallel 2`,
+`--cache-ram 8192`), with two agent contexts of 75K and 81K tokens:
+
+| Step | Context 1 | Context 2 |
+| --- | --- | --- |
+| Repeat before the decision calls | 0.55 s, all cached | 0.41 s, all cached |
+| Repeat after 60 decision calls, **not pinned** | 657 s, nothing cached | 730 s, nothing cached |
+| Repeat after 60 decision calls, **pinned to slot 1** (3 runs) | 0.25 s, all cached (3 of 3) | 730 s, nothing cached (it was in the pinned slot) |
+
+The cause is in how llama-server selects a slot. A request whose prompt matches
+no slot (`--slot-prompt-similarity`) goes to the least recently used slot. The
+decision calls therefore alternate over all slots. Each one pushes the context
+that was there out to the host prompt cache (`--cache-ram`). Two contexts of
+about 5 GiB each do not fit in 8 GiB, so the server removed them
+(`making room for prompt cache entry, removing oldest entry`). With two 6K
+contexts nothing was lost, which is why a small test does not show this.
+
+The correction: the proxy adds `id_slot` to the backend request, so all decision
+calls go to **one** llama-server slot and the other slots keep their contexts.
+
+- `--decide-slot N` / `QWEN_PROXY_DECIDE_SLOT=N`. Default `-1` = do not pin.
+- `bin/qwen_llama` sets it to `parallel - 1` when `parallel >= 2`.
+- The llama-server log shows `selected slot by id (N)` for each call.
+- Only `bin/qwen_llama` sets it, so a backend that is not llama-server never gets the key.
+
+**What the pin does not solve.** A context that is *in the pinned slot* when a
+decision call arrives still goes to the host cache, and in the test above it did
+not come back: `--cache-ram 8192` also held older copies of both contexts
+(`--cache-idle-slots`, on by default, saves every idle slot on each new task),
+and the server removes the oldest entry first. So the rule for a caller is:
+
+- Contexts in the other slots are safe.
+- The context in the pinned slot is at risk when the host cache cannot hold it
+  beside what is there already. A larger `--cache-ram` (see
+  `src/llm3_cache_budget.py`) is the lever. It was not changed here.
+- The safe time for a burst of decision calls is between agent runs, when no
+  context is worth keeping.
+
+An erase of the pinned slot after each call (`POST /slots/N?action=erase`, so
+llama-server has no decision prompt to save) was tried and removed: it showed no
+benefit in the test, and llama-server defers an erase while the slot is busy,
+which can delete an agent context that took the slot in between.
+
+`mlx-dspark` did not show the problem. Same test on the MLX slot (Qwen3.8 27B,
+contexts of 17K and 21K tokens): both were fully cached after 60 decision calls
+(0.21 s and 0.22 s). It got no `id_slot`: only `bin/qwen_llama` sets the pin.
+
 ## The mlx-dspark shim
 
 ### The problem
@@ -270,4 +320,5 @@ uv pip install --python ~/.venvs/mlx-dspark/bin/python "mlx-dspark==0.19.0"
 
 | Date | Event |
 | --- | --- |
+| 2026-09-20 | Decision calls pinned to one llama-server slot after the prompt cache measurement. |
 | 2026-09-20 | `/v1/decide` and shim v1 written. mlx-dspark updated 0.15.1 -> 0.19.0 (only that package changed; the list before the update is in `~/.local/state/mlx_dspark/venv-freeze-0.15.1.txt`). Shim `active` on both versions. |

@@ -1356,6 +1356,13 @@ start_proxy() {
   # launcher). It reads its configuration from the QWEN_PROXY_* environment.
   local proxy_pid=""
   local proxy_script="$LLM3_DIR/src/slot-api-proxy.py"
+  # POST /v1/decide calls go to the last llama-server slot, so a burst of them
+  # cannot walk over every slot by LRU and push each agent context out of it.
+  # With one slot there is nothing to choose. See docs/DECIDE_ENDPOINT.md.
+  local decide_slot="-1"
+  if [ "${PARALLEL:-1}" -ge 2 ] 2>/dev/null; then
+    decide_slot="$((PARALLEL - 1))"
+  fi
   if [[ ! -f "$proxy_script" ]]; then
     echo "Missing proxy script $proxy_script" >&2
     return 1
@@ -1376,6 +1383,7 @@ start_proxy() {
       QWEN_PROXY_DEFAULT_REPETITION_PENALTY="$REPETITION_PENALTY" \
       QWEN_PROXY_HIDE_REASONING="${HIDE_REASONING:-false}" \
       QWEN_PROXY_MAX_CAPTURE="${QWEN_LLAMA_MAX_CAPTURE:-}" \
+      QWEN_PROXY_DECIDE_SLOT="$decide_slot" \
       python3 -u "$proxy_script")"
   echo "$proxy_pid" >"$PID_FILE"
   printf '%s\n' "$proxy_pid"

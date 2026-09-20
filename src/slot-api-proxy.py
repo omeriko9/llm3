@@ -107,6 +107,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     # sampling field were invisible, and responses were cut before
     # finish_reason or any tool_calls delta, which made stalls undiagnosable.
     parser.add_argument("--max-capture", type=int, default=env_int("QWEN_PROXY_MAX_CAPTURE", 200000))
+    # llama-server gives a request with no matching prompt to its least recently
+    # used slot. A burst of decision calls therefore walks over every slot and
+    # pushes each agent's context out to the host prompt cache. Pinning them to
+    # one slot leaves the others alone. -1 = do not pin (the default, and the
+    # right value for a backend that is not llama-server).
+    parser.add_argument("--decide-slot", type=int, default=env_int("QWEN_PROXY_DECIDE_SLOT", -1))
     parser.add_argument(
         "--no-sampling-defaults",
         action="store_true",
@@ -260,7 +266,7 @@ def run_decide(payload) -> dict:
     readings = []
     for order in orders:
         prompt = slot_decide.build_prompt(request["context"], request["question"], order, request["choices"])
-        body = slot_decide.build_backend_body(model, prompt, request["top_logprobs"])
+        body = slot_decide.build_backend_body(model, prompt, request["top_logprobs"], int(ARGS.decide_slot))
         response = backend_chat_completion(body)
         readings.append(slot_decide.read_response(response, slot_decide.LABELS[: len(order)]))
     result = slot_decide.combine(names, orders, readings)

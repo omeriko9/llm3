@@ -102,7 +102,9 @@ def build_prompt(context: str, question: str, order, choices: dict) -> str:
     )
 
 
-def build_backend_body(model: str, prompt: str, top_logprobs: int) -> bytes:
+def build_backend_body(model: str, prompt: str, top_logprobs: int, pin_slot: int = -1) -> bytes:
+    """`pin_slot` >= 0 adds llama-server's `id_slot` (see DECIDE_ENDPOINT.md,
+    "Decision calls and the prompt cache"). Other backends ignore the key."""
     body = {
         "model": model or "default",
         "messages": [{"role": "user", "content": prompt}],
@@ -116,6 +118,8 @@ def build_backend_body(model: str, prompt: str, top_logprobs: int) -> bytes:
         "enable_thinking": False,
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    if pin_slot >= 0:
+        body["id_slot"] = pin_slot
     return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
 
