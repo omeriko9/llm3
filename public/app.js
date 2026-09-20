@@ -247,6 +247,9 @@ const state = {
   logs: {},
   // slotId -> { busy, source }; filled by refreshSlotActivity from /api/slots/activity.
   slotActivity: {},
+  // { label } while actionInFlight, so the topbar tooltip can say WHICH action
+  // is running instead of "applying a model action".
+  busyAction: null,
   thinkingClearOffsets: loadPersistedThinkingClearOffsets(),
   activeFilter: "all",
   modelSearch: "",
@@ -969,7 +972,10 @@ document.addEventListener("DOMContentLoaded", () => {
   refreshDiagnostics();
   refreshHermesStatus();
   refreshHfDownloads();
-  refreshHfSearch({ silent: true });
+  // Prefetch so the Hugging Face tab is populated when it is first opened.
+  // `background` keeps it out of the topbar spinner: the user did not ask for
+  // this and must not be told llm3 is "Searching Hugging Face" on every load.
+  refreshHfSearch({ silent: true, background: true });
   fetchWebsites();
   if (state.hf.favoritesOnly) {
     ensureHfFavoriteEntriesHydrated();
@@ -2538,6 +2544,7 @@ function handleLaunchModalInput(event) {
         presencePenalty: String(preset.presencePenalty),
         repetitionPenalty: String(preset.repetitionPenalty),
       });
+      syncEffortFromThinking(form, form.launcher);
       renderLaunchModal();
     }
     return;
@@ -2568,11 +2575,14 @@ function handleLaunchModalInput(event) {
     const model = getModel(state.modal.modelKey);
     const defaults = getSlotDefaults(getSlot(state.modal.slotId), model, input.value);
     const grammarSelection = normalizeGrammarSelection(model, defaults);
+    const { reasoningEffort, dsparkMode } = normalizeSpeedTrickSelection(model, defaults);
     Object.assign(form, {
       launcher: input.value,
       ctxSize: String(defaults.contextSize || defaults.ctxSize || form.ctxSize),
       parallel: String(defaults.parallel || form.parallel),
-      thinking: model?.supportsThinking ? Boolean(defaults.thinking) : false,
+      reasoningEffort,
+      dsparkMode,
+      thinking: initialFormThinking(model, input.value, defaults, reasoningEffort),
       ...grammarSelection,
       ...buildDefaultSamplingForm({
         temperature: defaults.temperature,
@@ -2591,6 +2601,11 @@ function handleLaunchModalInput(event) {
   if (field === "thinking") {
     form.thinking = !!input.checked;
     applyThinkingPresencePenalty(form, form.thinking);
+    renderLaunchModal();
+    return;
+  } else if (field === "reasoningEffort") {
+    form.reasoningEffort = String(input.value || "");
+    form.thinking = thinkingFromReasoningEffort(form.reasoningEffort, form.launcher);
     renderLaunchModal();
     return;
   } else if (field === "chatTemplate") {
@@ -2675,7 +2690,7 @@ async function runAction(url, body, options = {}) {
   const isLaunchAction = isLaunchActionContext(actionContext);
 
   let result = null;
-  state.actionInFlight = true;
+  beginBusyAction(actionLabelForUrl(url));
   render();
   setGlobalActionButtonsDisabled(true);
 
@@ -2709,10 +2724,43 @@ async function runAction(url, body, options = {}) {
     }
     return null;
   } finally {
-    state.actionInFlight = false;
+    endBusyAction();
     setGlobalActionButtonsDisabled(false);
     render();
   }
+}
+
+// A human name for the request the user just fired, for the topbar tooltip.
+const ACTION_LABELS = [
+  [/^\/api\/start\b/, "Starting a model"],
+  [/^\/api\/stop\b/, "Stopping a slot"],
+  [/^\/api\/models\/delete\b/, "Deleting a model"],
+  [/^\/api\/profiles\/apply\b/, "Applying a profile"],
+  [/^\/api\/profiles\b/, "Saving a profile"],
+  [/^\/api\/llm3\/restart\b/, "Restarting llm3"],
+  [/^\/api\/hermes\/restart\b/, "Restarting Hermes"],
+  [/^\/api\/voice\/(start|restart)\b/, "Starting a voice runtime"],
+  [/^\/api\/voice\/stop\b/, "Stopping a voice runtime"],
+  [/^\/api\/launchers\/[^/]+\/update\b/, "Updating a launcher"],
+  [/^\/api\/applications\//, "Applying an application change"],
+];
+
+function actionLabelForUrl(url) {
+  const path = String(url || "").split("?")[0];
+  for (const [pattern, label] of ACTION_LABELS) {
+    if (pattern.test(path)) return label;
+  }
+  return "Applying a model action";
+}
+
+function beginBusyAction(label) {
+  state.actionInFlight = true;
+  state.busyAction = { label: label || "Applying a model action" };
+}
+
+function endBusyAction() {
+  state.actionInFlight = false;
+  state.busyAction = null;
 }
 
 function buildActionContext(url, body, options = {}) {
@@ -3008,7 +3056,7 @@ async function runSaveDefaultsFromModal() {
       modelKey: model.key,
       ctxSize: Number(form.ctxSize),
       parallel: Number(form.parallel),
-      thinking: model.supportsThinking ? Boolean(form.thinking) : false,
+      thinking: resolveFormThinking(model, form),
       ...grammarSelection,
       ...speedTricks,
       temperature: Number(form.temperature),
@@ -3066,7 +3114,7 @@ async function runStopModel(modelKey) {
 }
 
 async function runDeleteModel(modelKey) {
-  state.actionInFlight = true;
+  beginBusyAction("Deleting a model");
   render();
   try {
     const result = await fetchJson("/api/models/delete", {
@@ -3081,7 +3129,7 @@ async function runDeleteModel(modelKey) {
   } catch (error) {
     toast(error.message || "Delete failed");
   } finally {
-    state.actionInFlight = false;
+    endBusyAction();
     updateTopbarSpinner();
     render();
   }
@@ -3089,6 +3137,10 @@ async function runDeleteModel(modelKey) {
 
 async function refreshHfSearch(options = {}) {
   const silent = Boolean(options.silent);
+  // Reported in the topbar only when the user is waiting on it. `silent` is not
+  // the same thing: a sort change and opening the tab are both silent and both
+  // user-initiated.
+  state.hf.loadingIsBackground = Boolean(options.background);
   state.hf.hasLoaded = true;
   state.hf.loading = true;
   state.hf.error = "";
@@ -3108,6 +3160,7 @@ async function refreshHfSearch(options = {}) {
     state.hf.error = error.message || "Search failed";
   } finally {
     state.hf.loading = false;
+    state.hf.loadingIsBackground = false;
     if (state.activeSection === "huggingface-models") {
       renderHfSearch();
     }
@@ -3118,6 +3171,7 @@ async function refreshHfDownloads() {
   try {
     const data = await fetchJson("/api/hf/downloads");
     state.hf.downloads = data.jobs || [];
+    renderTopbarBusyIndicators();
     if (state.activeSection === "huggingface-models") {
       rerenderHfPanels({ preserveUi: true });
     }
@@ -3566,6 +3620,13 @@ function applyOverview(data) {
   applyServedApplicationLabels(data.applicationLabels);
   state.integrationTargets = data.integrationTargets || buildDefaultIntegrationTargets();
   state.actionInFlight = Boolean(data.actionInFlight);
+  if (!state.actionInFlight) {
+    state.busyAction = null;
+  } else if (!state.busyAction) {
+    // The action was started elsewhere (another browser, or before this tab
+    // loaded), so all this tab knows is that the server is busy.
+    state.busyAction = { label: "A model action is running" };
+  }
   syncApplicationDrafts();
 
   // Ensure voice log slot exists
@@ -3859,7 +3920,7 @@ async function restartLlm3() {
   if (state.actionInFlight) {
     return;
   }
-  state.actionInFlight = true;
+  beginBusyAction("Restarting llm3");
   render();
   setGlobalActionButtonsDisabled(true);
 
@@ -3876,7 +3937,7 @@ async function restartLlm3() {
   } catch (error) {
     toast(error.message || "Unable to restart llm3.", { type: "error", duration: 7000 });
   } finally {
-    state.actionInFlight = false;
+    endBusyAction();
     setGlobalActionButtonsDisabled(false);
     render();
   }
@@ -4889,6 +4950,14 @@ function renderModelsSlotStrip() {
   if (isSlotRenameInputFocused()) {
     return;
   }
+  // Same reason, for reading rather than typing: rebuilding the strip destroys
+  // the element the pointer is on, so a hover tooltip (CSS) or a native title
+  // vanished on every poll. The live numbers inside the cards are written in
+  // place by updateSlotThroughputReadout, so they keep updating while this is
+  // paused -- only the card markup waits for the pointer to move away.
+  if (isPointerOver(els.modelsSlotStrip)) {
+    return;
+  }
   const items = buildModelsSlotStripItems();
   if (!items.length) {
     els.modelsSlotStrip.innerHTML = "";
@@ -5308,7 +5377,7 @@ function renderModels() {
         <div class="model-meta">
           <div class="meta-item"><dt>Size</dt><dd>${esc(model.sizeLabel || "n/a")}</dd></div>
           <div class="meta-item"><dt>Variant</dt><dd>${esc(getModelVariant(model) || "default")}</dd></div>
-          <div class="meta-item"><dt>Thinking</dt><dd>${model.supportsThinking ? "On" : "Off"}</dd></div>
+          <div class="meta-item"><dt>Thinking</dt><dd>${launcherSupportsThinking(model, model.launcher) ? "On" : "Off"}</dd></div>
           <div class="meta-item"><dt>Slots</dt><dd>${getRunningModelSlots(model).length ? `${getRunningModelSlots(model).length} live` : "Idle"}</dd></div>
         </div>
         <div class="model-card-footer">
@@ -8175,6 +8244,7 @@ function renderLaunchModal() {
   const tinyGrammarSupported = supportsTinyGrammar(model);
   const structuredGbnfSupported = supportsStructuredGbnf(model);
   const reasoningBudgetSupported = supportsReasoningBudget(model);
+  const thinkingSupported = launcherSupportsThinking(model, selectedLauncher);
   const mtpDraftSupported = supportsMtpDraftTuning(model);
 
   if (!model || !slot) {
@@ -8333,7 +8403,7 @@ function renderLaunchModal() {
           </select>
         </div>
         <div class="lc-control-row">
-          <span class="lc-control-label" title="How long the model is allowed to think before answering. Model default leaves Qwen3.8's own chat template alone, which asks for xhigh — fine for chat, but an agent turn can spend a long time reasoning before emitting any content. Off sends --no-thinking. Lower levels trade answer depth for time-to-first-token.">Reasoning effort</span>
+          <span class="lc-control-label" title="How long the model is allowed to think before answering. Model default leaves Qwen3.8's own chat template alone, which asks for xhigh — fine for chat, but an agent turn can spend a long time reasoning before emitting any content. Off sends --no-thinking and is the same switch as the Non-thinking sampling preset. Lower levels trade answer depth for time-to-first-token.">Reasoning effort</span>
           <select data-modal-input="reasoningEffort">
             ${DSPARK_REASONING_EFFORTS.map((level) => `<option value="${esc(level)}" ${String(form.reasoningEffort ?? "") === level ? "selected" : ""}>${esc(DSPARK_REASONING_LABELS[level] ?? level)}</option>`).join("")}
           </select>
@@ -8357,12 +8427,12 @@ function renderLaunchModal() {
       <section class="lc-card">
         <header class="lc-card-head">
           <h4>Sampling</h4>
-          <span class="lc-pill ${form.thinking ? "is-on" : ""}">Thinking ${model.supportsThinking ? (form.thinking ? "on" : "off") : "n/a"}</span>
+          <span class="lc-pill ${form.thinking ? "is-on" : ""}">Thinking ${thinkingSupported ? (form.thinking ? "on" : "off") : "n/a"}</span>
           <button class="btn btn-secondary btn-sm lc-head-btn" type="button" data-modal-reset-sampling ${state.actionInFlight ? "disabled" : ""}>Reset</button>
         </header>
         <label class="lc-field">
           <span class="lc-field-label">Preset</span>
-          <select data-modal-sampling-preset ${model.supportsThinking ? "" : "disabled"} title="${model.supportsThinking ? "Applies a matched thinking mode + sampling set." : "Model does not support thinking mode."}">
+          <select data-modal-sampling-preset ${thinkingSupported ? "" : "disabled"} title="${thinkingSupported ? "Applies a matched thinking mode + sampling set." : "Model does not support thinking mode."}">
             <option value="nonThinking" ${form.thinking === false ? "selected" : ""}>Non-thinking (Instruct)</option>
             <option value="thinking" ${form.thinking === true && (form.temperature ?? 0.7) >= 0.9 ? "selected" : ""}>Thinking (Standard)</option>
             <option value="thinkingPrecise" ${form.thinking === true && (form.temperature ?? 0.7) < 0.9 ? "selected" : ""}>Thinking (Precise Code)</option>
@@ -8917,7 +8987,7 @@ function renderSystem() {
   els.ramDetail.textContent = cachedBytes > 0
     ? `${fmtBytes(system.memory?.usedBytes)} / ${fmtBytes(system.memory?.totalBytes)} used · ${fmtBytes(cachedBytes)} cached files`
     : `${fmtBytes(system.memory?.usedBytes)} / ${fmtBytes(system.memory?.totalBytes)} used`;
-  els.ramDetail.title = buildRamAttributionTitle(system.memory, cachedBytes);
+  setLiveTitle(els.ramDetail, buildRamAttributionTitle(system.memory, cachedBytes));
 
   const cpuPercent = system.cpu?.overallPercent || 0;
   els.cpuPct.textContent = `${cpuPercent}%`;
@@ -8941,13 +9011,13 @@ function renderSystem() {
   if (system.disk) {
     const diskUsedPercent = Number(system.disk.usedPercent || 0);
     els.diskPct.textContent = fmtCompactBytes(system.disk.availableBytes);
-    els.diskPct.title = `${fmtBytes(system.disk.availableBytes)} free of ${fmtBytes(system.disk.totalBytes)} total`;
+    setLiveTitle(els.diskPct, `${fmtBytes(system.disk.availableBytes)} free of ${fmtBytes(system.disk.totalBytes)} total`);
     els.diskBar.style.width = `${Math.min(diskUsedPercent, 100)}%`;
     els.diskBar.className = metricFillClass(diskUsedPercent);
     els.diskDetail.textContent = `${fmtBytes(system.disk.availableBytes)} free · ${diskUsedPercent}% used of ${fmtBytes(system.disk.totalBytes)}`;
   } else {
     els.diskPct.textContent = "--";
-    els.diskPct.title = "";
+    setLiveTitle(els.diskPct, "");
     els.diskBar.style.width = "0%";
     els.diskBar.className = "progress-fill muted";
     els.diskDetail.textContent = "Disk telemetry unavailable.";
@@ -8956,14 +9026,14 @@ function renderSystem() {
   const uptimeSec = Math.floor(system.cpu?.uptime || 0);
   if (uptimeSec > 0) {
     els.uptimeValue.textContent = formatUptime(uptimeSec, { compact: true });
-    els.uptimeValue.title = formatUptime(uptimeSec);
+    setLiveTitle(els.uptimeValue, formatUptime(uptimeSec));
     els.uptimeBar.style.width = "100%";
     els.uptimeBar.className = "progress-fill";
     const bootedAt = system.cpu?.bootedAt ? formatTimestamp(system.cpu.bootedAt) : "";
     els.uptimeDetail.textContent = bootedAt ? `${formatUptime(uptimeSec)} · booted ${bootedAt}` : formatUptime(uptimeSec);
   } else {
     els.uptimeValue.textContent = "--";
-    els.uptimeValue.title = "";
+    setLiveTitle(els.uptimeValue, "");
     els.uptimeBar.style.width = "0%";
     els.uptimeBar.className = "progress-fill muted";
     els.uptimeDetail.textContent = "Uptime unavailable.";
@@ -9026,12 +9096,12 @@ function renderTopbarMetrics() {
   if (system.disk) {
     const diskUsedPercent = Number(system.disk.usedPercent || 0);
     els.topbarDiskPct.textContent = `${fmtCompactBytes(system.disk.usedBytes)} / ${fmtCompactBytes(system.disk.totalBytes)}`;
-    els.topbarDiskPct.title = `${fmtBytes(system.disk.usedBytes)} used · ${fmtBytes(system.disk.availableBytes)} free of ${fmtBytes(system.disk.totalBytes)} total`;
+    setLiveTitle(els.topbarDiskPct, `${fmtBytes(system.disk.usedBytes)} used · ${fmtBytes(system.disk.availableBytes)} free of ${fmtBytes(system.disk.totalBytes)} total`);
     els.topbarDiskBar.style.width = `${Math.min(diskUsedPercent, 100)}%`;
     els.topbarDiskBar.className = metricFillClass(diskUsedPercent);
   } else {
     els.topbarDiskPct.textContent = "--";
-    els.topbarDiskPct.title = "";
+    setLiveTitle(els.topbarDiskPct, "");
     els.topbarDiskBar.style.width = "0%";
     els.topbarDiskBar.className = "progress-fill muted";
   }
@@ -9039,10 +9109,10 @@ function renderTopbarMetrics() {
   const uptimeSec = Math.floor(system.cpu?.uptime || 0);
   if (uptimeSec > 0) {
     els.topbarUptime.textContent = formatUptime(uptimeSec, { compact: true });
-    els.topbarUptime.title = formatUptime(uptimeSec);
+    setLiveTitle(els.topbarUptime, formatUptime(uptimeSec));
   } else {
     els.topbarUptime.textContent = "--";
-    els.topbarUptime.title = "";
+    setLiveTitle(els.topbarUptime, "");
   }
 }
 
@@ -9080,42 +9150,125 @@ function renderHermesIndicators() {
   });
 }
 
-function hasTopbarBusyActivity() {
-  const activeHfJobs = (state.hf.downloads || []).some((job) => !["completed", "failed", "cancelled"].includes(String(job?.status || "").toLowerCase()));
-  const benchmarkStarting = Object.values(state.benchmarkStartInFlight || {}).some(Boolean);
-  const voiceLibraryBusy = Boolean(state.voiceTuningModal?.voiceLibrary?.loading || state.voiceTuningModal?.voiceLibrary?.busy);
-  return Boolean(
-    state.actionInFlight ||
-    activeHfJobs ||
-    benchmarkStarting ||
-    state.hf.loading ||
-    state.diagnostics.loading ||
-    state.hermesStatus.loading ||
-    state.hermesFeedModal.loading ||
-    state.launchersModal.loading ||
-    state.voiceBenchmark.loading ||
-    voiceLibraryBusy
-  );
+// What the topbar spinner reports.
+//
+// It used to be driven by the `loading` flag of every fetch in the app, which
+// meant it reported POLLING, not work: refreshVoiceBenchmarkState runs on a 1s
+// timer and sets voiceBenchmark.loading for the length of each request, so the
+// tooltip sat on "preparing voice benchmark" more or less permanently while
+// nothing was being prepared. Routine pollers are excluded here on purpose --
+// diagnostics, Hermes status, the voice-benchmark state poll and the Hermes
+// feed poll are housekeeping, not something the user is waiting on.
+//
+// Each collector returns a human sentence, and every one that is true shows up
+// in the tooltip, so two things at once read as two lines instead of the first
+// one winning a priority list.
+function collectTopbarActivities() {
+  const lines = [];
+
+  if (state.actionInFlight) {
+    lines.push(state.busyAction?.label || "Applying a model action");
+  }
+
+  // The work the box is actually doing: a slot generating. This was missing
+  // entirely, which is why the spinner stayed dark through a whole generation.
+  for (const slot of state.slots || []) {
+    const activity = state.slotActivity?.[slot.id];
+    if (activity?.busy !== true) continue;
+    // No phase means the proxy is holding a request the runtime has not started
+    // committing tokens for yet -- prefill, a queue, or a stall.
+    const phase = SLOT_PHASE_TEXT[activity.phase]
+      || (activity.source === "inflight" ? "handling a request" : "working");
+    const rate = Number(activity.tokensPerSecond);
+    const rateText = Number.isFinite(rate) && rate > 0 ? ` at ${rate.toFixed(1)} tok/s` : "";
+    lines.push(`${slotName(slot)}: ${phase}${rateText}`);
+  }
+
+  for (const slot of state.slots || []) {
+    if (slot?.benchmark?.status === "running") {
+      lines.push(`${slotName(slot)}: benchmark running`);
+    }
+  }
+  if (Object.values(state.benchmarkStartInFlight || {}).some(Boolean)) {
+    lines.push("Starting a benchmark");
+  }
+  if (String(state.voiceBenchmark?.serverState?.status || "") === "running") {
+    const detail = String(state.voiceBenchmark?.serverState?.currentStageDetail || "").trim();
+    lines.push(detail ? `Voice benchmark: ${detail}` : "Voice benchmark running");
+  }
+
+  for (const job of state.hf.downloads || []) {
+    const status = String(job?.status || "").toLowerCase();
+    if (["completed", "failed", "cancelled"].includes(status)) continue;
+    const name = job?.candidate?.fullName || job?.candidate?.name || job?.id || "model";
+    const verb = job?.kind === "convert" ? "Converting" : "Downloading";
+    const percent = Number(job?.progressPct);
+    const progress = Number.isFinite(percent) && percent > 0 ? ` (${Math.round(percent)}%)` : "";
+    lines.push(`${verb} ${name}${progress}`);
+  }
+
+  if (state.voiceTuningModal?.voiceLibrary?.loading || state.voiceTuningModal?.voiceLibrary?.busy) {
+    lines.push("Updating the voice library");
+  }
+  // Both of these are things the user just asked for and is waiting on, unlike
+  // the pollers above.
+  if (state.hf.loading && !state.hf.loadingIsBackground) lines.push("Searching Hugging Face");
+  if (state.launchersModal.loading) lines.push("Loading launchers");
+
+  return lines;
 }
 
-function topbarBusyTitle() {
-  if (state.actionInFlight) return "Background activity: applying a model action";
-  if ((state.hf.downloads || []).some((job) => !["completed", "failed", "cancelled"].includes(String(job?.status || "").toLowerCase()))) {
-    return "Background activity: downloads or conversions in progress";
+function hasTopbarBusyActivity() {
+  return collectTopbarActivities().length > 0;
+}
+
+function topbarBusyTitle(lines = collectTopbarActivities()) {
+  if (!lines.length) return "No background activity";
+  if (lines.length === 1) return lines[0];
+  return `${lines.length} things running:\n${lines.map((line) => `\u2022 ${line}`).join("\n")}`;
+}
+
+// Visibility, the spin and the tooltip are set together. They used to live in
+// two functions on two call paths (renderTopbarBusyIndicators for the title,
+// updateTopbarSpinner for the animation, and the latter read only
+// state.actionInFlight), so the indicator could be shown and frozen at once --
+// which is exactly what it did for downloads, searches and benchmarks.
+// Writing `title` dismisses whatever native tooltip the browser is showing,
+// even when the new value is identical to the old one. The dashboard rewrites
+// titles from its pollers -- the topbar metrics every 5s, the slot tok/s and
+// the busy indicator every 2s -- so a tooltip you were reading blinked out and
+// came back on every tick.
+//
+// Two rules fix it: never write the same text twice, and never write at all
+// while the pointer is on the element. A native tooltip cannot be updated in
+// place, so while you are reading one the choice is a stale tooltip or no
+// tooltip -- stale wins, and the next poll after you move away catches it up.
+function isPointerOver(element) {
+  try {
+    return typeof element?.matches === "function" && element.matches(":hover");
+  } catch (_error) {
+    return false;
   }
-  if (Object.values(state.benchmarkStartInFlight || {}).some(Boolean)) return "Background activity: starting benchmark";
-  if (state.voiceBenchmark.loading) return "Background activity: preparing voice benchmark";
-  if (state.voiceTuningModal?.voiceLibrary?.loading || state.voiceTuningModal?.voiceLibrary?.busy) return "Background activity: updating voice library";
-  if (state.hf.loading) return "Background activity: searching Hugging Face";
-  if (state.diagnostics.loading) return "Background activity: refreshing diagnostics";
-  if (state.hermesStatus.loading || state.hermesFeedModal.loading) return "Background activity: refreshing Hermes status";
-  if (state.launchersModal.loading) return "Background activity: loading launchers";
-  return "Background activity in progress";
+}
+
+function setLiveTitle(element, value) {
+  if (!element) {
+    return;
+  }
+  const next = String(value == null ? "" : value);
+  if (element.getAttribute("title") === next) {
+    return;
+  }
+  if (isPointerOver(element)) {
+    return;
+  }
+  element.setAttribute("title", next);
 }
 
 function renderTopbarBusyIndicators() {
-  const visible = hasTopbarBusyActivity();
-  const title = topbarBusyTitle();
+  const lines = collectTopbarActivities();
+  const visible = lines.length > 0;
+  const title = topbarBusyTitle(lines);
   [
     els.topbarBusyIndicator,
     els.topbarBusyIndicatorMobile,
@@ -9125,8 +9278,19 @@ function renderTopbarBusyIndicators() {
       return;
     }
     element.hidden = !visible;
-    element.setAttribute("title", title);
-    element.setAttribute("aria-label", title);
+    setLiveTitle(element, title);
+    if (element.getAttribute("aria-label") !== title) {
+      element.setAttribute("aria-label", title);
+    }
+    const spinner = element.querySelector(".topbar-busy-spinner");
+    if (spinner) {
+      // Shown means working means spinning. There is no third state.
+      spinner.classList.toggle("spinning", visible);
+    }
+    const srLabel = element.querySelector(".sr-only");
+    if (srLabel && srLabel.textContent !== title) {
+      srLabel.textContent = title;
+    }
   });
 }
 
@@ -9143,7 +9307,7 @@ function applyHermesIndicator(element, payload, options = {}) {
   const detail = String(status.detail || "").trim();
   const title = String(status.tooltip || "").trim()
     || `${options.fallbackLabel || "Hermes"} (${options.fallbackHost || ""})\nStatus: ${status.state || "offline"}`;
-  element.title = title;
+  setLiveTitle(element, title);
   element.setAttribute("aria-label", detail || title);
   element.setAttribute("role", "button");
   element.setAttribute("tabindex", "0");
@@ -9225,7 +9389,12 @@ function formatLogTimestampLocal(rawTimestamp) {
 }
 
 function formatLogTimestampsLocal(text) {
+  // A stamped line glued to the previous line's text (an older proxy wrote
+  // concurrent streams that way) gets its own line before the stamps convert.
   return String(text || "").replace(
+    /(?<=[^\n])(?=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z \[[^\]\n]+\])/g,
+    "\n"
+  ).replace(
     /^(\[?)(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)(\]?)/gm,
     (_match, open, stamp, close) => `${open}${formatLogTimestampLocal(stamp)}${close}`
   );
@@ -9795,6 +9964,10 @@ function buildProfileSlotDraft(slotId, source = {}) {
       : customSlotName(slot),
     ctxSize: String(source.ctxSize ?? baseForm.ctxSize),
     parallel: String(source.parallel ?? baseForm.parallel),
+    // A profile saved before it kept reasoningEffort has none (null): fall back to
+    // the slot's saved effort, which is what such a profile launched with.
+    reasoningEffort: String(source.reasoningEffort ?? baseForm.reasoningEffort ?? ""),
+    dsparkMode: String(source.dsparkMode ?? baseForm.dsparkMode ?? "auto"),
     thinking: Boolean(source.thinking ?? baseForm.thinking),
     launcher: String(source.launcher ?? baseForm.launcher ?? ""),
     runtimeBaseUrl: String(source.runtimeBaseUrl ?? baseForm.runtimeBaseUrl ?? ""),
@@ -9901,6 +10074,7 @@ function handleProfileModalInput(event) {
         presencePenalty: String(preset.presencePenalty),
         repetitionPenalty: String(preset.repetitionPenalty),
       });
+      syncEffortFromThinking(draft, resolvePreferredLauncher(getModel(draft.modelKey), draft.launcher));
       renderProfileModal();
     }
     return;
@@ -9951,11 +10125,14 @@ function handleProfileModalInput(event) {
       const model = getModel(draft.modelKey);
       const defaults = getSlotDefaults(getSlot(slotId), model, slotInput.value);
       const grammarSelection = normalizeGrammarSelection(model, defaults);
+      const { reasoningEffort, dsparkMode } = normalizeSpeedTrickSelection(model, defaults);
       Object.assign(draft, {
         launcher: slotInput.value,
         ctxSize: String(defaults.contextSize || defaults.ctxSize || draft.ctxSize),
         parallel: String(defaults.parallel || draft.parallel),
-        thinking: model?.supportsThinking ? Boolean(defaults.thinking) : false,
+        reasoningEffort,
+        dsparkMode,
+        thinking: initialFormThinking(model, slotInput.value, defaults, reasoningEffort),
         ...grammarSelection,
         ...buildDefaultSamplingForm({
           temperature: defaults.temperature,
@@ -9972,6 +10149,12 @@ function handleProfileModalInput(event) {
     if (field === "thinking") {
       draft.thinking = Boolean(slotInput.checked);
       applyThinkingPresencePenalty(draft, draft.thinking);
+      renderProfileModal();
+      return;
+    }
+    if (field === "reasoningEffort") {
+      draft.reasoningEffort = String(slotInput.value || "");
+      draft.thinking = thinkingFromReasoningEffort(draft.reasoningEffort, "mlx-dspark");
       renderProfileModal();
       return;
     }
@@ -10038,7 +10221,7 @@ async function runSaveProfile() {
           modelKey: String(draft.modelKey || ""),
           ctxSize: Number(draft.ctxSize),
           parallel: Number(draft.parallel),
-          thinking: Boolean(draft.thinking),
+          thinking: resolveFormThinking(model, { ...draft, launcher: resolvePreferredLauncher(model, draft.launcher) }),
           ...normalizeGrammarSelection(model, draft),
           ...normalizeSpeedTrickSelection(model, draft),
           name: String(draft.name || ""),
@@ -10774,7 +10957,7 @@ function renderProfileSlotPanel(slot, draft, model, defaults) {
         <div class="detail-row"><span class="detail-label">Profile Parallel</span><span class="detail-value">${NumberFmt(draft.parallel)}</span></div>
         <div class="detail-row"><span class="detail-label">Default Context</span><span class="detail-value mono">${fmtCount(defaults.contextSize || defaults.ctxSize)}</span></div>
         <div class="detail-row"><span class="detail-label">Default Parallel</span><span class="detail-value">${NumberFmt(defaults.parallel)}</span></div>
-        <div class="detail-row"><span class="detail-label">Thinking</span><span class="detail-value">${model.supportsThinking && draft.thinking ? "on" : "off"}</span></div>
+        <div class="detail-row"><span class="detail-label">Thinking</span><span class="detail-value">${launcherSupportsThinking(model, selectedLauncher) && draft.thinking ? "on" : "off"}</span></div>
         <div class="detail-row"><span class="detail-label">Grammar Mode</span><span class="detail-value">${grammarModeLabel(draft)}</span></div>
         <div class="detail-row"><span class="detail-label">Temperature</span><span class="detail-value">${esc(draft.temperature)}</span></div>
         <div class="detail-row"><span class="detail-label">Top P</span><span class="detail-value">${esc(draft.topP)}</span></div>
@@ -10880,13 +11063,26 @@ function renderProfileSlotPanel(slot, draft, model, defaults) {
         <div class="modal-flags">
           <div class="form-group">
             <label>Sampling Preset</label>
-            <select data-profile-slot-sampling-preset data-slot-id="${slot.id}" ${model.supportsThinking ? "" : "disabled"}>
+            <select data-profile-slot-sampling-preset data-slot-id="${slot.id}" ${launcherSupportsThinking(model, selectedLauncher) ? "" : "disabled"}>
               <option value="nonThinking" ${draft.thinking === false ? "selected" : ""}>Non-thinking (Instruct)</option>
               <option value="thinking" ${draft.thinking === true && (draft.temperature ?? 0.7) >= 0.9 ? "selected" : ""}>Thinking (Standard)</option>
               <option value="thinkingPrecise" ${draft.thinking === true && (draft.temperature ?? 0.7) < 0.9 ? "selected" : ""}>Thinking (Precise Code)</option>
             </select>
-            ${model.supportsThinking ? "" : '<span class="help-text">Model does not support thinking mode</span>'}
+            ${launcherSupportsThinking(model, selectedLauncher) ? "" : '<span class="help-text">Model does not support thinking mode</span>'}
           </div>
+          ${selectedLauncher === "mlx-dspark" ? `
+          <div class="form-group">
+            <label>Speculation</label>
+            <select data-profile-slot-input="dsparkMode" data-slot-id="${slot.id}">
+              ${DSPARK_MODES.map((mode) => `<option value="${esc(mode)}" ${String(draft.dsparkMode || "auto") === mode ? "selected" : ""}>${esc(DSPARK_MODE_LABELS[mode] || mode)}</option>`).join("")}
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Reasoning Effort</label>
+            <select data-profile-slot-input="reasoningEffort" data-slot-id="${slot.id}">
+              ${DSPARK_REASONING_EFFORTS.map((level) => `<option value="${esc(level)}" ${String(draft.reasoningEffort ?? "") === level ? "selected" : ""}>${esc(DSPARK_REASONING_LABELS[level] ?? level)}</option>`).join("")}
+            </select>
+          </div>` : ""}
           ${renderProfileApplicationFlagCheckboxes(slot, draft)}
         </div>
       ` : `<div class="profile-slot-disabled-note">Choose a model for ${esc(slot.label)} to include it in the profile.</div>`}
@@ -10972,6 +11168,56 @@ const DSPARK_REASONING_LABELS = {
   medium: "Medium (unguided)",
   xhigh: "Extra high",
 };
+// mlx-dspark and mlx-vlm have no thinking flag of their own: thinking is the
+// reasoning effort. The launch modal and the profile editor give them the same
+// Thinking preset as a GGUF model; these keep form.thinking and
+// form.reasoningEffort in step. reasoningEffort stays the stored value (the
+// launchers' defaults JSON has no thinking field), so a slot saved before this
+// change keeps its behaviour.
+//   mlx-dspark: "off" = --no-thinking; "" (template default, xhigh) or a level thinks.
+//   mlx-vlm:    a level = --enable-thinking; "" and "off" pass no flag, and
+//               mlx_vlm.server then renders enable_thinking=false.
+const EFFORT_THINKING_LAUNCHERS = ["mlx-dspark", "mlx-vlm"];
+
+function launcherSupportsThinking(model, launcher) {
+  return Boolean(model?.supportsThinking) || EFFORT_THINKING_LAUNCHERS.includes(launcher);
+}
+
+function thinkingFromReasoningEffort(reasoningEffort, launcher = "mlx-dspark") {
+  const raw = String(reasoningEffort ?? "").trim().toLowerCase();
+  if (raw === "off") {
+    return false;
+  }
+  return launcher === "mlx-vlm" ? raw !== "" : true;
+}
+
+function syncEffortFromThinking(form, launcher) {
+  if (!EFFORT_THINKING_LAUNCHERS.includes(launcher)) {
+    return;
+  }
+  if (!form.thinking) {
+    form.reasoningEffort = "off";
+  } else if (!thinkingFromReasoningEffort(form.reasoningEffort, launcher)) {
+    // mlx-vlm collapses every level to --enable-thinking; xhigh is just "on".
+    form.reasoningEffort = launcher === "mlx-vlm" ? "xhigh" : "";
+  }
+}
+
+function resolveFormThinking(model, form) {
+  const launcher = form.launcher || model?.launcher;
+  if (EFFORT_THINKING_LAUNCHERS.includes(launcher)) {
+    return thinkingFromReasoningEffort(form.reasoningEffort, launcher);
+  }
+  return model?.supportsThinking ? Boolean(form.thinking) : false;
+}
+
+function initialFormThinking(model, launcher, defaults, reasoningEffort) {
+  if (EFFORT_THINKING_LAUNCHERS.includes(launcher)) {
+    return thinkingFromReasoningEffort(reasoningEffort, launcher);
+  }
+  return model?.supportsThinking ? Boolean(defaults.thinking) : false;
+}
+
 const DSPARK_MODE_LABELS = {
   auto: "Auto (best for model)",
   dflash: "DFlash 2",
@@ -11037,7 +11283,7 @@ function createLaunchForm(slotId, model) {
   return {
     ctxSize: String(defaults.contextSize || defaults.ctxSize || 255000),
     parallel: String(defaults.parallel || 1),
-    thinking: model?.supportsThinking ? Boolean(defaults.thinking) : false,
+    thinking: initialFormThinking(model, selectedLauncher, defaults, speedTricks.reasoningEffort),
     runtimeBaseUrl: String(slot?.configuredRuntimeBaseUrl || "").trim(),
     ...grammarSelection,
     reasoningBudget: speedTricks.reasoningBudget === null ? "" : String(speedTricks.reasoningBudget),
@@ -11565,16 +11811,9 @@ function renderGlobalActionButtons() {
   setGlobalActionButtonsDisabled(Boolean(state.actionInFlight));
 }
 
+// Kept for its call sites; the indicator has one renderer now.
 function updateTopbarSpinner() {
-  const spinning = Boolean(state.actionInFlight);
-  [els.topbarBusyIndicator, els.topbarBusyIndicatorMobile, els.topbarBusyIndicatorFloating].forEach((indicator) => {
-    if (indicator) {
-      const spinner = indicator.querySelector('.topbar-busy-spinner');
-      if (spinner) {
-        spinner.classList.toggle('spinning', spinning);
-      }
-    }
-  });
+  renderTopbarBusyIndicators();
 }
 
 function setGlobalActionButtonsDisabled(disabled) {
@@ -11614,6 +11853,9 @@ async function refreshSlotActivity() {
     state.slotActivity = {};
   }
   updateSlotWorkingIndicators();
+  // The topbar spinner reports slot generation too, and this is the poll that
+  // knows about it -- without this it would only update on the 5s overview.
+  renderTopbarBusyIndicators();
   renderChatLive();
 }
 
@@ -11649,13 +11891,13 @@ function updateSlotThroughputReadout(slot, activity) {
       pill.classList.toggle("is-empty", empty);
       pill.textContent = empty ? "0.0 tok/s" : `${shown.toFixed(1)} tok/s`;
       pill.classList.toggle("stale", stale);
-      pill.title = empty
+      setLiveTitle(pill, empty
         ? ""
         : (stale
           ? "Last measured rate. The slot is not working now."
           : (shownPhase === "prefill"
             ? "Prompt-processing speed right now."
-            : "Generation speed right now."));
+            : "Generation speed right now.")));
     }
 
     const line = card.querySelector("[data-slot-activity]");
@@ -11668,14 +11910,14 @@ function updateSlotThroughputReadout(slot, activity) {
     // the card height is identical idle and busy.
     line.textContent = label || "\u00a0";
     if (!label) {
-      line.title = "";
+      setLiveTitle(line, "");
       return;
     }
-    line.title = phase === "prefill"
+    setLiveTitle(line, phase === "prefill"
       ? "Processing the prompt. No tokens are generated yet."
       : phase === "decode"
         ? "Generating the reply."
-        : "The runtime reports a request in flight.";
+        : "The runtime reports a request in flight.");
   });
 }
 
@@ -11768,7 +12010,7 @@ function buildLaunchRequestPayload(slot, model, form) {
     modelKey: model.key,
     ctxSize: Number(form.ctxSize),
     parallel: Number(form.parallel),
-    thinking: model.supportsThinking ? Boolean(form.thinking) : false,
+    thinking: resolveFormThinking(model, form),
     applicationTargets: buildApplicationTargetRequest(form),
     ...grammarSelection,
     ...speedTricks,
@@ -13220,6 +13462,8 @@ function renderChatLive() {
     chatStatRow("tok/s", Number.isFinite(rate) ? rate.toFixed(1) : "—",
       phase === "prefill" ? "prompt-processing speed" : "generation speed"),
     chatStatRow("source", activity.source || "—", "which runtime endpoint the number came from"),
+    chatStatRow("decide", activity.decide || "—",
+      "POST /v1/decide method: logprobs = probabilities, greedy = the choice only, unknown = no decision call yet"),
     chatStatRow("context", params.ctxSize ? fmtCount(params.ctxSize) : "—"),
     chatStatRow("parallel", params.parallel ?? "—"),
     chatStatRow("effort", params.reasoningEffort === "" ? "model default" : (params.reasoningEffort ?? "—")),

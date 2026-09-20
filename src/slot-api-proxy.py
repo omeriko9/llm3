@@ -16,11 +16,16 @@ What it does on the way through:
     generation request that leaves the field unset. /responses counts as a
     generation path: agent clients use it instead of chat/completions, and
     without this they silently ran on llama.cpp's stock defaults.
+  * Skips those sampling defaults with --no-sampling-defaults, for a backend
+    that has its own (mlx-dspark, mlx-vlm): the request reaches it unchanged.
   * Optionally strips reasoning_content from responses (--hide-reasoning).
     Only meaningful when the backend runs with the think block open, because
     that is the only case where reasoning is tagged and separable.
   * Writes one JSON line per request to the traffic log and a readable trace
     of the stream to stdout (the proxy log).
+  * Answers POST /v1/decide itself (src/slot_decide.py): a decision call that
+    returns one probability for each permitted answer and generates no text.
+    GET /llm3/capabilities reports which decide method the backend supports.
 
 It must emit RFC-compliant HTTP or strict clients (Node undici/fetch) reject it
 with "400 (no body)" while curl tolerates it: exactly one Server header, no
@@ -37,9 +42,13 @@ import os
 import socket
 import socketserver
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import slot_decide  # noqa: E402
 
 
 def env_text(name: str, fallback: str = "") -> str:
@@ -99,6 +108,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     # finish_reason or any tool_calls delta, which made stalls undiagnosable.
     parser.add_argument("--max-capture", type=int, default=env_int("QWEN_PROXY_MAX_CAPTURE", 200000))
     parser.add_argument(
+        "--no-sampling-defaults",
+        action="store_true",
+        help="forward generation requests without adding sampling keys the client left out",
+    )
+    parser.add_argument(
         "--hide-reasoning",
         action="store_true",
         default=env_flag("QWEN_PROXY_HIDE_REASONING"),
@@ -121,7 +135,7 @@ DEFAULT_SAMPLING = {
     "min_p": ARGS.default_min_p,
     "presence_penalty": ARGS.default_presence_penalty,
     "repetition_penalty": ARGS.default_repetition_penalty,
-} if ARGS else {}
+} if ARGS and not ARGS.no_sampling_defaults else {}
 
 
 HOP_BY_HOP_HEADERS = {
@@ -146,6 +160,112 @@ SKIP_RESPONSE_HEADERS = HOP_BY_HOP_HEADERS | {
 # Endpoints that take generation params and therefore need the slot's
 # configured sampling applied (and, for optiq, the model id remapped).
 GENERATION_PATH_MARKERS = ("chat/completions", "completions", "responses")
+
+
+# Requests the proxy is holding open right now, per slot.
+#
+# "Is a model generating?" was answered only by a decode counter moving between
+# two polls, which is blind to the whole first half of a request: a long prefill
+# commits no tokens, and neither does a request queued behind another or one
+# stalled on memory. The dashboard spinner sat dark through all of it. An open
+# generation request is the honest signal for "llm3 is working".
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT = {"count": 0, "since": 0.0}
+
+
+def inflight_begin() -> None:
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT["count"] <= 0:
+            _INFLIGHT["since"] = time.time()
+        _INFLIGHT["count"] += 1
+
+
+def inflight_end() -> None:
+    with _INFLIGHT_LOCK:
+        _INFLIGHT["count"] = max(0, _INFLIGHT["count"] - 1)
+        if _INFLIGHT["count"] == 0:
+            _INFLIGHT["since"] = 0.0
+
+
+def build_local_activity_payload() -> bytes:
+    with _INFLIGHT_LOCK:
+        count = int(_INFLIGHT["count"])
+        since = float(_INFLIGHT["since"])
+    return json.dumps({
+        "inflight": count,
+        "busy": count > 0,
+        "openForMs": round((time.time() - since) * 1000) if since else 0,
+        # Rides on the probe the dashboard polls already: no second request.
+        "decide": _DECIDE_STATE["decide"],
+    }).encode("utf-8")
+
+
+# Which decide method this backend gave on the most recent decision call:
+# "logprobs", "greedy", or "unknown" before the first call. It is measured from
+# a real response, not read from a launcher table, so it is correct for every
+# backend and it shows at once when an mlx-dspark update disables the shim.
+_DECIDE_LOCK = threading.Lock()
+_DECIDE_STATE = {"decide": "unknown", "checkedAt": 0.0, "calls": 0}
+DECIDE_ROUTES = {"/v1/decide", "/decide"}
+DECIDE_PROBE = {
+    "context": "Text:\nThe sky is blue.",
+    "question": "Is the text about the sky?",
+    "choices": {"yes": "yes", "no": "no"},
+}
+
+
+def decide_state_update(method: str) -> None:
+    with _DECIDE_LOCK:
+        _DECIDE_STATE["decide"] = method
+        _DECIDE_STATE["checkedAt"] = time.time()
+        _DECIDE_STATE["calls"] += 1
+
+
+def build_local_capabilities_payload() -> bytes:
+    with _DECIDE_LOCK:
+        state = dict(_DECIDE_STATE)
+    return json.dumps({
+        "decide": state["decide"],
+        "decideCheckedAt": round(state["checkedAt"] * 1000) if state["checkedAt"] else 0,
+        "decideCalls": state["calls"],
+        "maxChoices": slot_decide.MAX_CHOICES,
+    }).encode("utf-8")
+
+
+def backend_chat_completion(body: bytes) -> dict:
+    """One non-streamed chat completion, sent by the proxy itself."""
+    headers = {"Content-Type": "application/json", "Content-Length": str(len(body))}
+    if ARGS.backend_api_key:
+        headers["Authorization"] = f"Bearer {ARGS.backend_api_key}"
+        headers["X-API-Key"] = ARGS.backend_api_key
+    conn = http.client.HTTPConnection(ARGS.backend_host, ARGS.backend_port, timeout=3600)
+    resp = None
+    try:
+        conn.request("POST", "/v1/chat/completions", body=body, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read()
+        if resp.status >= 400:
+            raise RuntimeError(f"backend status {resp.status}: {safe_text(raw)[:500]}")
+        return json.loads(raw.decode("utf-8"))
+    finally:
+        close_backend(resp, conn)
+
+
+def run_decide(payload) -> dict:
+    """Do the rotations of one decision call against the backend."""
+    request = slot_decide.parse_request(payload)
+    names = list(request["choices"])
+    orders = slot_decide.rotation_orders(names, request["rotations"])
+    model = str(ARGS.backend_model_id or "").strip() or request["model"]
+    readings = []
+    for order in orders:
+        prompt = slot_decide.build_prompt(request["context"], request["question"], order, request["choices"])
+        body = slot_decide.build_backend_body(model, prompt, request["top_logprobs"])
+        response = backend_chat_completion(body)
+        readings.append(slot_decide.read_response(response, slot_decide.LABELS[: len(order)]))
+    result = slot_decide.combine(names, orders, readings)
+    decide_state_update(result["method"])
+    return result
 
 
 def is_generation_path(path: str) -> bool:
@@ -221,21 +341,54 @@ def proxy_timestamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+# The server is threaded, so several requests share one stdout. Stream text is
+# written without a newline, and it used to be each stream's own business to
+# close its line. A second request's "[response]" line or its own "[thinking]"
+# header then started mid-line, glued to the first stream's text, and the
+# Thinking tab showed the timestamp on the previous line. One lock and one
+# record of who owns the open line keep every timestamp at a line start.
+_STDOUT_LOCK = threading.Lock()
+_open_line_owner = None
+
+
+def _close_open_line_locked() -> None:
+    global _open_line_owner
+    if _open_line_owner is not None:
+        sys.stdout.write("\n")
+        _open_line_owner = None
+
+
 def append_proxy_line(message: str) -> None:
-    print(f"{proxy_timestamp()} {message}", flush=True)
+    with _STDOUT_LOCK:
+        _close_open_line_locked()
+        sys.stdout.write(f"{proxy_timestamp()} {message}\n")
+        sys.stdout.flush()
+
+
+def end_stream_line(stream_state: dict) -> None:
+    with _STDOUT_LOCK:
+        if _open_line_owner is stream_state:
+            _close_open_line_locked()
+            sys.stdout.flush()
+        stream_state["open_line"] = False
 
 
 def write_stream_text(stream_state: dict, kind: str, text: str) -> None:
+    global _open_line_owner
     if not text:
         return
-    if stream_state.get("last_kind") != kind:
-        if stream_state.get("open_line"):
-            print("", flush=True)
-        label = "thinking" if kind == "thinking" else "answer"
-        print(f"{proxy_timestamp()} [{label}] ", end="", flush=True)
-        stream_state["last_kind"] = kind
-        stream_state["open_line"] = True
-    print(text, end="", flush=True)
+    with _STDOUT_LOCK:
+        # A header again when another writer took the line, so the text that
+        # follows is still labelled (and still extracted as thinking).
+        if stream_state.get("last_kind") != kind or _open_line_owner is not stream_state:
+            _close_open_line_locked()
+            label = "thinking" if kind == "thinking" else "answer"
+            sys.stdout.write(f"{proxy_timestamp()} [{label}] ")
+            stream_state["last_kind"] = kind
+            stream_state["open_line"] = True
+            _open_line_owner = stream_state
+        sys.stdout.write(text)
+        sys.stdout.flush()
 
 
 def split_visible_thinking(content: str, stream_state: dict) -> None:
@@ -332,9 +485,7 @@ def observe_stream_line(line: bytes, stream_state: dict) -> None:
     if not data:
         return
     if data == "[DONE]":
-        if stream_state.get("open_line"):
-            print("", flush=True)
-            stream_state["open_line"] = False
+        end_stream_line(stream_state)
         append_proxy_line("[stream done]")
         return
     try:
@@ -356,6 +507,36 @@ def observe_stream_line(line: bytes, stream_state: dict) -> None:
         content = message_text(delta.get("content")) or message_text(delta.get("text"))
         if content:
             split_visible_thinking(content, stream_state)
+
+
+def observe_json_body(body: bytes, stream_state: dict) -> None:
+    """Log the reasoning and answer of a non-streamed completion, like a stream.
+
+    Without this a client that does not stream (many agents) left the Thinking
+    tab empty even though the response carried reasoning_content.
+    """
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    for choice in payload.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            text = message_text(choice.get("text"))
+            if text:
+                split_visible_thinking(text, stream_state)
+            continue
+        reasoning = message_text(message.get("reasoning_content")) or message_text(message.get("reasoning"))
+        if reasoning:
+            write_stream_text(stream_state, "thinking", reasoning)
+        content = message_text(message.get("content"))
+        if content:
+            split_visible_thinking(content, stream_state)
+    end_stream_line(stream_state)
 
 
 def is_client_disconnect(exc) -> bool:
@@ -399,14 +580,20 @@ def normalize_request(path: str, body: bytes) -> "tuple[bytes, dict | None]":
         return body, None
     if not isinstance(payload, dict):
         return body, None
+    changed = False
     advertised_model_id = str(ARGS.advertised_model_id or "").strip()
     backend_model_id = str(ARGS.backend_model_id or "").strip()
     current_model = str(payload.get("model") or "").strip()
     if backend_model_id and (not current_model or current_model == advertised_model_id):
         payload["model"] = backend_model_id
+        changed = True
     for key, value in DEFAULT_SAMPLING.items():
         if payload.get(key) in (None, ""):
             payload[key] = value
+            changed = True
+    if not changed:
+        # Byte-for-byte what the client sent.
+        return body, payload
     return json.dumps(payload, ensure_ascii=False).encode("utf-8"), payload
 
 
@@ -445,9 +632,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def do_OPTIONS(self) -> None:
         self.handle_proxy()
 
-    def send_local_json(self, started: float, body: bytes) -> None:
-        """Answer a request from the proxy itself, without touching the backend."""
-        self.send_response(200)
+    def send_local_json(self, started: float, body: bytes, status: int = 200, request: str = "") -> None:
+        """Answer a request from the proxy itself."""
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Length", str(len(body)))
@@ -460,15 +647,45 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             {
                 "method": self.command,
                 "path": self.path,
-                "status": 200,
+                "status": status,
                 "durationMs": round((time.time() - started) * 1000, 2),
                 "model": None,
                 "stream": False,
-                "request": "",
+                "request": request,
                 "response": safe_text(body)[:MAX_CAPTURE],
                 "client": self.client_address[0],
             }
         )
+
+    def handle_decide(self, started: float, body: bytes, probe: bool = False) -> None:
+        """POST /v1/decide, and the probe behind GET /llm3/capabilities?probe=1."""
+        status = 200
+        try:
+            payload = DECIDE_PROBE if probe else json.loads(body.decode("utf-8") or "{}")
+        except Exception:
+            payload = None
+        # A decision call is model work: the dashboard must show the slot busy.
+        inflight_begin()
+        try:
+            if payload is None:
+                raise slot_decide.DecideError("The body is not valid JSON.")
+            result = run_decide(payload)
+            answer = build_local_capabilities_payload() if probe else json.dumps(result, ensure_ascii=False).encode("utf-8")
+            append_proxy_line(
+                f"[decide] method={result['method']} choice={result['choice']} "
+                f"coverage={result['coverage']} rotations={result['rotations']} "
+                f"durationMs={round((time.time() - started) * 1000, 2)} client={self.client_address[0]}"
+            )
+        except slot_decide.DecideError as exc:
+            status = 400
+            answer = json.dumps({"error": str(exc)}).encode("utf-8")
+        except Exception as exc:
+            status = 502
+            answer = json.dumps({"error": "".join(traceback.format_exception_only(type(exc), exc)).strip()}).encode("utf-8")
+            append_proxy_line(f"[decide] failed status=502 {safe_text(answer)[:300]}")
+        finally:
+            inflight_end()
+        self.send_local_json(started, answer, status, "" if probe else prettify(body))
 
     def handle_proxy(self) -> None:
         started = time.time()
@@ -481,6 +698,23 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             return
         if self.command == "GET" and route == "/props" and int(ARGS.context_size or 0) > 0:
             self.send_local_json(started, build_local_props_payload())
+            return
+        # llm3's own probe. Namespaced so it can never collide with a backend
+        # route, and answered here because only the proxy knows what it holds.
+        if self.command == "GET" and route == "/llm3/activity":
+            self.send_local_json(started, build_local_activity_payload())
+            return
+        if self.command == "GET" and route == "/llm3/capabilities":
+            # ?probe=1 sends one small decision call when the method is not
+            # known yet. The result stays valid until the slot starts again.
+            query = self.path.split("?", 1)[1] if "?" in self.path else ""
+            if "probe=1" in query.split("&") and _DECIDE_STATE["decide"] == "unknown":
+                self.handle_decide(started, b"", probe=True)
+                return
+            self.send_local_json(started, build_local_capabilities_payload())
+            return
+        if self.command == "POST" and route in DECIDE_ROUTES:
+            self.handle_decide(started, original_body)
             return
 
         request_body, request_json = normalize_request(self.path, original_body)
@@ -515,6 +749,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if not any(key.lower() == "x-api-key" for key in headers):
                 headers["X-API-Key"] = ARGS.backend_api_key
 
+        if proxy_log_request:
+            inflight_begin()
         try:
             if proxy_log_request:
                 append_proxy_line(f"[request] {self.command} {self.path} model={model or '-'} client={self.client_address[0]}")
@@ -577,6 +813,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 body = resp.read()
                 if len(captured) < MAX_CAPTURE:
                     captured.extend(body[: MAX_CAPTURE - len(captured)])
+                if proxy_log_request and status < 400:
+                    observe_json_body(body, stream_state)
                 body = rewrite_models_payload(route, body)
                 if HIDE_REASONING:
                     body = strip_reasoning_json_body(body)
@@ -620,8 +858,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(payload)
                     self.wfile.flush()
         finally:
-            if stream_state.get("open_line"):
-                print("", flush=True)
+            if proxy_log_request:
+                inflight_end()
+            end_stream_line(stream_state)
             if proxy_log_request or status >= 400:
                 append_proxy_line(
                     f"[response] {self.command} {self.path} status={status} stream={str(stream_mode).lower()} durationMs={round((time.time() - started) * 1000, 2)}"

@@ -33,6 +33,26 @@ PLEASE COMMIT TO GIT AND REFRESH PM2
 - [docs/IMPROVEMENT_PASS_2026-09.md](docs/IMPROVEMENT_PASS_2026-09.md) — the September 2026
   review pass: what changed, what was verified, and the ranked list of what is still open.
 
+## Decision calls and the mlx-dspark shim (read before an mlx-dspark update)
+
+`POST /v1/decide` on every slot port returns one probability for each permitted answer
+and generates no text ("local Jev"). podG depends on this contract. Full reference:
+[docs/DECIDE_ENDPOINT.md](docs/DECIDE_ENDPOINT.md).
+
+- It needs the logprobs of the first output token. `llama-server` has them. mlx-dspark
+  drops them silently in the **dflash** mode (verified on 0.15.1 and 0.19.0).
+- The answer is `src/mlx-dspark-shim.py`, **not** an edit in `site-packages`.
+  `bin/run-mlx-dspark-api.sh` starts the server through it. It replaces three names in
+  memory after a check of the package, and it changes nothing when the check fails
+  (`incompatible`) or when upstream gains the function (`native`). The server starts in
+  every state; `/v1/decide` then falls back to `method: "greedy"`.
+- `LLM3_DSPARK_SHIM=0` in `.env` sets it to off.
+- After any mlx-dspark update: read the `[llm3-shim]` line in the slot log, then run
+  `curl 'http://127.0.0.1:8036/llm3/capabilities?probe=1'`. `"decide": "logprobs"` is the
+  only proof that counts. The doc has the procedure for `native` (delete the shim) and
+  for `incompatible` (the four names to find again).
+- `tests/slot-decide.test.js` and `tests/mlx-dspark-shim.test.js` are the contract tests.
+
 ## Launcher helpers
 
 The nine zsh launchers (`bin/run-*.sh`) source `bin/lib/launcher-common.zsh` for the helpers

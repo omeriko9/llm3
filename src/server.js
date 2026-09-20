@@ -240,6 +240,7 @@ const VOICE_APP_SYNC_ENABLED =
     : true;
 const GGUF_LAUNCHER = process.env.QWEN_LLAMA || path.join(BIN_DIR, "qwen_llama");
 const GGUF_TQ3_LAUNCHER = process.env.QWEN_LLAMA_TQ3 || path.join(BIN_DIR, "qwen_llama_tq3");
+const GGUF_PRISM_LAUNCHER = process.env.QWEN_LLAMA_PRISM || path.join(BIN_DIR, "qwen_llama_prism");
 const BEELLAMA_LAUNCHER = process.env.QWEN_BEELLAMA || path.join(BIN_DIR, "qwen_llama_beellama");
 const BEELLAMA_METAL_SERVER = path.join(REPO_ROOT, "vendor", "beellama.cpp", "build-metal", "bin", "llama-server");
 const MLX_LAUNCHER = process.env.QWEN_MLX || path.join(BIN_DIR, "run-qwen36-mlx-api.sh");
@@ -264,6 +265,22 @@ const DSPARK_REASONING_EFFORTS = ["off", "low", "medium", "xhigh"];
 function normalizeDsparkReasoningEffort(value) {
   const raw = String(value ?? "").trim().toLowerCase();
   return DSPARK_REASONING_EFFORTS.includes(raw) ? raw : null;
+}
+
+// Reads reasoningEffort off a launch request or a saved profile slot. Absent (or
+// null) = null: the launcher keeps the slot's saved effort. "" = an explicit "Model
+// default", which the launcher must honour even when the saved effort is "off".
+function parseReasoningEffortField(source) {
+  const value = source?.reasoningEffort;
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const raw = String(value).trim().toLowerCase();
+  return raw === "" ? "" : normalizeDsparkReasoningEffort(raw);
+}
+
+function reasoningEffortLauncherArgs(params) {
+  return typeof params.reasoningEffort === "string" ? ["--reasoning-effort", params.reasoningEffort] : [];
 }
 
 const MLX_DSPARK_LAUNCHER = process.env.MLX_DSPARK_LAUNCHER || path.join(BIN_DIR, "run-mlx-dspark-api.sh");
@@ -293,6 +310,7 @@ const MODELS_ROOT = path.join(HOME, "models");
 const HF_MODELS_ROOT = path.join(MODELS_ROOT, "hf");
 const GGUF_STATE_DIR = path.join(DEFAULT_XDG_STATE_HOME, "qwen_llama");
 const GGUF_TQ3_STATE_DIR = path.join(DEFAULT_XDG_STATE_HOME, "qwen_llama_tq3");
+const GGUF_PRISM_STATE_DIR = path.join(DEFAULT_XDG_STATE_HOME, "qwen_llama_prism");
 const BEELLAMA_STATE_DIR = path.join(DEFAULT_XDG_STATE_HOME, "qwen_llama_beellama");
 const MLX_STATE_DIR = path.join(DEFAULT_XDG_STATE_HOME, "qwen36_mlx");
 const RAPID_MLX_STATE_DIR = path.join(DEFAULT_XDG_STATE_HOME, "qwen36_rapid_mlx");
@@ -317,6 +335,7 @@ const SLOT_ICON_NAMES = ["diamond", "orbit", "triangle", "hexagon", "square"];
 const GGUF_BACKEND_PORT_BASE = 18036;
 const GGUF_TQ3_BACKEND_PORT_BASE = 18636;
 const BEELLAMA_BACKEND_PORT_BASE = 18736;
+const GGUF_PRISM_BACKEND_PORT_BASE = 18936;
 const MLX_BACKEND_PORT_BASE = 18136;
 const RAPID_MLX_BACKEND_PORT_BASE = 18336;
 const MTPLX_BACKEND_PORT_BASE = 18536;
@@ -368,6 +387,18 @@ const LAUNCHER_DEFINITIONS = Object.freeze([
     versionPath: LLAMA_CPP_UPSTREAM_DIR,
     updateKind: "git",
     updatePath: LLAMA_CPP_UPSTREAM_DIR,
+    buildDirs: ["build"],
+  },
+  {
+    key: "gguf-prism",
+    name: "llama.cpp Prism",
+    family: "gguf",
+    accent: "gguf",
+    path: GGUF_PRISM_LAUNCHER,
+    versionKind: "git",
+    versionPath: path.join(REPO_ROOT, "vendor", "prism-llama.cpp"),
+    updateKind: "git",
+    updatePath: path.join(REPO_ROOT, "vendor", "prism-llama.cpp"),
     buildDirs: ["build"],
   },
   {
@@ -594,6 +625,7 @@ function buildLauncherCommandTemplate(launcherKey) {
     case "ds4":
       return `${launcherPath} --slot ${slot} --model ${modelPath} --context-size ${contextSize} --parallel ${parallel} --port <public-port> --mtp on|off --mtp-draft <n> --temperature ${temperature} --top-p ${topP} --top-k ${topK} --min-p ${minP} --presence-penalty ${presencePenalty} --repetition-penalty ${repetitionPenalty} --start`;
     case "gguf-tq3":
+    case "gguf-prism":
     case "beellama":
     case "gguf":
     default:
@@ -2009,6 +2041,7 @@ function buildSlotDefinition(index) {
   const label = index === 4 ? "Compcation LLM" : `${formatOrdinal(index)} LLM`;
   const ggufStateDir = index === 1 ? GGUF_STATE_DIR : path.join(GGUF_STATE_DIR, id);
   const ggufTq3StateDir = index === 1 ? GGUF_TQ3_STATE_DIR : path.join(GGUF_TQ3_STATE_DIR, id);
+  const ggufPrismStateDir = index === 1 ? GGUF_PRISM_STATE_DIR : path.join(GGUF_PRISM_STATE_DIR, id);
   const beellamaStateDir = index === 1 ? BEELLAMA_STATE_DIR : path.join(BEELLAMA_STATE_DIR, id);
   const mlxStateDir = index === 1 ? MLX_STATE_DIR : path.join(MLX_STATE_DIR, id);
   const rapidMlxStateDir = index === 1 ? RAPID_MLX_STATE_DIR : path.join(RAPID_MLX_STATE_DIR, id);
@@ -2026,6 +2059,7 @@ function buildSlotDefinition(index) {
     localRuntimeBaseUrl: `http://${API_PUBLIC_HOST}:${PUBLIC_API_PORT_BASE + index - 1}/v1`,
     ggufBackendPort: GGUF_BACKEND_PORT_BASE + index - 1,
     ggufTq3BackendPort: GGUF_TQ3_BACKEND_PORT_BASE + index - 1,
+    ggufPrismBackendPort: GGUF_PRISM_BACKEND_PORT_BASE + index - 1,
     beellamaBackendPort: BEELLAMA_BACKEND_PORT_BASE + index - 1,
     mlxBackendPort: MLX_BACKEND_PORT_BASE + index - 1,
     dflashBackendPort: DFLASH_BACKEND_PORT_BASE + index - 1,
@@ -2038,6 +2072,7 @@ function buildSlotDefinition(index) {
     mtplxStateDir,
     optiqStateDir,
     ggufTq3StateDir,
+    ggufPrismStateDir,
     beellamaStateDir,
     turboquantStateDir,
   };
@@ -2111,7 +2146,7 @@ function parseLauncherRequestBody(body = {}) {
     mtpDraftMax: parseIntNumber(body.mtpDraftMax, null),
     ubatchSize: parseIntNumber(body.ubatchSize, null),
     dsparkMode: normalizeDsparkMode(body.dsparkMode),
-    reasoningEffort: normalizeDsparkReasoningEffort(body.reasoningEffort),
+    reasoningEffort: parseReasoningEffortField(body),
     enableTinyGrammar: Boolean(body.enableTinyGrammar),
     enableStructuredGbnf: Boolean(body.enableStructuredGbnf),
     chatTemplate: String(body.chatTemplate || "").trim(),
@@ -2234,6 +2269,14 @@ function getDefaultLogs(slot, runtime) {
     };
   }
 
+  if (runtime === "gguf-prism") {
+    return {
+      server: path.join(slot.ggufPrismStateDir, "llama-server.log"),
+      traffic: path.join(slot.ggufPrismStateDir, "traffic.log"),
+      proxy: path.join(slot.ggufPrismStateDir, "proxy.log"),
+    };
+  }
+
   if (runtime === "gguf-tq3") {
     return {
       server: path.join(slot.ggufTq3StateDir, "llama-server.log"),
@@ -2246,8 +2289,10 @@ function getDefaultLogs(slot, runtime) {
     const stateDir = path.join(DEFAULT_XDG_STATE_HOME, "mlx_dspark", slot.id);
     return {
       server: path.join(stateDir, "mlx-dspark-api.log"),
-      traffic: "",
-      proxy: path.join(stateDir, "mlx-dspark-api.log"),
+      // The launcher puts slot-api-proxy.py in front of the server; the proxy
+      // log is what the Thinking tab reads.
+      traffic: path.join(stateDir, "traffic.log"),
+      proxy: path.join(stateDir, "proxy.log"),
     };
   }
 
@@ -2255,8 +2300,10 @@ function getDefaultLogs(slot, runtime) {
     const stateDir = path.join(DEFAULT_XDG_STATE_HOME, "mlx_vlm", slot.id);
     return {
       server: path.join(stateDir, "mlx-vlm-api.log"),
-      traffic: "",
-      proxy: path.join(stateDir, "mlx-vlm-api.log"),
+      // The launcher puts slot-api-proxy.py in front of the server; the proxy
+      // log is what the Thinking tab reads.
+      traffic: path.join(stateDir, "traffic.log"),
+      proxy: path.join(stateDir, "proxy.log"),
     };
   }
 
@@ -2348,6 +2395,10 @@ function getDefaultLogs(slot, runtime) {
   };
 }
 
+function splitGluedLogStamps(line) {
+  return String(line).split(/(?<=.)(?=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \[[^\]\r\n]+\])/);
+}
+
 function extractThinkingLogContent(buffer, baseOffset, minOffset) {
   const output = [];
   const logLinePattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z \[([^\]]+)\]/;
@@ -2363,18 +2414,18 @@ function extractThinkingLogContent(buffer, baseOffset, minOffset) {
 
   const processLine = (lineEnd, hasNewline) => {
     const lineBuffer = buffer.subarray(lineStart, lineEnd);
-    const line = lineBuffer.toString("utf8");
     const absoluteEndOffset = baseOffset + lineEnd + (hasNewline ? 1 : 0);
-    const logLineMatch = line.match(logLinePattern);
-    if (logLineMatch) {
-      inThinkingBlock = String(logLineMatch[1] || "").trim().toLowerCase() === "thinking";
+    // Older proxies let a concurrent request's stamped line start mid-line,
+    // glued to the open stream text. Split there, or a "[response]" line would
+    // pass as thinking and the "[thinking]" header after it would be missed.
+    for (const line of splitGluedLogStamps(lineBuffer.toString("utf8"))) {
+      const logLineMatch = line.match(logLinePattern);
+      if (logLineMatch) {
+        inThinkingBlock = String(logLineMatch[1] || "").trim().toLowerCase() === "thinking";
+      }
       if (inThinkingBlock) {
         pushLine(line, absoluteEndOffset);
       }
-      return;
-    }
-    if (inThinkingBlock) {
-      pushLine(line, absoluteEndOffset);
     }
   };
 
@@ -2551,6 +2602,7 @@ function createIdleStatus(slot) {
     logs: {
       gguf: getDefaultLogs(slot, "gguf"),
       "gguf-tq3": getDefaultLogs(slot, "gguf-tq3"),
+      "gguf-prism": getDefaultLogs(slot, "gguf-prism"),
       beellama: getDefaultLogs(slot, "beellama"),
       mlx: getDefaultLogs(slot, "mlx"),
       "rapid-mlx": getDefaultLogs(slot, "rapid-mlx"),
@@ -2566,6 +2618,9 @@ function createIdleStatus(slot) {
 function normalizeModelRuntime(value) {
   const runtime = String(value || "").trim().toLowerCase();
   if (runtime === "gguf-tq3" || runtime === "llama.cpp-tq3") {
+    return "gguf";
+  }
+  if (runtime === "gguf-prism" || runtime === "llama.cpp-prism") {
     return "gguf";
   }
   if (runtime === "beellama") {
@@ -2641,6 +2696,14 @@ function modelTraitText(model) {
     model?.quantization,
     ...(Array.isArray(model?.aliases) ? model.aliases : []),
   ].map((value) => String(value || "").trim()).filter(Boolean).join(" ").toLowerCase();
+}
+
+// PrismML's ternary quantizations (Bonsai). They store their weights as ggml
+// types 142 (PQ2_0) / 143 (PTQ1_0), which only the PrismML fork defines, so no
+// other launcher can load them -- upstream llama.cpp stops at type 42.
+function isPrismTernaryModel(model) {
+  const text = modelTraitText(model);
+  return text.includes("pq2_0") || text.includes("ptq1_0");
 }
 
 function isTq3Model(model) {
@@ -2888,6 +2951,9 @@ function getLaunchersForModel(model) {
     // not one option among several here -- it is the only one.
     if (isDs4PackModel(model)) {
       return ["ds4"];
+    }
+    if (isPrismTernaryModel(model)) {
+      return ["gguf-prism"];
     }
     if (isTq3Model(model)) {
       return ["gguf-tq3"];
@@ -3295,7 +3361,15 @@ function normalizeLaunchParamsForModel(model, params = {}) {
     ...params,
     launcher,
     ctxSize: normalizeLaunchContextSizeForModel(model, params),
-    thinking: model?.supportsThinking ? Boolean(params.thinking) : false,
+    // The MLX launchers' thinking switch is their reasoning effort, so report the
+    // state the launcher will actually run with. mlx-dspark: "off" = --no-thinking,
+    // anything else thinks. mlx-vlm: a level = --enable-thinking; "" and "off" pass
+    // no flag, and mlx_vlm.server then renders enable_thinking=false.
+    thinking: launcher === "mlx-dspark"
+      ? params.reasoningEffort !== "off"
+      : launcher === "mlx-vlm"
+        ? Boolean(params.reasoningEffort) && params.reasoningEffort !== "off"
+        : (model?.supportsThinking ? Boolean(params.thinking) : false),
     reasoningBudget: normalizeReasoningBudgetParam(model, params),
     enableDry: supportsGgufExtras(model) ? Boolean(params.enableDry) : false,
     mtpDraftMax: normalizeMtpDraftMaxParam(model, params),
@@ -3636,15 +3710,79 @@ function readTaskCounterThroughput(slotId, key, decoded, prompt) {
   return { phase: prompt > 0 || decoded > 0 ? "prefill" : null, rate: null };
 }
 
+// The slot proxy holds every generation request, so it knows the model is
+// working before a single token is committed. Without this the dashboard
+// spinner stayed dark through prefill, through a queued request and through a
+// stall -- all of which are llm3 working.
+async function probeSlotProxyInflight(port) {
+  if (!Number.isInteger(port) || port <= 0) {
+    return null;
+  }
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/llm3/activity`, {
+      signal: AbortSignal.timeout(SLOT_ACTIVITY_PROBE_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      return null;
+    }
+    const payload = await response.json();
+    if (typeof payload?.inflight !== "number") {
+      return null;
+    }
+    return {
+      inflight: payload.inflight,
+      openForMs: Number(payload.openForMs) || 0,
+      decide: typeof payload.decide === "string" ? payload.decide : null,
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+// Which method POST /v1/decide gets from this slot: "logprobs", "greedy", or
+// "unknown" before the first decision call. The proxy measures it from a real
+// response. One probe after a start makes it known at once, which is how an
+// mlx-dspark update that disables src/mlx-dspark-shim.py becomes visible.
+// Fire-and-forget on purpose: it is inference, so it must never hold the
+// action lock, and a busy model answers it late.
+function probeSlotDecideCapability(slot) {
+  const port = Number(slot?.publicPort);
+  if (!Number.isInteger(port) || port <= 0) {
+    return;
+  }
+  fetch(`http://127.0.0.1:${port}/llm3/capabilities?probe=1`, {
+    signal: AbortSignal.timeout(10 * 60 * 1000),
+  }).then((response) => response.arrayBuffer()).catch(() => {});
+}
+
 async function probeSlotThroughput(slot) {
   const ports = Number(slot.publicPort) === Number(slot.ggufBackendPort)
     ? [slot.ggufBackendPort]
     : [slot.ggufBackendPort, slot.publicPort];
 
+  const inflight = await probeSlotProxyInflight(slot.publicPort);
+  const measured = await measureSlotThroughput(slot, ports, inflight);
+  const decide = inflight?.decide || null;
+  if (!measured) {
+    return decide ? { busy: null, tokensPerSecond: null, phase: null, source: null, decide } : null;
+  }
+  return { ...measured, decide };
+}
+
+async function measureSlotThroughput(slot, ports, inflight) {
   for (const port of ports) {
     const rounds = await probeSlotRounds(port);
     if (rounds) {
-      return { ...readRoundsThroughput(slot.id, rounds), source: "rounds" };
+      const measured = readRoundsThroughput(slot.id, rounds);
+      if (measured.busy) {
+        return { ...measured, source: "rounds" };
+      }
+      // No round landed since the last poll. That is only idle if nothing is
+      // open: during prefill, or behind a queue, rounds do not move yet.
+      if (inflight && inflight.inflight > 0) {
+        return { busy: true, tokensPerSecond: null, phase: "prefill", source: "inflight" };
+      }
+      return { ...measured, source: "rounds" };
     }
   }
   for (const port of ports) {
@@ -3664,11 +3802,18 @@ async function probeSlotThroughput(slot) {
   for (const port of ports) {
     const metrics = await probeSlotMetrics(port);
     if (metrics) {
+      if (!metrics.busy && inflight && inflight.inflight > 0) {
+        return { busy: true, tokensPerSecond: null, phase: "prefill", source: "inflight" };
+      }
       return { busy: metrics.busy, tokensPerSecond: null, source: "metrics" };
     }
   }
   slotRoundsSamples.delete(slot.id);
   slotCounterSamples.delete(slot.id);
+  // A runtime with no throughput endpoint at all still goes through the proxy.
+  if (inflight) {
+    return { busy: inflight.inflight > 0, tokensPerSecond: null, phase: null, source: "inflight" };
+  }
   return null;
 }
 
@@ -3685,6 +3830,7 @@ app.get("/api/slots/activity", async (_req, res) => {
         source: probe?.busy == null ? "traffic" : probe.source,
         tokensPerSecond: Number.isFinite(rate) ? Math.round(rate * 10) / 10 : null,
         phase: probe?.phase || null,
+        decide: probe?.decide || null,
       }];
     })
   );
@@ -5767,6 +5913,7 @@ async function stopAllRuntimes({ slotId = "" } = {}) {
     output.push(await safeStop(MLX_LAUNCHER, currentSlot));
     output.push(await safeStop(BEELLAMA_LAUNCHER, currentSlot));
     output.push(await safeStop(GGUF_TQ3_LAUNCHER, currentSlot));
+    output.push(await safeStop(GGUF_PRISM_LAUNCHER, currentSlot));
     output.push(await safeStop(GGUF_LAUNCHER, currentSlot));
   }
 
@@ -5813,6 +5960,7 @@ async function startConfiguredModel(slot, model, params, requestedApplicationTar
   assertActionNotAborted();
   const stdout = await startModel(slot, model, params);
   assertActionNotAborted();
+  probeSlotDecideCapability(slot);
   await markModelUsed(model);
   const dashboardConfig = await readDashboardConfig();
   const proposedApplicationTargets = {
@@ -5903,6 +6051,8 @@ async function applySavedProfile(profileId) {
           ctxSize: slotConfig.ctxSize,
           parallel: slotConfig.parallel,
           thinking: slotConfig.thinking,
+          reasoningEffort: slotConfig.reasoningEffort,
+          dsparkMode: slotConfig.dsparkMode,
           reasoningBudget: slotConfig.reasoningBudget,
           enableDry: slotConfig.enableDry,
           mtpDraftMax: slotConfig.mtpDraftMax,
@@ -6119,7 +6269,7 @@ async function startModel(slot, model, params) {
       "--model",
       model.key,
       ...(params.dsparkMode ? ["--mode", params.dsparkMode] : []),
-      ...(params.reasoningEffort ? ["--reasoning-effort", params.reasoningEffort] : []),
+      ...reasoningEffortLauncherArgs(params),
       "--context-size",
       String(params.ctxSize),
       "--parallel",
@@ -6184,7 +6334,7 @@ async function startModel(slot, model, params) {
       slot.id,
       "--model",
       model.key,
-      ...(params.reasoningEffort ? ["--reasoning-effort", params.reasoningEffort] : []),
+      ...reasoningEffortLauncherArgs(params),
       "--context-size",
       String(params.ctxSize),
       "--parallel",
@@ -6311,8 +6461,8 @@ async function startModel(slot, model, params) {
     ]);
   }
 
-  if (launcher === "gguf-tq3") {
-    return runLauncher(GGUF_TQ3_LAUNCHER, [
+  if (launcher === "gguf-prism") {
+    return runLauncher(GGUF_PRISM_LAUNCHER, [
       "--slot",
       slot.id,
       model.key,
@@ -6449,7 +6599,7 @@ async function setLauncherDefaults(slot, model, params) {
       slot.id,
       "--set-defaults",
       ...(params.dsparkMode ? ["--mode", params.dsparkMode] : []),
-      ...(params.reasoningEffort ? ["--reasoning-effort", params.reasoningEffort] : []),
+      ...reasoningEffortLauncherArgs(params),
       "--context-size",
       String(params.ctxSize),
       "--parallel",
@@ -6501,7 +6651,7 @@ async function setLauncherDefaults(slot, model, params) {
       "--slot",
       slot.id,
       "--set-defaults",
-      ...(params.reasoningEffort ? ["--reasoning-effort", params.reasoningEffort] : []),
+      ...reasoningEffortLauncherArgs(params),
       "--context-size",
       String(params.ctxSize),
       "--parallel",
@@ -6593,8 +6743,8 @@ async function setLauncherDefaults(slot, model, params) {
     ]);
   }
 
-  if (launcher === "gguf-tq3") {
-    return runLauncher(GGUF_TQ3_LAUNCHER, [
+  if (launcher === "gguf-prism") {
+    return runLauncher(GGUF_PRISM_LAUNCHER, [
       "--slot",
       slot.id,
       "--set-defaults",
@@ -9194,6 +9344,7 @@ async function getSlotStatus(slot, models = null) {
   const statusChecks = [
     ["gguf", GGUF_LAUNCHER],
     ["gguf-tq3", GGUF_TQ3_LAUNCHER],
+    ["gguf-prism", GGUF_PRISM_LAUNCHER],
     ["beellama", BEELLAMA_LAUNCHER],
     ["mlx", MLX_LAUNCHER],
     ["rapid-mlx", RAPID_MLX_LAUNCHER],
@@ -9216,7 +9367,7 @@ async function getSlotStatus(slot, models = null) {
   // file behind. Most specific first.
   const statusPrecedence = [
     "turboquant", "rapid-mlx", "dflash", "mtplx", "optiq",
-    "mlx-dspark", "mlx-vlm", "ds4", "mlx", "gguf-tq3", "beellama", "gguf",
+    "mlx-dspark", "mlx-vlm", "ds4", "mlx", "gguf-tq3", "gguf-prism", "beellama", "gguf",
   ];
   for (const key of statusPrecedence) {
     const candidate = statusByKey.get(key);
@@ -9267,6 +9418,7 @@ async function computeOverviewData() {
       defaults: {
         gguf: await readDefaultsFromScript(GGUF_LAUNCHER, slot),
         "gguf-tq3": await readDefaultsFromScript(GGUF_TQ3_LAUNCHER, slot),
+        "gguf-prism": await readDefaultsFromScript(GGUF_PRISM_LAUNCHER, slot),
         beellama: await readDefaultsFromScript(BEELLAMA_LAUNCHER, slot),
         mlx: await readDefaultsFromScript(MLX_LAUNCHER, slot),
         "rapid-mlx": await readDefaultsFromScript(RAPID_MLX_LAUNCHER, slot),
@@ -10881,6 +11033,7 @@ async function readStatusFromScript(script, slot, fallbackLogs, launcher) {
         logs: {
           gguf: getDefaultLogs(slot, "gguf"),
           "gguf-tq3": getDefaultLogs(slot, "gguf-tq3"),
+      "gguf-prism": getDefaultLogs(slot, "gguf-prism"),
           beellama: getDefaultLogs(slot, "beellama"),
           mlx: getDefaultLogs(slot, "mlx"),
           "rapid-mlx": getDefaultLogs(slot, "rapid-mlx"),
@@ -10914,6 +11067,7 @@ async function readStatusFromScript(script, slot, fallbackLogs, launcher) {
       logs: {
         gguf: getDefaultLogs(slot, "gguf"),
         "gguf-tq3": getDefaultLogs(slot, "gguf-tq3"),
+      "gguf-prism": getDefaultLogs(slot, "gguf-prism"),
         beellama: getDefaultLogs(slot, "beellama"),
         mlx: getDefaultLogs(slot, "mlx"),
         "rapid-mlx": getDefaultLogs(slot, "rapid-mlx"),
@@ -10943,6 +11097,7 @@ async function readStatusFromScript(script, slot, fallbackLogs, launcher) {
         logs: {
           gguf: getDefaultLogs(slot, "gguf"),
           "gguf-tq3": getDefaultLogs(slot, "gguf-tq3"),
+      "gguf-prism": getDefaultLogs(slot, "gguf-prism"),
           beellama: getDefaultLogs(slot, "beellama"),
           mlx: getDefaultLogs(slot, "mlx"),
           "rapid-mlx": getDefaultLogs(slot, "rapid-mlx"),
@@ -11242,6 +11397,8 @@ async function resolveSlotContextLength(slot, status) {
     ? "beellama"
     : launcher === "gguf-tq3"
     ? "gguf-tq3"
+    : launcher === "gguf-prism"
+    ? "gguf-prism"
     : status?.model?.runtime === "dflash"
     ? "dflash"
     : status?.model?.runtime === "mtplx"
@@ -11258,6 +11415,8 @@ async function resolveSlotContextLength(slot, status) {
         ? BEELLAMA_LAUNCHER
       : runtime === "gguf-tq3"
         ? GGUF_TQ3_LAUNCHER
+      : runtime === "gguf-prism"
+        ? GGUF_PRISM_LAUNCHER
       : runtime === "mtplx"
         ? MTPLX_LAUNCHER
         : runtime === "turboquant"
@@ -13024,7 +13183,7 @@ async function detectLiveRuntimeStatus(slot, models) {
             : { key: modelId || "live-runtime", label: modelId || "Live MTPLX", family: "MLX", sizeLabel: "", launcher: "mtplx", runtime: "mtplx" },
           params: inferParamsFromCommand(mtplxProcess.command, "mtplx"),
           network: { publicHost: API_PUBLIC_HOST, publicPort: slot.publicPort, backendHost: "127.0.0.1", backendPort: slot.mtplxBackendPort },
-          logs: { gguf: getDefaultLogs(slot, "gguf"), "gguf-tq3": getDefaultLogs(slot, "gguf-tq3"), beellama: getDefaultLogs(slot, "beellama"), mlx: getDefaultLogs(slot, "mlx"), "rapid-mlx": getDefaultLogs(slot, "rapid-mlx"), mtplx: getDefaultLogs(slot, "mtplx"), optiq: getDefaultLogs(slot, "optiq"), dflash: getDefaultLogs(slot, "dflash"), turboquant: getDefaultLogs(slot, "turboquant"), active: getDefaultLogs(slot, "mtplx") },
+          logs: { gguf: getDefaultLogs(slot, "gguf"), "gguf-tq3": getDefaultLogs(slot, "gguf-tq3"), "gguf-prism": getDefaultLogs(slot, "gguf-prism"), beellama: getDefaultLogs(slot, "beellama"), mlx: getDefaultLogs(slot, "mlx"), "rapid-mlx": getDefaultLogs(slot, "rapid-mlx"), mtplx: getDefaultLogs(slot, "mtplx"), optiq: getDefaultLogs(slot, "optiq"), dflash: getDefaultLogs(slot, "dflash"), turboquant: getDefaultLogs(slot, "turboquant"), active: getDefaultLogs(slot, "mtplx") },
           pids: { proxy: mtplxProcess.pid, backend: null },
           startedAt: null,
         };
@@ -13086,6 +13245,7 @@ async function detectLiveRuntimeStatus(slot, models) {
     logs: {
       gguf: getDefaultLogs(slot, "gguf"),
       "gguf-tq3": getDefaultLogs(slot, "gguf-tq3"),
+      "gguf-prism": getDefaultLogs(slot, "gguf-prism"),
       beellama: getDefaultLogs(slot, "beellama"),
       mlx: getDefaultLogs(slot, "mlx"),
       "rapid-mlx": getDefaultLogs(slot, "rapid-mlx"),
@@ -13625,6 +13785,9 @@ function detectRuntimeFromProcess(command) {
   if (value.includes("qwen_llama_tq3") || value.includes("llama.cpp-tq3")) {
     return "gguf-tq3";
   }
+  if (value.includes("qwen_llama_prism") || value.includes("prism-llama.cpp")) {
+    return "gguf-prism";
+  }
   if (value.includes("rapid-mlx")) {
     return "mlx";
   }
@@ -13684,6 +13847,9 @@ function inferBackendPort(command, runtime, slot, launcher = "") {
   }
   if (launcher === "gguf-tq3") {
     return slot.ggufTq3BackendPort;
+  }
+  if (launcher === "gguf-prism") {
+    return slot.ggufPrismBackendPort;
   }
   if (launcher === "beellama") {
     return slot.beellamaBackendPort;
@@ -15020,6 +15186,8 @@ function buildDefaultProfileSlotConfig(slotId) {
     ctxSize: 255000,
     parallel: 1,
     thinking: false,
+    reasoningEffort: null,
+    dsparkMode: null,
     reasoningBudget: null,
     enableDry: false,
     mtpDraftMax: null,
@@ -15106,6 +15274,9 @@ function normalizeProfileSlotConfig(slotId, value) {
     ctxSize: Number.isInteger(ctxSize) && ctxSize > 0 ? ctxSize : fallback.ctxSize,
     parallel: Number.isInteger(parallel) && parallel > 0 ? parallel : fallback.parallel,
     thinking: Boolean(value?.thinking),
+    reasoningEffort: parseReasoningEffortField(value),
+    // null = saved before profiles kept it: the launcher keeps the slot's saved mode.
+    dsparkMode: normalizeDsparkMode(value?.dsparkMode),
     reasoningBudget: Number.isInteger(Number.parseInt(String(value?.reasoningBudget ?? ""), 10))
       && Number.parseInt(String(value?.reasoningBudget ?? ""), 10) >= -1
       ? Number.parseInt(String(value?.reasoningBudget ?? ""), 10)
@@ -18086,6 +18257,8 @@ module.exports = {
   getFailedIntegrationSyncMessages,
   readThinkingClearOffset,
   writeThinkingClearOffset,
+  extractThinkingLogContent,
+  getLaunchersForModel,
   buildHfCandidates,
   pruneForeignQuantFiles,
   normalizeDownloadCandidate,

@@ -9,9 +9,11 @@
 # tok/s, so this is the first MLX launcher here that beats GGUF/Metal — which is
 # why it is not behind LLM3_ENABLE_EXPERIMENTAL_LAUNCHERS like the rest.
 #
-# The server is OpenAI-compatible and speaks the same /v1 surface as the other
-# launchers, so no proxy layer is needed: mlx-dspark serves the public port
-# directly.
+# The server is OpenAI-compatible, but it runs on a backend port behind
+# src/slot-api-proxy.py, like the GGUF slots. Serving the public port directly
+# worked, yet left llm3's Logs -> Thinking and Traffic tabs empty: the proxy is
+# what writes the "[thinking]" stream lines and the traffic log. The proxy runs
+# with --no-sampling-defaults, so every request reaches mlx-dspark unchanged.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${(%):-%x}")" && pwd)"
@@ -25,6 +27,7 @@ STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/mlx_dspark"
 SLOT="slot1"
 STATE_DIR=""
 PORT=""
+BACKEND_PORT=""
 HOST="0.0.0.0"
 LOG_FILE=""
 PID_FILE=""
@@ -39,6 +42,9 @@ PRESENCE_PENALTY=""
 REPETITION_PENALTY=""
 MODE="${MLX_DSPARK_MODE:-}"
 REASONING_EFFORT=""
+# 1 once --reasoning-effort was passed. "" then means "use the template default",
+# which must not fall back to the slot's saved effort (it may be "off").
+REASONING_EFFORT_GIVEN=0
 ACTION=""
 FOREGROUND=0
 SKIP_STOP=0
@@ -67,7 +73,11 @@ configure_slot() {
   index="$(slot_index "${SLOT}")"
   [[ -n "${STATE_DIR}" ]] || STATE_DIR="${STATE_ROOT}/${SLOT}"
   [[ -n "${PORT}" ]] || PORT="$((8036 + index - 1))"
+  # llm3's MLX backend port base (MLX_BACKEND_PORT_BASE in src/server.js).
+  [[ -n "${BACKEND_PORT}" ]] || BACKEND_PORT="$((18136 + index - 1))"
   [[ -n "${LOG_FILE}" ]] || LOG_FILE="${STATE_DIR}/mlx-dspark-api.log"
+  PROXY_LOG_FILE="${STATE_DIR}/proxy.log"
+  TRAFFIC_LOG_FILE="${STATE_DIR}/traffic.log"
   [[ -n "${PID_FILE}" ]] || PID_FILE="${STATE_DIR}/mlx-dspark-api.pid"
   STATE_FILE="${STATE_DIR}/current.json"
   DEFAULTS_FILE="${STATE_DIR}/defaults.json"
@@ -138,7 +148,7 @@ save_defaults() {
   "presencePenalty": ${PRESENCE_PENALTY:-$DEFAULT_PRESENCE_PENALTY},
   "repetitionPenalty": ${REPETITION_PENALTY:-$DEFAULT_REPETITION_PENALTY},
   "mode": "${MODE:-$DEFAULT_MODE}",
-  "reasoningEffort": "${REASONING_EFFORT:-$DEFAULT_REASONING_EFFORT}"
+  "reasoningEffort": "$( (( REASONING_EFFORT_GIVEN )) && printf '%s' "${REASONING_EFFORT}" || printf '%s' "${DEFAULT_REASONING_EFFORT}" )"
 }
 EOF
   echo "Saved mlx-dspark defaults for ${SLOT}"
@@ -204,10 +214,11 @@ PY
 }
 
 status_json() {
-  /usr/bin/python3 - "${STATE_FILE}" "${PID_FILE}" "${LOG_FILE}" <<'PY'
+  /usr/bin/python3 - "${STATE_FILE}" "${PID_FILE}" "${LOG_FILE}" "${PROXY_LOG_FILE}" "${TRAFFIC_LOG_FILE}" <<'PY'
 import json, os, sys
 from pathlib import Path
 state_path, pid_path, log_file = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+idle_logs = {"server": log_file, "proxy": sys.argv[4], "traffic": sys.argv[5]}
 
 def alive(pid):
     try:
@@ -217,7 +228,7 @@ def alive(pid):
     return True
 
 if not state_path.exists():
-    print(json.dumps({"running": False, "logs": {"server": log_file}}, indent=2))
+    print(json.dumps({"running": False, "logs": idle_logs}, indent=2))
     raise SystemExit(0)
 data = json.loads(state_path.read_text())
 pid = (data.get("pids") or {}).get("server")
@@ -230,7 +241,7 @@ else:
             Path(path).unlink()
         except FileNotFoundError:
             pass
-    print(json.dumps({"running": False, "logs": {"server": log_file}}, indent=2))
+    print(json.dumps({"running": False, "logs": idle_logs}, indent=2))
 PY
 }
 
@@ -255,7 +266,7 @@ write_state_file() {
   "params": {
     "ctxSize": ${CONTEXT_SIZE},
     "parallel": ${PARALLEL},
-    "thinking": false,
+    "thinking": $([[ "${REASONING_EFFORT}" == "off" ]] && echo false || echo true),
     "temperature": ${TEMPERATURE},
     "topP": ${TOP_P},
     "topK": ${TOP_K},
@@ -275,12 +286,12 @@ write_state_file() {
     "publicHost": "${HOST}",
     "publicPort": ${PORT},
     "backendHost": "127.0.0.1",
-    "backendPort": ${PORT}
+    "backendPort": ${BACKEND_PORT}
   },
   "logs": {
     "server": "${LOG_FILE}",
-    "traffic": "",
-    "proxy": "${LOG_FILE}"
+    "traffic": "${TRAFFIC_LOG_FILE}",
+    "proxy": "${PROXY_LOG_FILE}"
   },
   "pids": {
     "server": ${server_pid}
@@ -301,16 +312,11 @@ stop_instance() {
     done
     kill -0 "${pid}" 2>/dev/null && kill -9 "${pid}" 2>/dev/null || true
   fi
-  # Anything still holding the slot port (a crashed predecessor) has to go, or
-  # the next start silently binds nothing. netstat, never lsof: lsof walks every
-  # descriptor on the box and stalls on a hung network mount.
-  local holder=""
-  holder="$(netstat -anv -p tcp 2>/dev/null | awk -v port="${PORT}" '$6=="LISTEN" && $4 ~ ("\\."port"$") {print $11}' | sed 's/.*://' | head -1 || true)"
-  if [[ -n "${holder}" && "${holder}" != "0" ]] && kill -0 "${holder}" 2>/dev/null; then
-    kill "${holder}" 2>/dev/null || true
-    sleep 1
-    kill -0 "${holder}" 2>/dev/null && kill -9 "${holder}" 2>/dev/null || true
-  fi
+  # Anything still holding the slot's two ports (a crashed predecessor, or a
+  # proxy/backend left behind by a killed wrapper) has to go, or the next start
+  # silently binds nothing.
+  kill_port_listener "${PORT}"
+  kill_port_listener "${BACKEND_PORT}"
   rm -f "${PID_FILE}" "${STATE_FILE}"
 }
 
@@ -327,9 +333,10 @@ while [[ $# -gt 0 ]]; do
     --presence-penalty) PRESENCE_PENALTY="$2"; shift 2 ;;
     --repetition-penalty) REPETITION_PENALTY="$2"; shift 2 ;;
     --mode) MODE="$2"; shift 2 ;;
-    --reasoning-effort) REASONING_EFFORT="$2"; shift 2 ;;
+    --reasoning-effort) REASONING_EFFORT="$2"; REASONING_EFFORT_GIVEN=1; shift 2 ;;
     --host) HOST="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
+    --backend-port) BACKEND_PORT="$2"; shift 2 ;;
     --state-dir) STATE_DIR="$2"; shift 2 ;;
     --log-file) LOG_FILE="$2"; shift 2 ;;
     --pid-file) PID_FILE="$2"; shift 2 ;;
@@ -368,7 +375,7 @@ MODEL_HF_URL="$(model_metadata "${MODEL_DIR}" hfUrl)"
 MODEL_SIZE_LABEL="$(model_metadata "${MODEL_DIR}" size)"
 CONTEXT_SIZE="${CONTEXT_SIZE:-$DEFAULT_CONTEXT_SIZE}"
 MODE="${MODE:-$DEFAULT_MODE}"
-REASONING_EFFORT="${REASONING_EFFORT:-$DEFAULT_REASONING_EFFORT}"
+(( REASONING_EFFORT_GIVEN )) || REASONING_EFFORT="${DEFAULT_REASONING_EFFORT}"
 EFFECTIVE_MODE="$(resolve_effective_mode "${MODEL_DIR:-}" "${MODE}")"
 PARALLEL="${PARALLEL:-$DEFAULT_PARALLEL}"
 TEMPERATURE="${TEMPERATURE:-$DEFAULT_TEMPERATURE}"
@@ -420,14 +427,23 @@ if (( FOREGROUND )); then
     fi
   fi
 
-  exec "${BIN}" serve \
+  # The server starts through src/mlx-dspark-shim.py, not through the mlx-dspark
+  # console script. The shim edits no package file: it adds first-token logprobs
+  # to the dflash mode in memory, which POST /v1/decide needs, and then calls the
+  # same CLI entry point. It does a check of the package first and changes
+  # nothing when the package moved or when upstream has the function itself.
+  # LLM3_DSPARK_SHIM=0 sets it to off. Read docs/DECIDE_ENDPOINT.md before an
+  # mlx-dspark update.
+  export LLM3_DSPARK_SHIM_STATUS_FILE="${STATE_DIR}/dspark-shim.json"
+  serve_behind_slot_proxy "${BACKEND_PORT}" "${HOST}" "${PORT}" "${PROXY_LOG_FILE}" "${TRAFFIC_LOG_FILE}" -- \
+    "${VENV}/bin/python" "${SCRIPT_DIR:h}/src/mlx-dspark-shim.py" serve \
     --model "${MODEL_DIR}" \
     --mode "${MODE}" \
     --max-batch "${PARALLEL}" \
     "${draft_args[@]}" \
     "${think_args[@]}" \
-    --host "${HOST}" \
-    --port "${PORT}" \
+    --host 127.0.0.1 \
+    --port "${BACKEND_PORT}" \
     --context-window "${CONTEXT_SIZE}" \
     --default-temperature "${TEMPERATURE}" \
     --default-top-p "${TOP_P}" \
@@ -436,7 +452,7 @@ fi
 
 server_pid="$(
   spawn_detached "${LOG_FILE}" "$0" --foreground --skip-stop --slot "${SLOT}" --model "${MODEL_DIR}" \
-    --host "${HOST}" --port "${PORT}" --state-dir "${STATE_DIR}" --log-file "${LOG_FILE}" --pid-file "${PID_FILE}" \
+    --host "${HOST}" --port "${PORT}" --backend-port "${BACKEND_PORT}" --state-dir "${STATE_DIR}" --log-file "${LOG_FILE}" --pid-file "${PID_FILE}" \
     --context-size "${CONTEXT_SIZE}" --parallel "${PARALLEL}" --mode "${MODE}" \
     --reasoning-effort "${REASONING_EFFORT}" \
     --temperature "${TEMPERATURE}" --top-p "${TOP_P}" --top-k "${TOP_K}" --min-p "${MIN_P}" \
@@ -446,8 +462,9 @@ server_pid="$(
 echo "${server_pid}" > "${PID_FILE}"
 
 # A 27B 8-bit target plus its drafter is ~31GB of weights to page in; the other
-# launchers allow 180s for far less.
-if ! wait_for_http "http://127.0.0.1:${PORT}/v1/models" 300; then
+# launchers allow 180s for far less. The public port answers only once the
+# backend is up (300s inside) and the proxy has started, hence a little more.
+if ! wait_for_http "http://127.0.0.1:${PORT}/v1/models" 330; then
   echo "Timed out waiting for mlx-dspark on ${HOST}:${PORT} (see ${LOG_FILE})" >&2
   exit 1
 fi
@@ -456,5 +473,6 @@ write_state_file "${server_pid}"
 echo "Started mlx-dspark (${MODE}) on ${HOST}:${PORT}"
 echo "PID: ${server_pid}"
 echo "Log: ${LOG_FILE}"
+echo "Proxy log: ${PROXY_LOG_FILE} (backend 127.0.0.1:${BACKEND_PORT})"
 echo "Model: ${MODEL_DIR}"
 echo "Context size: ${CONTEXT_SIZE} tokens"
