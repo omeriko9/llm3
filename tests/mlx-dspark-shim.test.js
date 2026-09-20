@@ -42,10 +42,25 @@ const FIRST_TOKEN = "token = _pick(Row())\n    _pick(Row())";
 
 const SERVER = `
 from .generate import dflash_generate
+from .lookup import lookup_generate
 
 class Engine:
+    mode = "dflash"
+
     def _generate_impl_inner(self, prompt_ids, max_tokens, logprobs=None):
+        if self.mode == "lookup":
+            return lookup_generate("target")
         return dflash_generate("target")
+`;
+
+// lookup.py imports _pick BY NAME, as the real package does: a hook on
+// generate._pick alone would never see the lookup mode's first token.
+const LOOKUP = (lookupParams, lookupFirstToken) => `
+from .generate import GenResult, Row, _pick
+
+def lookup_generate(target, ${lookupParams}):
+    ${lookupFirstToken}
+    return GenResult(text="y")
 `;
 
 const DRIVER = `
@@ -57,10 +72,15 @@ import mlx_dspark.server as server
 engine = server.Engine()
 asked = engine._generate_impl_inner([1], 1, logprobs=5)
 plain = engine._generate_impl_inner([1], 1)
-print(json.dumps({"status": status, "asked": asked.logprobs, "plain": plain.logprobs}))
+engine.mode = "lookup"
+looked = engine._generate_impl_inner([1], 1, logprobs=5)
+print(json.dumps({"status": status, "asked": asked.logprobs, "plain": plain.logprobs, "lookup": looked.logprobs}))
 `;
 
-async function run(t, { dflashParams = "max_new_tokens=1", firstToken = FIRST_TOKEN, env = {} } = {}) {
+async function run(t, {
+  dflashParams = "max_new_tokens=1", firstToken = FIRST_TOKEN,
+  lookupParams = "max_new_tokens=1", lookupFirstToken = "token = _pick(Row())", env = {},
+} = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "llm3-shim-test-"));
   t.after(() => fs.rm(dir, { recursive: true, force: true }));
   const pkg = path.join(dir, "mlx_dspark");
@@ -68,6 +88,7 @@ async function run(t, { dflashParams = "max_new_tokens=1", firstToken = FIRST_TO
   await fs.writeFile(path.join(pkg, "__init__.py"), "");
   await fs.writeFile(path.join(pkg, "generate.py"), GENERATE(dflashParams, firstToken));
   await fs.writeFile(path.join(pkg, "server.py"), SERVER);
+  await fs.writeFile(path.join(pkg, "lookup.py"), LOOKUP(lookupParams, lookupFirstToken));
   const statusFile = path.join(dir, "status.json");
   const { stdout, stderr } = await execFileAsync("python3", ["-c", DRIVER, SHIM], {
     env: { PATH: process.env.PATH, PYTHONPATH: dir, LLM3_DSPARK_SHIM_STATUS_FILE: statusFile, ...env },
@@ -83,21 +104,34 @@ test("active: the first token gets logprobs, and only when the request asked for
   assert.equal(out.asked[0].token_id, 7);
   assert.equal(out.plain, null);
   assert.match(out.stderr, /\[llm3-shim\] active/);
+  assert.equal(out.lookup.length, 1, "the lookup mode gets its first-token logprobs too");
   assert.equal(out.written.status, "active");
-  assert.equal(out.written.shimVersion, 1);
+  assert.equal(out.written.shimVersion, 2);
 });
 
-test("native: upstream dflash_generate accepts logprobs, so the shim changes nothing", async (t) => {
-  const out = await run(t, { dflashParams: "max_new_tokens=1, logprobs=None" });
+test("native: every generator accepts logprobs upstream, so the shim changes nothing", async (t) => {
+  const out = await run(t, {
+    dflashParams: "max_new_tokens=1, logprobs=None", lookupParams: "max_new_tokens=1, logprobs=None",
+  });
   assert.equal(out.status, "native");
   assert.equal(out.asked, null);
+  assert.equal(out.lookup, null);
   assert.match(out.stderr, /upstream supports it/);
 });
 
-test("incompatible: a moved name leaves the package as it is and the server still starts", async (t) => {
-  const out = await run(t, { firstToken: "token = 7" });
+test("mixed: upstream fixed dflash only, so the shim patches the lookup mode and leaves dflash alone", async (t) => {
+  const out = await run(t, { dflashParams: "max_new_tokens=1, logprobs=None" });
+  assert.equal(out.status, "active");
+  assert.equal(out.asked, null, "the fake native dflash returns none, and the shim must not touch it");
+  assert.equal(out.lookup.length, 1);
+  assert.match(out.written.reason, /dflash_generate: native, lookup_generate: active/);
+});
+
+test("incompatible: moved names leave the package as it is and the server still starts", async (t) => {
+  const out = await run(t, { firstToken: "token = 7", lookupFirstToken: "token = 7" });
   assert.equal(out.status, "incompatible");
   assert.equal(out.asked, null);
+  assert.equal(out.lookup, null);
   assert.match(out.written.reason, /_pick/);
 });
 

@@ -121,6 +121,7 @@ The value comes from a real response, not from a launcher table.
 | `gguf` (llama-server) | Standard function | No change was necessary |
 | `mlx-dspark`, mode `dspark` or `baseline` | Standard function | |
 | `mlx-dspark`, mode `dflash` | **Only through the shim** | See below |
+| `mlx-dspark`, mode `lookup` | **Only through the shim** (v2) | `--mode auto` selects it for a model with no drafter. Found 2026-09-21, when a new podG model gave `greedy` |
 | Other launchers | Not examined | They get `greedy` if they return no logprobs |
 
 Measured 2026-09-20 on the M4 Max:
@@ -212,6 +213,20 @@ runs on the one generation thread of the server, so there is no lock.
 
 Limit: in the dflash mode only the **first** token has logprobs. A request with
 `max_tokens > 1` gets one entry. A decision call reads only that one.
+
+### The generators it covers
+
+`SHIM_TARGETS` lists each generator that takes no `logprobs` argument:
+`generate.dflash_generate` and, since v2, `lookup.lookup_generate`. `lookup.py`
+imports `_pick` from `generate` by name, so it holds its own `_pick`, and the
+hook goes into each module. The check runs for each generator by itself: if
+upstream gives logprobs to one of them, the shim leaves that one alone and
+still covers the other. The `[llm3-shim]` line names each, for example
+`first-token logprobs (dflash_generate: active, lookup_generate: active)`.
+
+A new mode that drops logprobs shows as `"decide": "greedy"` in the probe while
+the shim says `active`. Look at `/health` of the backend port for `mode`, find
+that mode's generator, and add it to `SHIM_TARGETS`.
 
 ### The four states
 
@@ -323,5 +338,6 @@ uv pip install --python ~/.venvs/mlx-dspark/bin/python "mlx-dspark==0.19.0"
 
 | Date | Event |
 | --- | --- |
+| 2026-09-21 | Shim v2: the lookup mode. |
 | 2026-09-20 | Decision calls pinned to one llama-server slot after the prompt cache measurement. |
 | 2026-09-20 | `/v1/decide` and shim v1 written. mlx-dspark updated 0.15.1 -> 0.19.0 (only that package changed; the list before the update is in `~/.local/state/mlx_dspark/venv-freeze-0.15.1.txt`). Shim `active` on both versions. |
