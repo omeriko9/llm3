@@ -132,7 +132,7 @@ test("decide returns one probability for each choice and sends a zero-text reque
   assert.equal(sent.body.logprobs, true);
   assert.equal(sent.body.enable_thinking, false);
   assert.deepEqual(sent.body.chat_template_kwargs, { enable_thinking: false });
-  assert.match(sent.body.messages[0].content, /Label:$/);
+  assert.match(sent.body.messages[0].content, /exactly one letter from the allowed labels and nothing else\.$/);
 });
 
 test("rotations change the label order and the result follows the meaning, not the position", async (t) => {

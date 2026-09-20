@@ -21,7 +21,10 @@ probability for each answer.
 ## How a decision call works
 
 1. Each answer gets a one-letter label: `A`, `B`, `C`, and so on (maximum 26).
-2. The prompt lists `label = meaning` and ends with `Label:`.
+2. The prompt lists `label = meaning` and ends with the instruction to reply with
+   exactly one letter. It does not end with `Label:`. That ending made Gemma 4
+   repeat the word `Label` as its first token on long prompts (label coverage
+   0.35 against 1.00 with the present wording; Qwen3.8 0.90 against 0.99).
 3. The proxy sends one chat completion to the backend of the slot:
    `max_tokens: 1`, `temperature: 0`, `logprobs: true`, `top_logprobs: 20`,
    and the thinking mode off for this request only.

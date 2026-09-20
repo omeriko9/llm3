@@ -95,10 +95,14 @@ def rotation_orders(names, rotations: int):
 def build_prompt(context: str, question: str, order, choices: dict) -> str:
     lines = "\n".join(f"{label} = {choices[name]}" for label, name in zip(LABELS, order))
     head = f"{context}\n\n" if context else ""
+    # The ending matters. "Return only the label.\nLabel:" made Gemma 4 echo the
+    # word "Label" as its first token on long prompts: measured label coverage
+    # 0.35 (minimum 0.00) against 1.00 with this wording, and 0.90 against 0.99
+    # on Qwen3.8. Do not end the prompt with a word the model can repeat.
     return (
         f"{head}Question:\n{question}\n\n"
         f"Allowed labels:\n{lines}\n\n"
-        "Return only the label.\nLabel:"
+        "Reply with exactly one letter from the allowed labels and nothing else."
     )
 
 
