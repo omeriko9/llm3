@@ -332,3 +332,68 @@ test("/llm3/activity reports the generation requests the proxy is holding", asyn
   // The probe itself is not a generation, so it must never count itself.
   assert.equal(backend.seen.length, 0, "the probe is answered locally, never proxied");
 });
+
+// llama.cpp ends a task when it hits --reasoning-budget: it closes the stream
+// with no terminal finish_reason and no [DONE], and its own log still says
+// `stop processing ... truncated = 0`. Nothing reported a problem, so a reply
+// that stopped mid-sentence had no culprit anywhere in llm3's logs. Three of 23
+// requests on a DeepSeek-V4 slot ended that way, each with 0 visible characters
+// after ~1024 reasoning tokens.
+test("a stream that ends with no finish_reason and no [DONE] is named in the log", async (t) => {
+  const cut = http.createServer((req, res) => {
+    if (req.url.split("?")[0] === "/v1/chat/completions") {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      // Thinking only, then the stream simply stops.
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "weighing it up".repeat(8) }, finish_reason: null }] })}\n\n`);
+      res.end();
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  await new Promise((resolve) => cut.listen(0, "127.0.0.1", resolve));
+  t.after(() => cut.close());
+
+  const proxy = await startProxy(t, { backendPort: cut.address().port });
+  await fetch(`${proxy.base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  }).then((r) => r.text());
+  await new Promise((r) => setTimeout(r, 300));
+
+  const out = proxy.output();
+  assert.match(out, /\[cut off\]/, "the cut must be named in the proxy log");
+  assert.match(out, /still thinking and never wrote an answer/);
+  assert.match(out, /Thinking budget/, "and must point at the control that fixes it");
+});
+
+test("a normal stream is not reported as cut off", async (t) => {
+  const backend = await startBackend(t);
+  const proxy = await startProxy(t, { backendPort: backend.port });
+  await fetch(`${proxy.base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  }).then((r) => r.text());
+  await new Promise((r) => setTimeout(r, 300));
+  assert.ok(!/\[cut off\]/.test(proxy.output()), "a stream ending in [DONE] is fine");
+});
+
+test("reasoning_effort none becomes the thinking switch, and a real level passes through", async (t) => {
+  const backend = await startBackend(t);
+  const proxy = await startProxy(t, { backendPort: backend.port, args: ["--no-sampling-defaults"] });
+  const send = (body) => fetch(`${proxy.base}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }], ...body }),
+  });
+  await send({ reasoning_effort: "none", chat_template_kwargs: { keep: 1 } });
+  await send({ reasoning_effort: "medium" });
+  const [off, kept] = backend.seen.filter((r) => r.url === "/v1/chat/completions").map((r) => JSON.parse(r.body));
+  assert.equal("reasoning_effort" in off, false, "mlx-dspark answers 400 to 'none'");
+  assert.equal(off.enable_thinking, false);
+  assert.deepEqual(off.chat_template_kwargs, { keep: 1, enable_thinking: false });
+  assert.equal(kept.reasoning_effort, "medium");
+  assert.equal("enable_thinking" in kept, false);
+});

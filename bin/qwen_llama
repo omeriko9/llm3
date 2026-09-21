@@ -881,7 +881,14 @@ for field in reader.fields:
         break
 
 mtp_tensors = any("nextn" in tensor.name.lower() or "mtp" in tensor.name.lower() for tensor in reader.tensors)
-print("yes" if mtp_field or mtp_tensors else "no")
+# The TENSORS decide, never the metadata key on its own. nextn_predict_layers
+# states what the ARCHITECTURE has, not what this file carries: DeepSeek-V4-Flash-Q2
+# declares deepseek4.nextn_predict_layers = 1 and contains 0 of 1328 MTP tensors,
+# because that build ships its drafter as a separate file. Trusting the key sent
+# --spec-type draft-mtp to llama.cpp, which answered "context type MTP requested
+# but model doesn't contain MTP layers" and refused to load the model at all.
+# mtp_field is kept only as a tie-breaker when the tensor list came back empty.
+print("yes" if mtp_tensors else ("no" if reader.tensors else ("yes" if mtp_field else "no")))
 PY
   )"
 

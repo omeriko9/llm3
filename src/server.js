@@ -3073,17 +3073,30 @@ function applyLauncherMetadata(model) {
   };
 }
 
+function modelIdentityHaystack(model) {
+  const aliases = Array.isArray(model?.aliases) ? model.aliases.join(" ") : "";
+  return `${model?.key || ""} ${model?.label || ""} ${model?.family || ""} ${model?.path || ""} ${aliases}`.toLowerCase();
+}
+
+// Mirrors `supports_tiny_grammar` in bin/qwen_llama, which accepts only models
+// whose identity says "qwen". The server used to accept EVERY gguf model, so
+// llm3 offered the toggle, saved it on, and then the launcher refused the
+// launch outright: "Tiny Grammar is not supported for
+// DeepSeek-V4-Flash-Q2-0731." A non-Qwen GGUF could not be started at all
+// while the saved default had it enabled. Keep these two in step.
 function supportsTinyGrammar(model) {
-  return supportsGgufExtras(model);
+  if (!supportsGgufExtras(model)) {
+    return false;
+  }
+  return modelIdentityHaystack(model).includes("qwen");
 }
 
 function supportsStructuredGbnf(model) {
   if (!supportsTinyGrammar(model)) {
     return false;
   }
-  const aliases = Array.isArray(model?.aliases) ? model.aliases.join(" ") : "";
-  const haystack = `${model?.key || ""} ${model?.label || ""} ${model?.family || ""} ${model?.path || ""} ${aliases}`.toLowerCase();
-  return haystack.includes("qwen") && haystack.includes("3.6") && (haystack.includes("35b") || haystack.includes("a3b"));
+  const haystack = modelIdentityHaystack(model);
+  return haystack.includes("3.6") && (haystack.includes("35b") || haystack.includes("a3b"));
 }
 
 function normalizeGrammarSelectionForModel(model, params = {}) {
@@ -18338,6 +18351,9 @@ module.exports = {
   getLauncherDefinition,
   getLauncherDefinitions,
   normalizeLaunchParamsForModel,
+  normalizeGrammarSelectionForModel,
+  supportsTinyGrammar,
+  supportsStructuredGbnf,
   normalizeProfileSlotConfig,
   extractMarkerPayload,
   parseHermesSyncOutput,

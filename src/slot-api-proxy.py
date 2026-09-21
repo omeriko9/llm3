@@ -491,6 +491,7 @@ def observe_stream_line(line: bytes, stream_state: dict) -> None:
     if not data:
         return
     if data == "[DONE]":
+        stream_state["saw_done"] = True
         end_stream_line(stream_state)
         append_proxy_line("[stream done]")
         return
@@ -504,15 +505,52 @@ def observe_stream_line(line: bytes, stream_state: dict) -> None:
     for choice in choices:
         if not isinstance(choice, dict):
             continue
+        finish = choice.get("finish_reason")
+        if isinstance(finish, str) and finish:
+            stream_state["finish_reason"] = finish
         delta = choice.get("delta")
         if not isinstance(delta, dict):
             continue
         reasoning = message_text(delta.get("reasoning_content")) or message_text(delta.get("reasoning"))
         if reasoning:
+            stream_state["reasoning_chars"] = stream_state.get("reasoning_chars", 0) + len(reasoning)
             write_stream_text(stream_state, "thinking", reasoning)
         content = message_text(delta.get("content")) or message_text(delta.get("text"))
         if content:
+            stream_state["visible_chars"] = stream_state.get("visible_chars", 0) + len(content)
             split_visible_thinking(content, stream_state)
+
+
+def describe_silent_cut(stream_state: dict, *, streamed: bool, status: int,
+                       client_disconnected: bool) -> str:
+    """Name a generation that ended without ever saying why, or "".
+
+    llama.cpp ends a task when it hits --reasoning-budget. It closes the stream
+    without a terminal finish_reason and without [DONE], and its own log says
+    `stop processing ... truncated = 0`, so nothing anywhere reports a problem:
+    the client just shows a reply that stops mid-sentence. Three of 23 requests
+    on a DeepSeek-V4 slot ended this way, every one of them with 0 visible
+    characters after ~1024 reasoning tokens, and the Logs tab showed nothing.
+    """
+    if not streamed or status != 200 or client_disconnected:
+        return ""
+    if stream_state.get("saw_done") or stream_state.get("finish_reason"):
+        return ""
+    reasoning = int(stream_state.get("reasoning_chars", 0))
+    visible = int(stream_state.get("visible_chars", 0))
+    if not reasoning and not visible:
+        return ""
+    detail = (
+        f"reasoning={reasoning} chars, visible={visible} chars, "
+        "no finish_reason and no [DONE]"
+    )
+    if reasoning and not visible:
+        return (
+            "[cut off] the model was still thinking and never wrote an answer -- "
+            f"{detail}. This is what hitting --reasoning-budget looks like; raise "
+            "the slot's Thinking budget."
+        )
+    return f"[cut off] the stream ended without completing -- {detail}."
 
 
 def observe_json_body(body: bytes, stream_state: dict) -> None:
@@ -572,6 +610,29 @@ def close_backend(response, conn) -> None:
             pass
 
 
+# "No thinking" spelled as a reasoning effort. OpenAI-style clients send
+# reasoning_effort "none" (or "minimal"); hermes does so on its own when a turn
+# spent its whole token budget on thinking and it retries without. mlx-dspark
+# knows only low / medium / high / xhigh and answers 400, which turned that
+# recovery into a failed episode (podG dbf3dc21, 2026-09-21). What the client
+# means is "do not think", and every backend here has a switch for exactly that.
+REASONING_EFFORT_MEANS_OFF = {"none", "minimal", "off"}
+
+
+def thinking_off_requested(payload: dict) -> bool:
+    """Rewrite reasoning_effort none/minimal/off into the thinking switch. True if it did."""
+    effort = payload.get("reasoning_effort")
+    if not isinstance(effort, str) or effort.strip().lower() not in REASONING_EFFORT_MEANS_OFF:
+        return False
+    del payload["reasoning_effort"]
+    payload["enable_thinking"] = False  # mlx-dspark reads this key
+    kwargs = payload.get("chat_template_kwargs")
+    kwargs = dict(kwargs) if isinstance(kwargs, dict) else {}
+    kwargs["enable_thinking"] = False  # llama-server reads this one
+    payload["chat_template_kwargs"] = kwargs
+    return True
+
+
 def normalize_request(path: str, body: bytes) -> "tuple[bytes, dict | None]":
     """Apply the slot's sampling defaults and the optiq model-id remap.
 
@@ -597,6 +658,8 @@ def normalize_request(path: str, body: bytes) -> "tuple[bytes, dict | None]":
         if payload.get(key) in (None, ""):
             payload[key] = value
             changed = True
+    if thinking_off_requested(payload):
+        changed = True
     if not changed:
         # Byte-for-byte what the client sent.
         return body, payload
@@ -733,7 +796,9 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         resp = None
         client_disconnected = False
         response_started = False
-        stream_state = {"last_kind": "", "open_line": False, "in_think": False}
+        stream_state = {"last_kind": "", "open_line": False, "in_think": False,
+                        "saw_done": False, "finish_reason": "",
+                        "reasoning_chars": 0, "visible_chars": 0}
         proxy_log_request = is_generation_path(self.path)
 
         headers = {}
@@ -867,6 +932,19 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             if proxy_log_request:
                 inflight_end()
             end_stream_line(stream_state)
+            cut_notice = ""
+            if proxy_log_request:
+                cut_notice = describe_silent_cut(
+                    stream_state,
+                    streamed=stream_mode,
+                    status=status,
+                    client_disconnected=client_disconnected,
+                )
+                if cut_notice:
+                    # Goes to the proxy log, which is what the Logs tab reads, so
+                    # the run is named instead of leaving a blank where the reason
+                    # should be.
+                    append_proxy_line(cut_notice)
             if proxy_log_request or status >= 400:
                 append_proxy_line(
                     f"[response] {self.command} {self.path} status={status} stream={str(stream_mode).lower()} durationMs={round((time.time() - started) * 1000, 2)}"
@@ -882,6 +960,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                     "stream": stream_mode,
                     "request": request_preview,
                     "response": response_preview,
+                    **({"cutOff": cut_notice} if cut_notice else {}),
                     "client": self.client_address[0],
                 }
             )

@@ -11113,24 +11113,42 @@ function buildLaunchButtonTitle(model) {
 // GGUF too, and none of the llama.cpp extras below (tiny grammar, structured
 // GBNF, DRY, reasoning budget, chat-template override) exist in it. Showing
 // those controls for a ds4 model gives a switch that silently does nothing.
-function supportsTinyGrammar(model) {
+function modelIdentityHaystack(model) {
+  const aliases = Array.isArray(model?.aliases) ? model.aliases.join(" ") : "";
+  return `${model?.key || ""} ${model?.label || ""} ${model?.family || ""} ${model?.path || ""} ${aliases}`.toLowerCase();
+}
+
+// Plain llama.cpp flags: thinking budget, DRY, micro-batch, MTP draft depth.
+// They work on ANY GGUF, which is what the server has always used
+// (supportsGgufExtras in src/server.js). The browser used to route them through
+// supportsTinyGrammar instead, which was harmless while that meant "any GGUF"
+// and became a bug the moment it was narrowed to Qwen: every one of those four
+// controls greyed out for a non-Qwen GGUF, so a DeepSeek slot could not have its
+// thinking budget raised at all.
+function supportsGgufExtras(model) {
   if (String(model?.launcher || "").toLowerCase() === "ds4") {
     return false;
   }
   return String(model?.runtime || model?.launcher || "").toLowerCase() === "gguf";
 }
 
+// Narrower, and deliberately so: the grammar FILE is Qwen-specific. Must agree
+// with supportsTinyGrammar in src/server.js and supports_tiny_grammar in
+// bin/qwen_llama, which rejects a non-Qwen model with exit 1.
+function supportsTinyGrammar(model) {
+  return supportsGgufExtras(model) && modelIdentityHaystack(model).includes("qwen");
+}
+
 function supportsStructuredGbnf(model) {
   if (!supportsTinyGrammar(model)) {
     return false;
   }
-  const aliases = Array.isArray(model?.aliases) ? model.aliases.join(" ") : "";
-  const haystack = `${model?.key || ""} ${model?.label || ""} ${model?.family || ""} ${model?.path || ""} ${aliases}`.toLowerCase();
-  return haystack.includes("qwen") && haystack.includes("3.6") && (haystack.includes("35b") || haystack.includes("a3b"));
+  const haystack = modelIdentityHaystack(model);
+  return haystack.includes("3.6") && (haystack.includes("35b") || haystack.includes("a3b"));
 }
 
 function supportsReasoningBudget(model) {
-  return supportsTinyGrammar(model);
+  return supportsGgufExtras(model);
 }
 
 // Families that ship an MTP head inside the weights with no "MTP" in the file
@@ -11145,11 +11163,10 @@ function supportsMtpDraftTuning(model) {
   if (String(model?.launcher || "").toLowerCase() === "ds4") {
     return true;
   }
-  if (!supportsTinyGrammar(model)) {
+  if (!supportsGgufExtras(model)) {
     return false;
   }
-  const aliases = Array.isArray(model?.aliases) ? model.aliases.join(" ") : "";
-  const haystack = `${model?.key || ""} ${model?.label || ""} ${model?.family || ""} ${model?.path || ""} ${aliases}`.toLowerCase();
+  const haystack = modelIdentityHaystack(model);
   return haystack.includes("mtp")
     || haystack.includes("speculative")
     || EMBEDDED_MTP_PATTERNS.some((pattern) => pattern.test(haystack));
@@ -11237,7 +11254,7 @@ function normalizeSpeedTrickSelection(model, source = {}) {
     : null;
   // Blank = let bin/qwen_llama use its own default (512), so the field is opt-in.
   const ubatchRaw = Number.parseInt(String(source.ubatchSize ?? ""), 10);
-  const ubatchSize = supportsTinyGrammar(model) && Number.isInteger(ubatchRaw) && ubatchRaw >= 1 && ubatchRaw <= 8192
+  const ubatchSize = supportsGgufExtras(model) && Number.isInteger(ubatchRaw) && ubatchRaw >= 1 && ubatchRaw <= 8192
     ? ubatchRaw
     : null;
   // mlx-dspark speculation head. Blank/auto = let its registry pick the measured-best
@@ -11249,7 +11266,7 @@ function normalizeSpeedTrickSelection(model, source = {}) {
   const reasoningEffort = DSPARK_REASONING_EFFORTS.includes(effortRaw) ? effortRaw : "";
   return {
     reasoningBudget,
-    enableDry: supportsTinyGrammar(model) ? Boolean(source.enableDry) : false,
+    enableDry: supportsGgufExtras(model) ? Boolean(source.enableDry) : false,
     mtpDraftMax,
     ubatchSize,
     dsparkMode,
