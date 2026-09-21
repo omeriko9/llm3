@@ -109,6 +109,22 @@ VOCODER_DEVICE = str(os.getenv("PHONIKUD_UPSTREAM_VOCODER_DEVICE", "") or "").st
 # Log how much memory each stage of a request adds, so the growth can be
 # attributed to the decode or to the vocoder.
 STAGE_MEMORY_LOG = os.getenv("PHONIKUD_UPSTREAM_STAGE_MEMORY_LOG", "true").strip().lower() in {"1", "true", "yes"}
+# Keep the CPU ahead of the GPU in the decode loop. The T3 backbone is small (30 layers,
+# hidden 1024), so a step is bound by how fast Python can queue its kernels, and the GPU
+# runs them while Python queues the next step -- unless something in the step makes the
+# CPU wait for the GPU. Two things did, at every token (measured 2026-09-22, M4 Max,
+# torch 2.14, 150 steps, one sync at the end):
+#   bare backbone step                                   5.4 ms
+#   + upstream get_fixed_embedding(i + 1)                9.9 ms   torch.tensor(int, device=mps)
+#   + a 2-D attention mask for the step                  9.95 ms  the mask helper reads it back
+#   the whole sampling stack (penalty, min_p, top_p, draw) adds nothing measurable
+# The fix reads the position row from the table that is already on the GPU, and hands
+# the step a mask that was built once (or none, when no row is padded). Same values in,
+# same tokens out. "false" restores the upstream calls.
+# The seed of the vocoder's noise, set right before the vocoder (see _process). -1 =
+# the upstream behaviour, where the noise depends on what the decode drew before it.
+VOCODER_SEED = int(os.getenv("PHONIKUD_UPSTREAM_VOCODER_SEED", "1234") or "1234")
+ASYNC_DECODE = os.getenv("PHONIKUD_UPSTREAM_ASYNC_DECODE", "true").strip().lower() in {"1", "true", "yes"}
 
 
 def _bucket_length(length: int, bucket: int) -> int:
@@ -163,7 +179,14 @@ T3_DTYPE = {"float16": torch.float16, "half": torch.float16, "bfloat16": torch.b
 # trick and defers the GPU->CPU EOS check to every K tokens (post-EOS tokens
 # are discarded, so the emitted sequence is unchanged).
 FAST_SAMPLING = os.getenv("PHONIKUD_UPSTREAM_FAST_SAMPLING", "false").strip().lower() in {"1", "true", "yes"}
-FAST_SAMPLING_SYNC_EVERY = max(1, int(os.getenv("PHONIKUD_UPSTREAM_FAST_SAMPLING_SYNC_EVERY", "8") or "8"))
+# How many tokens are sampled between two looks at them on the CPU (for EOS and the
+# repeat guard). Each look is a device-to-host copy, and on Metal that wait costs about
+# 40 ms whatever its size -- as much as seven decode steps. Measured 2026-09-22 on one
+# 303-token take, same tokens out every time: every 8 = 9.6 ms a step, every 32 = 6.6,
+# every 128 = 5.7. The price of a long window is the steps decoded past EOS and then cut
+# (half a window on average, 5.5 ms each), so for takes of about 150 tokens the total is
+# lowest between 32 and 48.
+FAST_SAMPLING_SYNC_EVERY = max(1, int(os.getenv("PHONIKUD_UPSTREAM_FAST_SAMPLING_SYNC_EVERY", "32") or "32"))
 # The Perth watermarker runs on CPU per chunk; disabling it skips that pass.
 DISABLE_WATERMARK = os.getenv("PHONIKUD_UPSTREAM_DISABLE_WATERMARK", "false").strip().lower() in {"1", "true", "yes"}
 # Full gc.collect() + torch.mps.empty_cache() after every request costs real
@@ -613,7 +636,7 @@ def _patched_t3_inference(
             if last_step:
                 break
 
-            next_token_embed = self.speech_emb(next_token) + self.speech_pos_emb.get_fixed_embedding(i + 1)
+            next_token_embed = self.speech_emb(next_token) + _speech_position_embedding(self, i + 1)
             next_token_embed = torch.cat([next_token_embed, next_token_embed])
             output = backend(
                 inputs_embeds=next_token_embed,
@@ -678,7 +701,7 @@ def _patched_t3_inference(
                 )
                 break
 
-            next_token_embed = self.speech_emb(next_token) + self.speech_pos_emb.get_fixed_embedding(i + 1)
+            next_token_embed = self.speech_emb(next_token) + _speech_position_embedding(self, i + 1)
             next_token_embed = torch.cat([next_token_embed, next_token_embed])
             output = backend(
                 inputs_embeds=next_token_embed,
@@ -713,6 +736,19 @@ def _patched_t3_inference(
 
 
 T3.inference = torch.inference_mode()(_patched_t3_inference)
+
+
+def _speech_position_embedding(t3: T3, index: int) -> torch.Tensor:
+    """The learned position row for one decode step, shape (1, 1, D).
+
+    Upstream's get_fixed_embedding builds torch.tensor(index, device=...) for the
+    lookup: a host-to-device copy at every token, and on Metal that copy makes the
+    CPU wait for the GPU. The table is already on the device, and a slice of it is
+    a view, so this returns the same values with no copy.
+    """
+    if not ASYNC_DECODE:
+        return t3.speech_pos_emb.get_fixed_embedding(index)
+    return t3.speech_pos_emb.emb.weight[index: index + 1].unsqueeze(0)
 
 
 # --- Micro-batched generation ------------------------------------------------
@@ -861,6 +897,17 @@ def _batched_t3_decode(t3: T3, job_embeds: list[torch.Tensor], params: dict[str,
         return bool(finished.all().item())
 
     step_attention = attention_mask
+    # The key mask of every step, built once: the prefill's padding, then one open
+    # column for each token that can follow. A step takes a slice of it, which is a
+    # view. A 2-D mask would go through the mask helper at every token, and that
+    # helper reads the mask back to the CPU. With no padded row there is nothing to
+    # mask in a one-token step, and no mask is the cheapest of all.
+    step_key_mask = None
+    no_padding = all(length == max_len for length in lengths)
+    if ASYNC_DECODE and static_cache is None and not no_padding:
+        step_key_mask = torch.cat(
+            [key_padding, torch.zeros(rows, 1, 1, max_tokens, dtype=embed_dtype, device=device)], dim=-1
+        )  # (2B, 1, 1, L + max_tokens)
     for i in range(max_tokens):
         logits_step = output.logits[:, -1, :].float()
         cond = logits_step[0::2, :]
@@ -911,7 +958,7 @@ def _batched_t3_decode(t3: T3, job_embeds: list[torch.Tensor], params: dict[str,
         if (i + 1) >= max_tokens:
             break
 
-        next_embed = t3.speech_emb(next_token) + t3.speech_pos_emb.get_fixed_embedding(i + 1)  # (B, 1, D)
+        next_embed = t3.speech_emb(next_token) + _speech_position_embedding(t3, i + 1)  # (B, 1, D)
         step_inputs = next_embed.repeat_interleave(2, dim=0).to(dtype=embed_dtype)  # (2B, 1, D)
         step_positions = (row_real_len + i).unsqueeze(1)  # (2B, 1)
         if static_cache is not None:
@@ -920,6 +967,9 @@ def _batched_t3_decode(t3: T3, job_embeds: list[torch.Tensor], params: dict[str,
             static_key_valid[:, max_len + i] = 1
             step_mask = ((1 - static_key_valid) * mask_min)[:, None, None, :]  # (2B,1,1,cache_len)
             step_cache_position = torch.tensor([max_len + i], device=device)
+        elif ASYNC_DECODE:
+            step_mask = None if no_padding else step_key_mask[:, :, :, : max_len + i + 1]
+            step_cache_position = None
         else:
             step_attention = torch.cat(
                 [step_attention, torch.ones(rows, 1, dtype=torch.long, device=device)], dim=1
@@ -1111,6 +1161,31 @@ def _patched_flow_inference(
     return feat, None
 
 
+def _chunk_mask_without_sync(xs, masks, use_dynamic_chunk, use_dynamic_left_chunk, decoding_chunk_size, static_chunk_size, num_decoding_left_chunks):
+    """s3gen's add_optional_chunk_mask for the one case the vocoder uses, minus its sync.
+
+    The estimator calls it 14 times in each of the 10 flow steps, always with
+    use_dynamic_chunk=False and static_chunk_size=0, where upstream returns `masks`
+    itself. But first it runs `(chunk_masks.sum(-1) == 0).sum().item()` to warn about
+    an all-false row, and that .item() makes the CPU wait for the GPU: 140 waits a
+    take, 80 percent of the vocoder's time (0.265 s of 0.333 s in cProfile). The mask
+    here is the token mask, which is never all false for a row that has tokens, and a
+    row with none is padding that the output drops. Any other case goes upstream.
+    """
+    if use_dynamic_chunk or static_chunk_size > 0:
+        return _upstream_add_optional_chunk_mask(
+            xs, masks, use_dynamic_chunk, use_dynamic_left_chunk, decoding_chunk_size, static_chunk_size, num_decoding_left_chunks,
+        )
+    return masks
+
+
+if ASYNC_DECODE:
+    from chatterbox.models.s3gen import decoder as _s3gen_decoder
+
+    _upstream_add_optional_chunk_mask = _s3gen_decoder.add_optional_chunk_mask
+    _s3gen_decoder.add_optional_chunk_mask = _chunk_mask_without_sync
+
+
 if SPEECH_TOKEN_BUCKET > 1:
     from chatterbox.models.s3gen.flow import CausalMaskedDiffWithXvec as _FlowWithXvec
 
@@ -1197,6 +1272,14 @@ class _TTSBatcher:
                 decoded_mb = _process_footprint_mb() if STAGE_MEMORY_LOG else 0.0
                 for job, (tokens, stats) in zip(batch, decoded):
                     try:
+                        if VOCODER_SEED >= 0:
+                            # The flow starts from random noise. Seeded once before the
+                            # decode, that noise depended on how many draws the decode
+                            # made first (steps past EOS, the batch, the check window),
+                            # so the same tokens gave a different waveform after any
+                            # change to the decode loop. Seeded here, the same tokens
+                            # give the same waveform whatever the decode did.
+                            seed_rng(VOCODER_SEED)
                         job.result = _vocode_speech_tokens(self.model, tokens, job.conds)
                         job.stats = stats
                     except Exception as exc:  # vocoder failure should not sink siblings
