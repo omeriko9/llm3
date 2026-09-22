@@ -247,6 +247,8 @@ const state = {
   logs: {},
   // slotId -> { busy, source }; filled by refreshSlotActivity from /api/slots/activity.
   slotActivity: {},
+  // Slot ids whose stop is in flight, so the button stays down across repaints.
+  slotsStopping: new Set(),
   // { label } while actionInFlight, so the topbar tooltip can say WHICH action
   // is running instead of "applying a model action".
   busyAction: null,
@@ -1337,14 +1339,26 @@ function wireEvents() {
 
   els.modelsSlotStrip?.addEventListener("click", (event) => {
     const stopButton = event.target.closest("[data-slot-strip-stop]");
-    if (!stopButton) {
+    if (!stopButton || stopButton.disabled) {
       return;
     }
+    const slotId = stopButton.dataset.slotId;
+    // Unloading a 27B model takes seconds. Without an answer now the card looks
+    // untouched, so the button gets pressed again and again -- and the strip is
+    // not repainted under the pointer (that guard keeps hover tooltips alive),
+    // so nothing would have marked it until the pointer moved away.
+    if (slotId && state.slotsStopping.has(slotId)) {
+      return;
+    }
+    if (slotId) {
+      state.slotsStopping.add(slotId);
+    }
+    markSlotStopping(stopButton);
     if (stopButton.dataset.slotStripStop === "voice") {
-      runAction("/api/voice/stop", { voiceSlotId: stopButton.dataset.slotId }, { preserveModal: false });
+      runAction("/api/voice/stop", { voiceSlotId: slotId }, { preserveModal: false });
       return;
     }
-    runAction("/api/stop", { slotId: stopButton.dataset.slotId }, { preserveModal: false });
+    runAction("/api/stop", { slotId }, { preserveModal: false });
   });
 
   els.modelsSection?.addEventListener("focusin", (event) => {
@@ -4064,9 +4078,14 @@ function renderWebsites() {
       : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`;
     const shortName = w.name.length > 16 ? w.name.slice(0, 15) + "…" : w.name;
     const lanBadge = lanOnly ? `<span class="website-lan-badge">Local</span>` : "";
-    const onlineDot = w.online
-      ? `<span class="website-status-dot website-status-dot-online" title="Online"></span>`
-      : `<span class="website-status-dot website-status-dot-offline" title="Offline"></span>`;
+    // Three states, not two. A waker keeps the address answering while the
+    // service behind it is stopped, so "the port is open" no longer means the
+    // service runs -- see wakerLabel.
+    const onlineDot = w.sleeping
+      ? `<span class="website-status-dot website-status-dot-sleeping" title="${esc(wakerLabel(w))}"></span>`
+      : w.online
+        ? `<span class="website-status-dot website-status-dot-online" title="Online"></span>`
+        : `<span class="website-status-dot website-status-dot-offline" title="Offline"></span>`;
     // An embedded site opens inside llm3 as an iframe, not a new tab. It is a
     // button, not a link: no href to leak, no target, and a small badge so it is
     // visibly a different kind of card.
@@ -4444,9 +4463,20 @@ function formatPm2Bytes(value) {
   return `${rounded}${units[index]}`;
 }
 
+// What a sleeping site's tooltip and health line say. The card used to read
+// "Online" for a stopped ComfyUI, because llm3 only checked that the port
+// accepted a connection and the waker always does.
+function wakerLabel(website) {
+  const name = String(website?.wakerName || "waker").trim();
+  if (website?.waking) return `Starting up behind ${name}`;
+  return `Asleep behind ${name} · starts on the first request`;
+}
+
 function getWebsitePm2StatusLabel(website) {
   const status = String(website?.pm2?.status || "").trim().toLowerCase();
   if (!website?.pm2?.name) return "Unmanaged";
+  if (website?.waking) return "Starting";
+  if (website?.sleeping) return "Asleep";
   if (status === "online") return website.online ? "Online" : "Port down";
   if (status === "stopped") return "Stopped";
   if (status) return status[0].toUpperCase() + status.slice(1);
@@ -4456,6 +4486,7 @@ function getWebsitePm2StatusLabel(website) {
 function getWebsitePm2StatusClass(website) {
   const status = String(website?.pm2?.status || "").trim().toLowerCase();
   if (!website?.pm2?.name) return "neutral";
+  if (website?.sleeping || website?.waking) return "warning";
   if (status === "online" && website.online) return "online";
   if (status === "online" && !website.online) return "warning";
   if (status === "stopped") return "offline";
@@ -4467,7 +4498,9 @@ function renderWebsitePm2Status(website) {
   if (!pm2?.name) {
     return `<div class="pm2-status-stack"><span class="pm2-status-badge neutral">Unmanaged</span><span class="pm2-health-text">No PM2 mapping</span></div>`;
   }
-  const health = website.online ? "Port reachable" : "Port unreachable";
+  const health = website.sleeping || website.waking
+    ? wakerLabel(website)
+    : website.online ? "Port reachable" : "Port unreachable";
   const scope = pm2.remote ? "Remote host" : "Local host";
   return `
     <div class="pm2-status-stack">
@@ -4643,9 +4676,11 @@ function renderWebsitesTable() {
           // anyone reading this table from another machine, so show and link
           // the LAN address instead.
           const url = w.internal_url ? toLanUrl(w.internal_url, w) : "#";
-          const statusDot = w.online
-            ? '<span style="color: #22c55e;">● Online</span>'
-            : '<span style="color: #ef4444;">● Offline</span>';
+          const statusDot = w.sleeping
+            ? `<span style="color: #f59e0b;" title="${esc(wakerLabel(w))}">○ Asleep</span>`
+            : w.online
+              ? '<span style="color: #22c55e;">● Online</span>'
+              : '<span style="color: #ef4444;">● Offline</span>';
 
           return `
             <tr>
@@ -4940,7 +4975,7 @@ function buildModelsSlotStripItems() {
   return [...llmItems, ...voiceItems];
 }
 
-function renderModelsSlotStrip() {
+function renderModelsSlotStrip({ force = false } = {}) {
   if (!els.modelsSlotStrip) {
     return;
   }
@@ -4955,7 +4990,7 @@ function renderModelsSlotStrip() {
   // vanished on every poll. The live numbers inside the cards are written in
   // place by updateSlotThroughputReadout, so they keep updating while this is
   // paused -- only the card markup waits for the pointer to move away.
-  if (isPointerOver(els.modelsSlotStrip)) {
+  if (!force && isPointerOver(els.modelsSlotStrip)) {
     return;
   }
   const items = buildModelsSlotStripItems();
@@ -4976,15 +5011,16 @@ function renderModelsSlotStripCard(item) {
   const running = Boolean(status.running);
   const model = status.model || {};
   const memoryInfo = getModelsSlotMemoryInfo(item);
-  const currentLabel = running
-    ? String(model.label || model.key || "Runtime live")
-    : "Idle";
+  const stopping = Boolean(slot?.id && state.slotsStopping.has(slot.id));
+  const currentLabel = stopping
+    ? "Stopping\u2026"
+    : (running ? String(model.label || model.key || "Runtime live") : "Idle");
   const selectPlaceholder = `Select ${item.title} model…`;
   const selectedModelKey = running
     ? String(model.key || "")
     : "";
   return `
-    <article class="models-slot-card ${esc(item.typeClass || item.kind)} ${running ? "running" : "idle"}" data-slot-id="${esc(slot?.id || "")}">
+    <article class="models-slot-card ${esc(item.typeClass || item.kind)} ${running ? "running" : "idle"}" data-slot-id="${esc(slot?.id || "")}"${stopping ? ' data-stopping="1"' : ""}>
       <div class="models-slot-heading">
         <div class="models-slot-title-row">
           ${renderModelsSlotTitleCell(item)}
@@ -5017,9 +5053,10 @@ function renderModelsSlotStripCard(item) {
         type="button"
         data-slot-strip-stop="${item.kind}"
         data-slot-id="${esc(slot?.id || "")}"
-        ${running && !state.actionInFlight ? "" : "disabled"}
-        title="${running ? `Stop ${slot?.label || item.title}` : `${item.title} is offline`}"
-        aria-label="${running ? `Stop ${slot?.label || item.title}` : `${item.title} is offline`}"
+        ${running && !state.actionInFlight && !stopping ? "" : "disabled"}
+        ${stopping ? 'aria-busy="true"' : ""}
+        title="${stopping ? "Stopping…" : (running ? `Stop ${slot?.label || item.title}` : `${item.title} is offline`)}"
+        aria-label="${stopping ? "Stopping" : (running ? `Stop ${slot?.label || item.title}` : `${item.title} is offline`)}"
       >
         <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
       </button>
@@ -11891,7 +11928,13 @@ function updateSlotThroughputReadout(slot, activity) {
   const busy = activity?.busy === true;
   const phase = activity?.phase || null;
   const hasLive = Number.isFinite(live) && live > 0;
-  if (hasLive) {
+  // The last rate is kept so the card does not blink to empty between turns,
+  // but it describes a model that is loaded. Once the slot is empty the number
+  // belongs to nothing, and leaving it up claims a speed for a model that is
+  // no longer there.
+  if (slot?.status?.running !== true) {
+    slotLastTokensPerSecond.delete(slot.id);
+  } else if (hasLive) {
     slotLastTokensPerSecond.set(slot.id, { rate: live, phase });
   }
   const last = slotLastTokensPerSecond.get(slot.id);
@@ -11938,7 +11981,47 @@ function updateSlotThroughputReadout(slot, activity) {
   });
 }
 
+/* Answer the press immediately, on the button that was pressed, without waiting
+   for a repaint that the hover guard may be holding back. */
+function markSlotStopping(button) {
+  button.disabled = true;
+  button.setAttribute("aria-busy", "true");
+  button.title = "Stopping\u2026";
+  button.setAttribute("aria-label", "Stopping");
+  const card = button.closest("[data-slot-id]");
+  if (!card) return;
+  card.dataset.stopping = "1";
+  const label = card.querySelector(".models-slot-current-label");
+  if (label) label.textContent = "Stopping\u2026";
+  const line = card.querySelector("[data-slot-activity]");
+  if (line) {
+    line.classList.remove("is-empty");
+    line.textContent = "unloading the model";
+  }
+}
+
+function syncSlotStoppingState() {
+  let finished = false;
+  for (const slotId of [...state.slotsStopping]) {
+    const slot = state.slots.find((s) => s.id === slotId)
+      || (Array.isArray(state.voiceSlots) ? state.voiceSlots.find((s) => s.id === slotId) : null);
+    // Clear the flag once the server agrees the slot is empty, so a stop that
+    // failed does not leave the button dead forever.
+    if (!slot || slot.status?.running !== true) {
+      state.slotsStopping.delete(slotId);
+      finished = true;
+    }
+  }
+  // The card was written by hand when the press landed, so it has to be
+  // repainted by hand when the stop ends -- otherwise the pointer resting on
+  // the strip keeps "Stopping…" on screen indefinitely.
+  if (finished) {
+    renderModelsSlotStrip({ force: true });
+  }
+}
+
 function updateSlotWorkingIndicators() {
+  syncSlotStoppingState();
   state.slots.forEach((slot) => {
     updateSlotThroughputReadout(slot, state.slotActivity?.[slot.id]);
     // "Working" means the model is generating right now, which is what

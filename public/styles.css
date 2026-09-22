@@ -1491,6 +1491,50 @@ a { color: var(--accent); text-decoration: none; }
   min-width: 0;
 }
 
+/* Stopping a 27B model takes seconds, and a disabled stop button is exactly
+   what an idle slot already shows -- so "stopping" and "stopped" would look
+   identical. The button becomes a spinner for the duration instead: motion is
+   the one thing neither the live state nor the idle state has. */
+.models-slot-stop[aria-busy="true"] {
+  opacity: 1;
+  cursor: progress;
+  color: var(--orange);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.models-slot-stop[aria-busy="true"] svg {
+  display: none;
+}
+.models-slot-stop[aria-busy="true"]::after {
+  content: "";
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-top-color: transparent;
+  animation: models-slot-stop-spin .7s linear infinite;
+}
+@keyframes models-slot-stop-spin {
+  to { transform: rotate(360deg); }
+}
+
+.models-slot-card[data-stopping="1"] .models-slot-current-label {
+  font-style: italic;
+  opacity: .8;
+}
+.models-slot-card[data-stopping="1"] .models-slot-status-dot {
+  animation: models-slot-stopping-pulse 1.1s ease-in-out infinite;
+}
+@keyframes models-slot-stopping-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .3; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .models-slot-card[data-stopping="1"] .models-slot-status-dot { animation: none; }
+  .models-slot-stop[aria-busy="true"]::after { animation: none; border-top-color: currentColor; }
+}
+
 .models-slot-tooltip {
   position: absolute;
   top: calc(100% + 0.55rem);
@@ -6830,6 +6874,16 @@ a { color: var(--accent); text-decoration: none; }
 .website-status-dot-offline {
   background: #ef4444;
   box-shadow: 0 0 4px rgba(239,68,68,0.5);
+}
+
+/* Asleep: the port answers but the service behind it does not run, because a
+   waker holds the address and starts it on the first real request. That is
+   neither online nor offline, so it gets its own mark -- a hollow ring. */
+.website-status-dot-sleeping {
+  background: transparent;
+  border: 2px solid #f59e0b;
+  box-sizing: border-box;
+  box-shadow: 0 0 4px rgba(245,158,11,0.45);
 }
 
 /* Website card color via CSS variables */

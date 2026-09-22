@@ -23,14 +23,14 @@ const {
 } = require("../src/server.js");
 
 const DEEPSEEK = {
-  key: "/Users/x/models/hf/huihui-ai__Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/DeepSeek-V4-Flash-Q2-0731.gguf",
+  key: "models/hf/huihui-ai__Huihui-DeepSeek-V4-Flash-0731-abliterated-GGUF/DeepSeek-V4-Flash-Q2-0731.gguf",
   label: "DeepSeek-V4-Flash-Q2-0731",
   family: "Downloaded GGUF",
   runtime: "gguf",
   aliases: ["DeepSeek-V4-Flash-Q2-0731"],
 };
 const QWEN = {
-  key: "/Users/x/models/hf/unsloth__Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf",
+  key: "models/hf/unsloth__Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf",
   label: "Qwen3.8 27B Q8 0",
   family: "Qwen",
   runtime: "gguf",

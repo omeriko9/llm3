@@ -14,6 +14,7 @@ const { attachPerfDashboardRoutes } = require("./perf-dashboard-routes");
 const { createDashboardAuth, describeAuthPosture } = require("./dashboard-auth");
 const { CONVERSION_QUANT_PLANS, DEFAULT_CONVERSION_QUANTIZATION } = require("./hf-download-worker");
 const { loadLocalEnv } = require("./local-env");
+const { createWakerProbe } = require("./waker-status");
 
 // Machine-specific settings live in a git-ignored `.env`; the repo ships
 // neutral defaults. Must run before any process.env read below.
@@ -1420,6 +1421,26 @@ function summarizePm2App(app, { remote = false } = {}) {
   };
 }
 
+// A port given on the command line is as declarative as one in the environment.
+// ComfyUI is started as `main.py --listen 0.0.0.0 --port 8188`, so reading only
+// env vars left it unmapped: llm3 could see the app but could not offer start or
+// stop for it, because nothing tied the app to the port its website uses.
+function portFromPm2Args(app) {
+  const args = app?.pm2_env?.args;
+  const list = Array.isArray(args)
+    ? args
+    : String(args || "").split(/\s+/).filter(Boolean);
+  for (let i = 0; i < list.length; i += 1) {
+    const token = String(list[i]);
+    const inline = token.match(/^--port=(\d{2,5})$/);
+    if (inline) return inline[1];
+    if ((token === "--port" || token === "-p") && /^\d{2,5}$/.test(String(list[i + 1] || ""))) {
+      return String(list[i + 1]);
+    }
+  }
+  return "";
+}
+
 function resolvePm2DeclaredPort(app) {
   const env = app?.pm2_env?.env || {};
   const candidates = [
@@ -1429,6 +1450,7 @@ function resolvePm2DeclaredPort(app) {
     env.PORT,
     app?.pm2_env?.port,
     app?.port,
+    portFromPm2Args(app),
   ];
   for (const value of candidates) {
     const normalized = String(value || "").trim();
@@ -1641,7 +1663,11 @@ function getPm2AppForPort(port, host) {
   return null;
 }
 
-function getPm2MetadataForWebsite(website) {
+// `wakerPm2App` overrides the port lookup. A waker-fronted service does not run
+// on the port its website uses -- ComfyUI moved to 8189 when the waker took
+// 8188 -- so the port maps to nothing, and the card lost its start/stop button.
+// The waker names the app it fronts, which is the app the button must act on.
+function getPm2MetadataForWebsite(website, { wakerPm2App = "" } = {}) {
   try {
     const url = new URL(String(website?.internal_url || ""));
     const port = String(url.port || "").trim();
@@ -1649,7 +1675,9 @@ function getPm2MetadataForWebsite(website) {
     if (!port) {
       return null;
     }
-    const pm2Result = getPm2AppForPort(port, host);
+    const pm2Result = (wakerPm2App && localPm2AppsByName[wakerPm2App])
+      ? { name: wakerPm2App, remote: false }
+      : getPm2AppForPort(port, host);
     if (!pm2Result) {
       return null;
     }
@@ -1770,23 +1798,66 @@ async function checkWebsiteViaNginx(website) {
   });
 }
 
-// Check online status for a single website
-async function checkWebsiteStatus(website) {
+// A port that answers is normally a service that runs. comfy-waker breaks that
+// rule deliberately: it keeps ComfyUI's port answering while ComfyUI is stopped
+// and holds no memory. So a reachable local port is asked whether a waker owns
+// it, and the waker's own answer decides. Ordinary sites pay one extra request
+// every ten minutes for this -- see createWakerProbe.
+const wakerForPort = createWakerProbe();
+
+// Health of a single website: { online, sleeping, waker }.
+// `sleeping` is a third state, not a shade of offline: the port answers, the
+// service does not run, and the next real request starts it.
+async function checkWebsiteHealth(website) {
   try {
     // Nginx sites: check via nginx server
     if (website.category === "Nginx" && website.machine_ip) {
-      return await checkWebsiteViaNginx(website);
+      return { online: await checkWebsiteViaNginx(website), sleeping: false, waker: null };
     }
-    
+
     const url = new URL(website.internal_url);
     const host = url.hostname;
     const port = Number(url.port);
-    if (host === "127.0.0.1" || host === "localhost") {
-      return await checkPortLocal(port);
+    const isLocal = host === "127.0.0.1" || host === "localhost";
+    const reachable = isLocal ? await checkPortLocal(port) : await checkPortRemote(port, host);
+    if (!reachable || !isLocal) {
+      return { online: reachable, sleeping: false, waker: null };
     }
-    return await checkPortRemote(port, host);
+    const waker = await wakerForPort(port, "127.0.0.1");
+    if (!waker) {
+      return { online: true, sleeping: false, waker: null };
+    }
+    return { online: waker.awake, sleeping: !waker.awake, waker };
   } catch (_e) {
-    return false;
+    return { online: false, sleeping: false, waker: null };
+  }
+}
+
+// Check online status for a single website
+async function checkWebsiteStatus(website) {
+  return (await checkWebsiteHealth(website)).online;
+}
+
+// Which pm2 app a website's controls act on. A waker in front of the port names
+// its own app, and that is the one to start or stop: stopping the waker would
+// only take the address away and leave the service running.
+async function resolveWebsitePm2App(website) {
+  try {
+    const url = new URL(String(website?.internal_url || ""));
+    const port = String(url.port || "").trim();
+    const host = String(url.hostname || "").trim() || "127.0.0.1";
+    if (!port) {
+      return null;
+    }
+    if (host === "127.0.0.1" || host === "localhost") {
+      const waker = await wakerForPort(Number(port), "127.0.0.1");
+      if (waker?.pm2App && localPm2AppsByName[waker.pm2App]) {
+        return { name: waker.pm2App, remote: false, waker };
+      }
+    }
+    return getPm2AppForPort(port, host);
+  } catch (_error) {
+    return null;
   }
 }
 
@@ -1810,11 +1881,21 @@ app.get("/api/websites", async (_req, res) => {
     const websiteIcons = loadWebsiteIcons();
     const enriched = await Promise.all(
       rows.map(async (w) => {
-        const online = await checkWebsiteStatus(w);
-        const pm2 = getPm2MetadataForWebsite(w);
+        const health = await checkWebsiteHealth(w);
+        const pm2 = getPm2MetadataForWebsite(w, { wakerPm2App: health.waker?.pm2App || "" });
         const embedPath = embedPathForWebsite(w, EMBED_PROXIES, LOCAL_IPV4_ADDRESSES);
         const iconPath = typeof websiteIcons[w.name] === "string" ? websiteIcons[w.name] : null;
-        return { ...w, online, pm2, pm2App: pm2?.name || null, embedPath, iconPath };
+        return {
+          ...w,
+          online: health.online,
+          sleeping: health.sleeping,
+          waking: Boolean(health.waker?.waking),
+          wakerName: health.waker?.waker || null,
+          pm2,
+          pm2App: pm2?.name || null,
+          embedPath,
+          iconPath,
+        };
       })
     );
     res.json(enriched);
@@ -1856,8 +1937,9 @@ app.post("/api/websites/control", async (req, res) => {
     const port = String(url.port);
     const host = url.hostname || "127.0.0.1";
 
-    // Look up PM2 app using the new collision-aware resolver
-    const pm2Result = getPm2AppForPort(port, host);
+    // Look up PM2 app using the new collision-aware resolver, or the waker's
+    // own app when one fronts this port.
+    const pm2Result = await resolveWebsitePm2App(w);
     if (!pm2Result) {
       const hostLabel = host !== "127.0.0.1" && host !== "localhost"
         ? `${host}:`
@@ -1955,8 +2037,7 @@ app.post("/api/websites/pm2-memory", async (req, res) => {
     if (!website) {
       return res.status(404).json({ error: "website not found" });
     }
-    const url = new URL(website.internal_url);
-    const pm2Result = getPm2AppForPort(String(url.port || ""), url.hostname || "127.0.0.1");
+    const pm2Result = await resolveWebsitePm2App(website);
     if (!pm2Result) {
       return res.status(400).json({ error: "No PM2 app mapped to this website." });
     }
