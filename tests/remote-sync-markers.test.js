@@ -25,6 +25,7 @@ process.env.LLM3_STATE_DIR = TEST_STATE_DIR;
 const {
   extractMarkerPayload,
   parseHermesSyncOutput,
+  settleHermesVoiceSyncError,
   isLauncherSelectable,
   normalizeSlotName,
   normalizeSlotNames,
@@ -250,4 +251,23 @@ test("every failed action is logged, and successes and polls are not", () => {
 
   capture({ method: "POST", originalUrl: "/api/start" }, stub(500), { error: "boom", stdout: "launcher said this" });
   assert.match(lines.at(-1), /stdout:\n?launcher said this/);
+});
+
+// Starting an STT or TTS runtime with "Set Hermes" on used to answer 502 when
+// the remote PC was off, so the dashboard showed a failed launch for a runtime
+// that was up and healthy.
+test("an unreachable remote Hermes skips the voice sync instead of failing it", () => {
+  const error = Object.assign(new Error("ssh: connect to host remote.invalid port 22: Host is down"), {
+    remoteUnreachable: true,
+  });
+  const result = settleHermesVoiceSyncError(error, "Hermes STT sync failed.");
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, true);
+  assert.match(result.reason, /unreachable: ssh: connect to host remote\.invalid port 22: Host is down/);
+});
+
+test("any other voice sync failure stays a failure", () => {
+  const result = settleHermesVoiceSyncError(new Error("Permission denied (publickey)."), "Hermes STT sync failed.");
+  assert.equal(result.ok, false);
+  assert.match(result.error, /Permission denied/);
 });

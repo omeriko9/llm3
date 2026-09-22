@@ -4908,11 +4908,8 @@ async function sendVoiceStartResponse(req, res, options = {}) {
     const dashboardConfig = await persistActiveProfileVoiceSelection(vSlot, voiceModel, resolvedVoiceParams);
     const proposedAppTargets = { ...dashboardConfig.applicationTargets };
 
-    const integrationSync = {
-      tts: {},
-      stt: {},
-      hermesm4: {},
-    };
+    // Only the syncs that ran go in here; the launch dialog lists every entry.
+    const integrationSync = {};
 
     if (setHermes) {
       const syncTarget = await buildVoiceSyncTarget(vSlot, voiceModel, resolvedVoiceParams);
@@ -4932,22 +4929,19 @@ async function sendVoiceStartResponse(req, res, options = {}) {
     }
 
     const syncErrors = [
-      integrationSync.tts.ok === false ? `TTS Hermes sync failed: ${integrationSync.tts.error}` : "",
-      integrationSync.stt.ok === false ? `STT Hermes sync failed: ${integrationSync.stt.error}` : "",
-      integrationSync.hermesm4.ok === false ? `Hermes M4 voice sync failed: ${integrationSync.hermesm4.error}` : "",
+      integrationSync.tts?.ok === false ? `TTS Hermes sync failed: ${integrationSync.tts.error}` : "",
+      integrationSync.stt?.ok === false ? `STT Hermes sync failed: ${integrationSync.stt.error}` : "",
+      integrationSync.hermesm4?.ok === false ? `Hermes M4 voice sync failed: ${integrationSync.hermesm4.error}` : "",
     ].filter(Boolean);
 
-    if (syncErrors.length > 0) {
-      res.status(502).json({ error: syncErrors.join(" "), stdout, integration_sync: integrationSync });
-      return;
-    }
-
+    // The runtime started, so the launch succeeded. A failed sync is reported
+    // next to the application, as /api/start does, not as a failed launch.
     if (JSON.stringify(dashboardConfig.applicationTargets) !== JSON.stringify(proposedAppTargets)) {
       await writeDashboardConfig({ ...dashboardConfig, applicationTargets: proposedAppTargets });
     }
 
     const overview = await getOverviewData();
-    res.json({ ok: true, stdout, integration_sync: integrationSync, ...overview });
+    res.json({ ok: true, stdout, integration_sync: integrationSync, sync_errors: syncErrors, ...overview });
   } catch (error) {
     res.status(500).json({ error: formatExecError(error) });
   } finally {
@@ -18171,7 +18165,7 @@ async function syncHermesTTSAfterLaunch(target) {
     );
     return parseHermesVoiceSyncOutput(output);
   } catch (error) {
-    return { ok: false, error: formatExecError(error) || "Hermes TTS sync failed." };
+    return settleHermesVoiceSyncError(error, "Hermes TTS sync failed.");
   }
 }
 
@@ -18205,8 +18199,22 @@ async function syncHermesSTTAfterLaunch(target) {
     );
     return parseHermesVoiceSyncOutput(output);
   } catch (error) {
-    return { ok: false, error: formatExecError(error) || "Hermes STT sync failed." };
+    return settleHermesVoiceSyncError(error, "Hermes STT sync failed.");
   }
+}
+
+// The voice runtime is already up when this runs. A remote Hermes that cannot
+// be reached is not using any voice slot, so report it as skipped, the same
+// way the compaction reset does; every other failure stays a failure.
+function settleHermesVoiceSyncError(error, fallbackMessage) {
+  if (error?.remoteUnreachable) {
+    return {
+      ok: true,
+      skipped: true,
+      reason: `remote Hermes on ${HERMES_SYNC_HOST} is unreachable: ${error.message}`,
+    };
+  }
+  return { ok: false, error: formatExecError(error) || fallbackMessage };
 }
 
 function buildHermesVoiceSyncRemoteScript(payload) {
@@ -18438,6 +18446,7 @@ module.exports = {
   normalizeProfileSlotConfig,
   extractMarkerPayload,
   parseHermesSyncOutput,
+  settleHermesVoiceSyncError,
   isLauncherSelectable,
   normalizeSlotName,
   normalizeSlotNames,
