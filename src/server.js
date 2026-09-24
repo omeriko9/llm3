@@ -15,6 +15,7 @@ const { createDashboardAuth, describeAuthPosture } = require("./dashboard-auth")
 const { CONVERSION_QUANT_PLANS, DEFAULT_CONVERSION_QUANTIZATION } = require("./hf-download-worker");
 const { loadLocalEnv } = require("./local-env");
 const { createWakerProbe } = require("./waker-status");
+const { hfAuthHeaders } = require("./hf-token");
 
 // Machine-specific settings live in a git-ignored `.env`; the repo ships
 // neutral defaults. Must run before any process.env read below.
@@ -7707,10 +7708,7 @@ async function fetchHfRepoDetails(repoId) {
 }
 
 async function fetchHfJson(url) {
-  const headers = { "user-agent": HF_USER_AGENT };
-  if (process.env.HF_TOKEN) {
-    headers.authorization = `Bearer ${process.env.HF_TOKEN}`;
-  }
+  const headers = { "user-agent": HF_USER_AGENT, ...hfAuthHeaders() };
   const response = await fetch(url, { headers, signal: AbortSignal.timeout(HF_FETCH_TIMEOUT_MS) });
   if (!response.ok) {
     throw new Error(`Hugging Face request failed: ${response.status} ${response.statusText}`);
@@ -7994,6 +7992,12 @@ function isMtpDraftHeadGgufPath(value) {
   // (quant non-terminal or absent) is a draft head. Bundling full quants as
   // companions turned a 27.7GB DavidAU download into a 285GB whole-repo pull.
   if (!/-mtp(?:-|\.gguf$)/.test(base)) {
+    return false;
+  }
+  // A draft head is one small file. A split set ("…-Q8_0-MTP-00001-of-00005")
+  // is a full quant with the MTP head built in; taking it for a draft bundled
+  // 191 GB of Q8_0 shards into every other quant of the orcarouter repo.
+  if (SPLIT_GGUF_PATTERN.test(base)) {
     return false;
   }
   const stem = base.replace(/\.gguf$/, "");

@@ -5,6 +5,7 @@ const fsSync = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { spawn } = require("child_process");
+const { hfAuthHeaders } = require("./hf-token");
 
 const HF_USER_AGENT = "llm3/1.0";
 // Conversion targets. F16/BF16/Q8_0 come straight out of llama.cpp's
@@ -325,10 +326,7 @@ async function main() {
   }
 
   const job = JSON.parse(await fs.readFile(jobPath, "utf8"));
-  const headers = { "user-agent": HF_USER_AGENT };
-  if (process.env.HF_TOKEN) {
-    headers.authorization = `Bearer ${process.env.HF_TOKEN}`;
-  }
+  const headers = { "user-agent": HF_USER_AGENT, ...hfAuthHeaders() };
 
   let bytesDownloaded = 0;
   const totalBytes = Number(job.totalBytes || 0);

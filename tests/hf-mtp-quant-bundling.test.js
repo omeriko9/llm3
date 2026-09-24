@@ -245,3 +245,30 @@ test("resolveHfDownloadCandidate: falls back to the client spec when Hugging Fac
   const resolved = await resolveHfDownloadCandidate(candidate);
   assert.deepEqual(resolved.downloadSpec.files.map((entry) => entry.path), ["Model-Q6_K.gguf"]);
 });
+
+test("buildHfCandidates: a split …-Q8_0-MTP set is its own quant, not a draft bundled into every row (orcarouter)", () => {
+  const sibling = (rfilename, gb) => ({ rfilename, lfs: { size: Math.round(gb * GB) } });
+  const repo = {
+    id: "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+    sha: "abc123",
+    siblings: [
+      sibling("Qwen3.8-Flash-Next-Uncensored-Q2_K-00001-of-00002.gguf", 44.9),
+      sibling("Qwen3.8-Flash-Next-Uncensored-Q2_K-00002-of-00002.gguf", 35.5),
+      sibling("Qwen3.8-Flash-Next-Uncensored-MTP-draft.gguf", 4.1),
+      sibling("Qwen3.8-Flash-Next-Uncensored-Q8_0-MTP-00001-of-00002.gguf", 50),
+      sibling("Qwen3.8-Flash-Next-Uncensored-Q8_0-MTP-00002-of-00002.gguf", 50),
+    ],
+  };
+  const candidates = buildHfCandidates(repo);
+  const q2 = candidates.find((candidate) => candidate.quantization === "Q2_K");
+  assert.ok(q2, "Q2_K row exists");
+  assert.deepEqual(
+    q2.downloadSpec.files.map((file) => file.path).sort(),
+    [
+      "Qwen3.8-Flash-Next-Uncensored-MTP-draft.gguf",
+      "Qwen3.8-Flash-Next-Uncensored-Q2_K-00001-of-00002.gguf",
+      "Qwen3.8-Flash-Next-Uncensored-Q2_K-00002-of-00002.gguf",
+    ],
+  );
+  assert.ok(candidates.some((candidate) => candidate.quantization === "Q8_0"), "the Q8_0-MTP set is a selectable row");
+});
