@@ -224,6 +224,14 @@ load_defaults() {
       minP) if [ -n "$value" ]; then DEFAULT_MIN_P="$value"; fi ;;
       presencePenalty) if [ -n "$value" ]; then DEFAULT_PRESENCE_PENALTY="$value"; fi ;;
       repetitionPenalty) if [ -n "$value" ]; then DEFAULT_REPETITION_PENALTY="$value"; fi ;;
+      # Per-slot KV cache type (e.g. q4_0). The QWEN_LLAMA_CACHE_TYPE_* env vars still win;
+      # without either, the model-family defaults below apply (q8_0 for Qwen 3.6/3.8).
+      kvCacheType)
+        SAVED_KV_CACHE_TYPE="$value"
+        if [ -n "$value" ]; then
+          if [ -z "$ENV_CACHE_TYPE_K_SET" ]; then CACHE_TYPE_K="$value"; ENV_CACHE_TYPE_K_SET=x; fi
+          if [ -z "$ENV_CACHE_TYPE_V_SET" ]; then CACHE_TYPE_V="$value"; ENV_CACHE_TYPE_V_SET=x; fi
+        fi ;;
     esac
   done < <(
     python3 - <<'PY' "$DEFAULTS_FILE"
@@ -240,6 +248,7 @@ print(f"thinking\t{str(bool(data.get('thinking', False))).lower()}")
 print(f"reasoningBudget\t{data.get('reasoningBudget', '')}")
 print(f"enableDry\t{str(bool(data.get('enableDry', False))).lower()}")
 print(f"mtpDraftMax\t{data.get('mtpDraftMax', '')}")
+print(f"kvCacheType\t{data.get('kvCacheType', '')}")
 print(f"enableTinyGrammar\t{str(bool(data.get('enableTinyGrammar', False))).lower()}")
 print(f"enableStructuredGbnf\t{str(bool(data.get('enableStructuredGbnf', False))).lower()}")
 print(f"temperature\t{data.get('temperature', '')}")
@@ -280,6 +289,9 @@ EOF
 }
 
 save_defaults() {
+  # kvCacheType has no command-line flag; carry the saved value through a rewrite.
+  local kv_line=""
+  if [ -n "${SAVED_KV_CACHE_TYPE:-}" ]; then kv_line="  \"kvCacheType\": \"$SAVED_KV_CACHE_TYPE\","; fi
   cat >"$DEFAULTS_FILE" <<EOF
 {
   "ctxSize": $CTX_SIZE,
@@ -289,6 +301,7 @@ save_defaults() {
   "reasoningBudget": $REASONING_BUDGET,
   "enableDry": $ENABLE_DRY,
   "mtpDraftMax": $MTP_DRAFT_N_MAX_VALUE,
+$kv_line
   "enableTinyGrammar": $ENABLE_TINY_GRAMMAR,
   "enableStructuredGbnf": $ENABLE_STRUCTURED_GBNF,
   "temperature": $TEMPERATURE,
