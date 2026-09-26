@@ -12,7 +12,7 @@
        woff/ttf fallbacks are never requested. -->
   <link rel="stylesheet" href="/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/vendor/markdown-it-texmath/texmath.css">
-  <link rel="stylesheet" href="/styles.css?v=20260922-stop-spinner">
+  <link rel="stylesheet" href="/styles.css?v=20260926-topbar-comfy-mem-gpu">
   <link rel="stylesheet" href="/benchmarks-tab.css?v=20260820-rowdel">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -129,6 +129,10 @@
           <div class="topbar-left-stack">
             <h2 id="pageTitle">Models</h2>
             <div id="hermesIndicatorsMobile" class="hermes-indicators hermes-indicators-mobile" aria-label="Hermes activity">
+              <button id="comfyIndicatorMobile" class="comfy-indicator unknown" type="button" title="ComfyUI status unavailable" aria-label="ComfyUI status unavailable">
+                <span class="comfy-indicator-dot" aria-hidden="true"></span>
+                <span class="comfy-indicator-label">Comfy</span>
+              </button>
               <div id="topbarBusyIndicatorMobile" class="topbar-busy-indicator" title="No background activity" hidden>
                 <span class="topbar-busy-spinner" aria-hidden="true"></span>
                 <span class="sr-only">No background activity</span>
@@ -145,7 +149,7 @@
           </div>
         </div>
         <div id="topbarMetrics" class="topbar-metrics" aria-label="System indicators">
-          <div class="topbar-metric">
+          <div id="topbarMemoryMetric" class="topbar-metric" tabindex="0">
             <div class="topbar-metric-head">
               <span class="topbar-metric-label">Memory</span>
               <span id="topbarRamPct" class="topbar-metric-value">--%</span>
@@ -163,7 +167,7 @@
               <div id="topbarCpuBar" class="progress-fill muted"></div>
             </div>
           </div>
-          <div class="topbar-metric">
+          <div id="topbarGpuMetric" class="topbar-metric">
             <div class="topbar-metric-head">
               <span class="topbar-metric-label">GPU</span>
               <span id="topbarGpuPct" class="topbar-metric-value">--</span>
@@ -190,6 +194,10 @@
         </div>
         <div class="topbar-right">
           <div id="hermesIndicators" class="hermes-indicators" aria-label="Hermes activity">
+            <button id="comfyIndicator" class="comfy-indicator unknown" type="button" title="ComfyUI status unavailable" aria-label="ComfyUI status unavailable">
+              <span class="comfy-indicator-dot" aria-hidden="true"></span>
+              <span class="comfy-indicator-label">Comfy</span>
+            </button>
             <div id="topbarBusyIndicator" class="topbar-busy-indicator" title="No background activity" hidden>
               <span class="topbar-busy-spinner" aria-hidden="true"></span>
               <span class="sr-only">No background activity</span>
@@ -929,6 +937,6 @@
   <script src="/vendor/katex/katex.min.js"></script>
   <script src="/vendor/markdown-it/markdown-it.umd.min.js"></script>
   <script src="/vendor/markdown-it-texmath/texmath.js"></script>
-  <script src="/app.js?v=20260922-stop-spinner"></script>
+  <script src="/app.js?v=20260926-topbar-comfy-mem-gpu"></script>
 </body>
 </html>

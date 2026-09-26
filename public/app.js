@@ -274,6 +274,8 @@ const state = {
     updatedAt: "",
     loading: false,
   },
+  // ComfyUI behind comfy-waker: what the waker says, plus a click in flight.
+  comfy: { status: null, loading: false, busy: "" },
   benchmarkStartInFlight: {},
   voiceBenchmark: {
     text: loadPersistedVoiceBenchmarkText(),
@@ -805,6 +807,10 @@ const els = {
   hermesRemoteIndicator: $("#hermesRemoteIndicator"),
   hermesLocalIndicator: $("#hermesLocalIndicator"),
   topbarBusyIndicator: $("#topbarBusyIndicator"),
+  comfyIndicator: $("#comfyIndicator"),
+  comfyIndicatorMobile: $("#comfyIndicatorMobile"),
+  topbarMemoryMetric: $("#topbarMemoryMetric"),
+  topbarGpuMetric: $("#topbarGpuMetric"),
   hermesRemoteIndicatorMobile: $("#hermesRemoteIndicatorMobile"),
   hermesLocalIndicatorMobile: $("#hermesLocalIndicatorMobile"),
   topbarBusyIndicatorMobile: $("#topbarBusyIndicatorMobile"),
@@ -996,6 +1002,7 @@ const POLLERS = [
   [refreshOverview, 5000],
   [refreshDiagnostics, 5000],
   [refreshHermesStatus, 5000],
+  [refreshComfyStatus, 5000],
   [() => state.hermesFeedModal.open && refreshHermesFeed(), 4000],
   [refreshActiveBenchmarks, 1000],
   [refreshVoiceBenchmarkState, 1000],
@@ -1227,6 +1234,8 @@ function wireEvents() {
     runAction("/api/voice/restart", {}, { preserveModal: false });
   });
   els.hermesRemoteIndicator?.addEventListener("click", () => openHermesFeedModal("remote"));
+  els.comfyIndicator?.addEventListener("click", onComfyIndicatorClick);
+  els.comfyIndicatorMobile?.addEventListener("click", onComfyIndicatorClick);
   els.hermesLocalIndicator?.addEventListener("click", () => openHermesFeedModal("local"));
   els.hermesRemoteIndicatorMobile?.addEventListener("click", () => openHermesFeedModal("remote"));
   els.hermesLocalIndicatorMobile?.addEventListener("click", () => openHermesFeedModal("local"));
@@ -3734,6 +3743,88 @@ async function refreshDiagnostics() {
 
   if (state.activeSection === "diagnostics") {
     renderDiagnostics();
+  }
+}
+
+async function refreshComfyStatus() {
+  if (state.comfy.loading) {
+    return;
+  }
+  state.comfy.loading = true;
+  try {
+    state.comfy.status = await fetchJson("/api/comfyui/status");
+  } catch (_error) {
+    state.comfy.status = { available: false, error: "llm3 could not ask the waker" };
+  } finally {
+    state.comfy.loading = false;
+    renderComfyIndicators();
+  }
+}
+
+function comfyIndicatorView(status, busy) {
+  if (busy === "stop") {
+    return { state: "waking", title: "ComfyUI: stopping…" };
+  }
+  if (busy === "start") {
+    return { state: "waking", title: "ComfyUI: starting (usually a few seconds)…" };
+  }
+  if (!status || !status.available) {
+    return { state: "unknown", title: `ComfyUI: status unavailable${status?.error ? ` (${status.error})` : ""}` };
+  }
+  if (status.waking) {
+    return { state: "waking", title: "ComfyUI: starting — a request woke it" };
+  }
+  if (status.awake) {
+    return {
+      state: "online",
+      title: `ComfyUI: running (pm2 ${status.pm2App}) — holds its models in memory\nClick to stop it. The next image request wakes it again.`,
+    };
+  }
+  return {
+    state: "offline",
+    title: `ComfyUI: stopped (pm2 ${status.pm2App}) — uses no memory\nClick to start it. Any image request also wakes it automatically.`,
+  };
+}
+
+function renderComfyIndicators() {
+  const view = comfyIndicatorView(state.comfy.status, state.comfy.busy);
+  [els.comfyIndicator, els.comfyIndicatorMobile].forEach((element) => {
+    if (!element) {
+      return;
+    }
+    for (const name of ["online", "offline", "waking", "unknown"]) {
+      element.classList.toggle(name, name === view.state);
+    }
+    element.disabled = Boolean(state.comfy.busy) || view.state === "unknown";
+    setLiveTitle(element, view.title);
+    if (element.getAttribute("aria-label") !== view.title) {
+      element.setAttribute("aria-label", view.title);
+    }
+  });
+}
+
+async function onComfyIndicatorClick() {
+  const status = state.comfy.status;
+  if (state.comfy.busy || !status?.available || status.waking) {
+    return;
+  }
+  const action = status.awake ? "stop" : "start";
+  state.comfy.busy = action;
+  renderComfyIndicators();
+  try {
+    const data = await fetchJson("/api/comfyui/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action }),
+    });
+    state.comfy.status = data.status || state.comfy.status;
+    toast(action === "stop" ? "ComfyUI stopped" : "ComfyUI is running", { type: "success" });
+  } catch (error) {
+    toast(`ComfyUI ${action} failed: ${error.message}`, { type: "error", duration: 6000 });
+  } finally {
+    state.comfy.busy = "";
+    renderComfyIndicators();
+    refreshComfyStatus();
   }
 }
 
@@ -9090,8 +9181,51 @@ function renderSystem() {
   }).join("");
 }
 
+// The badge alone says "93%"; the tooltip says who holds it.
+function memoryTooltip(memory) {
+  if (!memory) {
+    return "Memory: waiting for data";
+  }
+  const lines = [`Memory ${memory.usedPercent}% used of ${fmtBytes(memory.totalBytes)}`];
+  const b = memory.breakdown;
+  if (b) {
+    lines.push(
+      `Wired ${fmtBytes(b.wiredBytes)} · app ${fmtBytes(b.appMemoryBytes)} · compressed ${fmtBytes(b.compressedBytes)}`,
+    );
+  }
+  if (memory.swap?.usedBytes != null) {
+    lines.push(`Swap ${fmtBytes(memory.swap.usedBytes)} of ${fmtBytes(memory.swap.totalBytes)}`);
+  }
+  const top = Array.isArray(memory.topConsumers) ? memory.topConsumers : [];
+  if (top.length) {
+    lines.push("", "Biggest consumers:");
+    for (const row of top) {
+      // Only worth a mention once it is large; a few MB compressed is noise.
+      const squeezed = row.compressedBytes >= 256 * 1024 ** 2 ? ` (${fmtBytes(row.compressedBytes)} compressed)` : "";
+      lines.push(`  ${fmtBytes(row.bytes).padStart(9)}  ${row.name}${squeezed}`);
+    }
+  }
+  if (b?.wiredBytes) {
+    lines.push("", "Wired pages (the GPU's Metal buffers) are not counted per process.");
+  }
+  return lines.join("\n");
+}
+
+function gpuTooltip(gpu) {
+  if (!gpu?.available) {
+    return gpu?.note || "GPU: waiting for data";
+  }
+  const lines = [`GPU busy ${gpu.percent}% (average of the last few seconds)`];
+  if (gpu.allocBytes) {
+    lines.push(`Metal allocations: ${fmtBytes(gpu.allocBytes)}`);
+  }
+  return lines.join("\n");
+}
+
 function renderTopbarMetrics() {
   const system = state.system;
+  setLiveTitle(els.topbarMemoryMetric, memoryTooltip(system?.memory));
+  setLiveTitle(els.topbarGpuMetric, gpuTooltip(system?.gpu));
   if (!system) {
     els.topbarRamPct.textContent = "--%";
     els.topbarCpuPct.textContent = "--%";
@@ -9305,7 +9439,7 @@ function setLiveTitle(element, value) {
 function renderTopbarBusyIndicators() {
   const lines = collectTopbarActivities();
   const visible = lines.length > 0;
-  const title = topbarBusyTitle(lines);
+  const title = visible ? topbarBusyTitle(lines) : "Idle — nothing is running";
   [
     els.topbarBusyIndicator,
     els.topbarBusyIndicatorMobile,
@@ -9314,7 +9448,12 @@ function renderTopbarBusyIndicators() {
     if (!element) {
       return;
     }
-    element.hidden = !visible;
+    // Always shown: idle is a state of its own (a calm, even ring), not an
+    // absence. The old `hidden` toggle never took effect -- the element's
+    // display:inline-flex overrides [hidden] -- so idle showed the spinner's
+    // two-coloured arc standing still, which read as "stopped mid-cycle".
+    element.hidden = false;
+    element.classList.toggle("idle", !visible);
     setLiveTitle(element, title);
     if (element.getAttribute("aria-label") !== title) {
       element.setAttribute("aria-label", title);

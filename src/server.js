@@ -1355,6 +1355,8 @@ app.post("/api/websites/delete", (req, res) => {
 // Build a map: port -> pm2AppName from `pm2 list` JSON output
 // Also store all-apps data for collision resolution
 let pm2PortMap = {};
+// pid -> pm2 app name, refreshed with the port map; names the memory consumers.
+let pm2PidToName = new Map();
 let pm2AppNameSet = new Set();
 let pm2PortToNameMap = {}; // port -> [{name, env}] for resolving collisions
 let remotePm2PortMap = {};
@@ -1467,6 +1469,7 @@ async function refreshPm2PortMap() {
     const { stdout } = await execFileAsync("pm2", ["jlist"], { timeout: 5000 });
     const raw = JSON.parse(stdout);
     const apps = Array.isArray(raw) ? raw : (raw.processes || []);
+    pm2PidToName = new Map(apps.filter((app) => app?.pid && app?.name).map((app) => [Number(app.pid), app.name]));
     pm2PortMap = {};
     pm2AppNameSet = new Set();
     pm2PortToNameMap = {};
@@ -1973,6 +1976,65 @@ app.post("/api/websites/control", async (req, res) => {
     res.json({ ok: true, pm2App, online, stdout: result.stdout?.trim() || "", stderr: result.stderr?.trim() || "", remote: isRemote });
   } catch (e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ---- ComfyUI top-bar indicator -------------------------------------------
+//
+// ComfyUI sits behind comfy-waker (port 8188), which starts it on the first real
+// request and never puts it back to sleep on its own -- an idle ComfyUI kept ~25 GB
+// for a day. The top bar shows the waker's truthful state and offers stop/start:
+// stop is `pm2 stop <app>`, exactly what the website card does; start goes through
+// the waker with an ordinary request, the same path any API client wakes it by.
+const COMFY_WAKER_URL = (process.env.LLM3_COMFY_WAKER_URL || "http://127.0.0.1:8188").replace(/\/+$/, "");
+const COMFY_WAKE_TIMEOUT_MS = 180000;
+
+async function readComfyWakerStatus() {
+  try {
+    const response = await fetch(`${COMFY_WAKER_URL}/waker/status`, { signal: AbortSignal.timeout(1500) });
+    if (!response.ok) {
+      return { available: false, error: `waker answered HTTP ${response.status}` };
+    }
+    const body = await response.json();
+    return {
+      available: true,
+      awake: Boolean(body.awake),
+      waking: Boolean(body.waking),
+      pm2App: String(body.pm2App || "comfyui"),
+      label: String(body.app || "ComfyUI"),
+      url: COMFY_WAKER_URL,
+    };
+  } catch (error) {
+    return { available: false, error: String(error?.message || error) };
+  }
+}
+
+app.get("/api/comfyui/status", async (_req, res) => {
+  res.json(await readComfyWakerStatus());
+});
+
+app.post("/api/comfyui/control", async (req, res) => {
+  const action = String(req.body?.action || "");
+  if (!["stop", "start"].includes(action)) {
+    return res.status(400).json({ error: "action must be stop or start" });
+  }
+  const status = await readComfyWakerStatus();
+  if (!status.available) {
+    return res.status(503).json({ error: `ComfyUI waker is not reachable: ${status.error}` });
+  }
+  try {
+    if (action === "stop") {
+      await execFileAsync("pm2", ["stop", status.pm2App], { timeout: 20000 });
+    } else {
+      // Any non-passive path makes the waker start ComfyUI and wait for it.
+      const response = await fetch(`${COMFY_WAKER_URL}/system_stats`, { signal: AbortSignal.timeout(COMFY_WAKE_TIMEOUT_MS) });
+      if (!response.ok) {
+        throw new Error(`waker could not start ComfyUI (HTTP ${response.status})`);
+      }
+    }
+    res.json({ ok: true, action, status: await readComfyWakerStatus() });
+  } catch (error) {
+    res.status(500).json({ error: String(error?.message || error), status: await readComfyWakerStatus() });
   }
 });
 
@@ -13379,6 +13441,111 @@ async function detectLiveRuntimeStatus(slot, models) {
   };
 }
 
+// ---- who holds the memory ---------------------------------------------------
+//
+// `top`'s MEM column is the physical footprint, compressed pages included --
+// unlike ps RSS, which counts mmap'd model files that cost no private memory.
+// ~160 ms a call, so cached. Names come from the llm3 slots first, then pm2.
+const MEMORY_CONSUMERS_TTL_MS = 10000;
+const MEMORY_CONSUMERS_LIMIT = 8;
+let memoryConsumersCache = { at: 0, value: null, pending: null };
+
+function parseTopSize(text) {
+  const match = String(text || "").trim().match(/^([0-9.]+)([BKMGT])?\+?$/i);
+  if (!match) {
+    return null;
+  }
+  const unit = { B: 1, K: 1024, M: 1024 ** 2, G: 1024 ** 3, T: 1024 ** 4 }[(match[2] || "B").toUpperCase()];
+  return Math.round(Number(match[1]) * unit);
+}
+
+function parseTopMemoryConsumers(stdout) {
+  const rows = [];
+  let inTable = false;
+  for (const line of String(stdout || "").split("\n")) {
+    if (/^\s*PID\s+MEM\s+CMPRS\s+COMMAND/.test(line)) {
+      inTable = true;
+      rows.length = 0;
+      continue;
+    }
+    if (!inTable) {
+      continue;
+    }
+    const match = line.match(/^\s*(\d+)\s+(\S+)\s+(\S+)\s+(.+?)\s*$/);
+    if (!match) {
+      continue;
+    }
+    const bytes = parseTopSize(match[2]);
+    if (bytes === null) {
+      continue;
+    }
+    rows.push({ pid: Number(match[1]), bytes, compressedBytes: parseTopSize(match[3]) || 0, command: match[4] });
+  }
+  return rows;
+}
+
+function nameMemoryConsumer(row, slotBackends) {
+  const slot = slotBackends.get(row.pid);
+  if (slot) {
+    return { name: slot, kind: "slot" };
+  }
+  const pm2Name = pm2PidToName.get(row.pid);
+  if (pm2Name) {
+    return { name: pm2Name, kind: "pm2" };
+  }
+  return { name: row.command, kind: "process" };
+}
+
+async function getTopMemoryConsumers(processes) {
+  const now = Date.now();
+  if (memoryConsumersCache.value && now - memoryConsumersCache.at < MEMORY_CONSUMERS_TTL_MS) {
+    return memoryConsumersCache.value;
+  }
+  if (memoryConsumersCache.pending) {
+    return memoryConsumersCache.pending;
+  }
+  memoryConsumersCache.pending = (async () => {
+    try {
+      const { stdout } = await execFileAsync(
+        "top", ["-l", "1", "-o", "mem", "-n", String(MEMORY_CONSUMERS_LIMIT), "-stats", "pid,mem,cmprs,command"],
+        { timeout: 5000, maxBuffer: 1024 * 1024 },
+      );
+      const dashboardConfig = await readDashboardConfig().catch(() => null);
+      const slotBackends = new Map();
+      for (const [slotId, entry] of Object.entries(processes || {})) {
+        if (entry?.backend?.pid) {
+          const slot = SLOT_DEFINITIONS.find((candidate) => candidate.id === slotId);
+          const slotLabel = slot ? resolveSlotName(slot, dashboardConfig) : slotId;
+          slotBackends.set(Number(entry.backend.pid), `${slotLabel} (model)`);
+        }
+      }
+      const value = parseTopMemoryConsumers(stdout)
+        .slice(0, MEMORY_CONSUMERS_LIMIT)
+        .map((row) => ({ ...row, ...nameMemoryConsumer(row, slotBackends) }));
+      memoryConsumersCache = { at: Date.now(), value, pending: null };
+      return value;
+    } catch (_error) {
+      memoryConsumersCache.pending = null;
+      return memoryConsumersCache.value || [];
+    }
+  })();
+  return memoryConsumersCache.pending;
+}
+
+async function getSwapUsage() {
+  try {
+    const { stdout } = await execFileAsync("sysctl", ["-n", "vm.swapusage"], { timeout: 2000 });
+    const used = stdout.match(/used = ([0-9.]+)M/);
+    const total = stdout.match(/total = ([0-9.]+)M/);
+    return {
+      usedBytes: used ? Math.round(Number(used[1]) * 1024 ** 2) : null,
+      totalBytes: total ? Math.round(Number(total[1]) * 1024 ** 2) : null,
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
 async function getSystemStats(statuses = null) {
   const runningStatuses = Array.isArray(statuses) ? statuses : await getSlotStatuses();
   const [memory, processes, disk] = await Promise.all([
@@ -13386,7 +13553,11 @@ async function getSystemStats(statuses = null) {
     getProcessStats(runningStatuses),
     getDiskStats(),
   ]);
-  const gpu = await getGpuStats(runningStatuses, memory);
+  const [gpu, topConsumers, swap] = await Promise.all([
+    getGpuStats(runningStatuses, memory),
+    getTopMemoryConsumers(processes),
+    getSwapUsage(),
+  ]);
   const uptimeSeconds = Math.max(0, Math.floor(os.uptime()));
 
   // Every running backend, not just the first one found. modelRssBytes used to
@@ -13443,6 +13614,8 @@ async function getSystemStats(statuses = null) {
       modelPercentOfSystem:
         memory.totalBytes > 0 ? round1((modelResidentBytes / memory.totalBytes) * 100) : 0,
       attribution,
+      topConsumers,
+      swap,
     },
     gpu,
     disk,
@@ -13450,7 +13623,78 @@ async function getSystemStats(statuses = null) {
   };
 }
 
+// ---- GPU utilisation ------------------------------------------------------
+//
+// The GPU badge used to be read out of a slot's log ("[Metal memory]" lines, or
+// llama.cpp's load report). That is memory, not load, and it is only there while
+// a slot runs and its log still holds such a line -- so the badge sat on "--"
+// nearly always. The IOAccelerator's PerformanceStatistics carry the real figure
+// without root: "Device Utilization %". One read swings 0 <-> 98 within a
+// second, so it is sampled every second and shown as a 5 s average. ioreg costs
+// ~12 ms a call. "Alloc system memory" is what Metal has allocated in total.
+const GPU_SAMPLE_INTERVAL_MS = 1000;
+const GPU_SAMPLE_WINDOW = 5;
+const gpuUtilSamples = [];
+let gpuAllocBytes = null;
+let gpuSamplerTimer = null;
+
+function parseIoAcceleratorStats(stdout) {
+  const util = String(stdout || "").match(/"Device Utilization %"\s*=\s*(\d+)/);
+  const alloc = String(stdout || "").match(/"Alloc system memory"\s*=\s*(\d+)/);
+  return {
+    utilization: util ? Number(util[1]) : null,
+    allocBytes: alloc ? Number(alloc[1]) : null,
+  };
+}
+
+function sampleGpuOnce() {
+  execFile("ioreg", ["-r", "-d", "1", "-c", "IOAccelerator"], { timeout: 2000, maxBuffer: 1024 * 1024 }, (error, stdout) => {
+    if (error) {
+      return;
+    }
+    const sample = parseIoAcceleratorStats(stdout);
+    if (sample.utilization !== null) {
+      gpuUtilSamples.push(sample.utilization);
+      if (gpuUtilSamples.length > GPU_SAMPLE_WINDOW) {
+        gpuUtilSamples.shift();
+      }
+    }
+    if (sample.allocBytes !== null) {
+      gpuAllocBytes = sample.allocBytes;
+    }
+  });
+}
+
+function startGpuSampler() {
+  if (gpuSamplerTimer) {
+    return;
+  }
+  sampleGpuOnce();
+  gpuSamplerTimer = setInterval(sampleGpuOnce, GPU_SAMPLE_INTERVAL_MS);
+  gpuSamplerTimer.unref();
+}
+
 async function getGpuStats(statuses, memory) {
+  const metal = await getMetalLogStats(statuses, memory);
+  if (!gpuUtilSamples.length) {
+    return metal;
+  }
+  const percent = Math.round(gpuUtilSamples.reduce((sum, value) => sum + value, 0) / gpuUtilSamples.length);
+  const activeBytes = metal?.available ? metal.activeBytes : gpuAllocBytes;
+  return {
+    available: true,
+    percent,
+    kind: "utilization",
+    allocBytes: gpuAllocBytes,
+    activeBytes,
+    peakBytes: metal?.available ? metal.peakBytes : null,
+    cacheBytes: metal?.available ? metal.cacheBytes : null,
+    note: `GPU busy ${percent}% (${GPU_SAMPLE_WINDOW} s average)`
+      + (gpuAllocBytes ? ` · Metal allocations ${formatBytes(gpuAllocBytes)}` : ""),
+  };
+}
+
+async function getMetalLogStats(statuses, memory) {
   const fallback = {
     available: false,
     percent: null,
@@ -16601,6 +16845,10 @@ function startServer() {
     console.error("[llm3] uncaught exception:", error);
   });
   startPm2Discovery();
+  // startServer() runs from the middle of this file (the require.main block),
+  // before the sampler's module-level state further down is initialised; defer
+  // until the whole module has evaluated or it throws a TDZ ReferenceError.
+  setImmediate(startGpuSampler);
   return app.listen(PORT, HOST, () => {
     console.log(`llm3 listening on http://${HOST}:${PORT}`);
     console.log(describeAuthPosture({ token: DASHBOARD_AUTH_TOKEN, host: HOST }));
@@ -18420,6 +18668,9 @@ module.exports = {
   isQwen38TwentySevenBModel,
   getChatTemplateOptionsForModel,
   isQwenFixedTemplateModel,
+  parseIoAcceleratorStats,
+  parseTopMemoryConsumers,
+  parseTopSize,
   resolveChatTemplateKey,
   normalizeChatTemplateParam,
   buildChatTemplateOptionsPayload,

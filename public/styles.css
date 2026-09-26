@@ -428,6 +428,95 @@ a { color: var(--accent); text-decoration: none; }
   animation: spin 0.78s linear infinite;
 }
 
+/* Idle: one even, dim ring and a still centre dot -- nothing that reads as a
+   spinner that stopped. Working swaps back to the two-tone arc and spins. */
+.topbar-busy-indicator.idle {
+  border-color: rgba(148, 163, 184, 0.18);
+}
+
+.topbar-busy-indicator.idle .topbar-busy-spinner {
+  position: relative;
+  border-color: rgba(148, 163, 184, 0.32);
+  animation: none;
+}
+
+.topbar-busy-indicator.idle .topbar-busy-spinner::after {
+  content: "";
+  position: absolute;
+  inset: 50% auto auto 50%;
+  width: 0.24rem;
+  height: 0.24rem;
+  margin: -0.12rem 0 0 -0.12rem;
+  border-radius: 50%;
+  background: rgba(148, 163, 184, 0.55);
+}
+
+/* ComfyUI (behind comfy-waker): purple while it runs, grey while it sleeps. */
+.comfy-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.42rem 0.62rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(24, 24, 27, 0.84);
+  color: #a1a1aa;
+  font: inherit;
+  cursor: pointer;
+}
+
+.comfy-indicator:disabled {
+  cursor: default;
+}
+
+.comfy-indicator-dot {
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 50%;
+  background: #6b7280;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04);
+  transition: background 140ms ease, box-shadow 140ms ease;
+}
+
+.comfy-indicator-label {
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  font-family: var(--mono);
+}
+
+.comfy-indicator.online {
+  border-color: rgba(168, 85, 247, 0.32);
+  color: #f3e8ff;
+}
+
+.comfy-indicator.online .comfy-indicator-dot {
+  background: #a855f7;
+  box-shadow: 0 0 10px rgba(168, 85, 247, 0.55);
+}
+
+.comfy-indicator.waking .comfy-indicator-dot {
+  background: #c084fc;
+  animation: comfy-pulse 1s ease-in-out infinite;
+}
+
+.comfy-indicator.unknown {
+  opacity: 0.55;
+}
+
+.comfy-indicator:not(:disabled):hover {
+  border-color: rgba(168, 85, 247, 0.5);
+}
+
+@keyframes comfy-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .comfy-indicator.waking .comfy-indicator-dot { animation: none; }
+}
+
 .hermes-indicators-mobile {
   display: none;
   margin-right: 0;
