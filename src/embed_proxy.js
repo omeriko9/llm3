@@ -4,7 +4,7 @@
 //
 // Why a server-side proxy and not an iframe pointed straight at the service:
 // llm3 is reachable from the internet at its public domain, the embedded
-// services are not, and an https page cannot frame an http://192.168.x.y URL
+// services are not, and an https page cannot frame an http://<LAN address> URL
 // (mixed content) even on the LAN. Proxying through llm3 puts the whole thing on
 // one https origin -- so there are no cross-origin or mixed-content limits, the
 // iframe gets the service in full, and the service needs no exposure of its own.

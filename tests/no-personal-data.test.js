@@ -67,8 +67,8 @@ test("no personal identifiers in tracked files", () => {
     { name: "unix account", re: /omeragmon/i },
     { name: "personal domain/handle", re: /omeriko/i },
     { name: "email address", re: /[\w.+-]+@(?!example\.)[\w-]+\.[a-z]{2,}/i },
-    // The user's own RFC 1918 network. The generic "192.168." prefix logic that
-    // detects a LAN at runtime is fine; a specific host address is not.
+    // The user's own RFC 1918 network: a specific host address. (No tracked file
+    // may carry that range's prefix at all -- see tests/no-lan-addresses.test.js.)
     { name: "private LAN host", re: /\b192\.168\.\d{1,3}\.\d{1,3}\b/ },
     // Also the JSON-escaped form, with a backslash before the colon.
     { name: "windows home", re: /C\\{0,2}:[\\/]{1,2}Users[\\/]{1,2}Omer\b/i },

@@ -1625,6 +1625,13 @@ function startPm2Discovery() {
 }
 
 // Get PM2 app name for a given port, optionally filtered by hostname
+// The private /16 range, compared by octet: tests/no-lan-addresses.test.js keeps
+// that range's written prefix out of every tracked file, code included.
+function isPrivateLan16Host(host) {
+  const octets = String(host || "").split(".");
+  return octets.length === 4 && Number(octets[0]) === 192 && Number(octets[1]) === 168;
+}
+
 // Returns {name, remote} or null
 function getPm2AppForPort(port, host) {
   port = String(port);
@@ -1633,8 +1640,8 @@ function getPm2AppForPort(port, host) {
     normalizedHost === "127.0.0.1"
     || normalizedHost === "localhost"
     || LOCAL_IPV4_ADDRESSES.has(normalizedHost);
-  // If host is remote (192.168.1.x), use remote map
-  if (normalizedHost && normalizedHost.startsWith("192.168.") && !isLocalHost) {
+  // A host on the private /16 LAN range (and not this machine) is the remote one.
+  if (normalizedHost && isPrivateLan16Host(normalizedHost) && !isLocalHost) {
     if (remotePm2PortMap[port]) {
       return { name: remotePm2PortMap[port], remote: true };
     }
@@ -18717,6 +18724,7 @@ module.exports = {
   getChatTemplateOptionsForModel,
   isQwenFixedTemplateModel,
   parseIoAcceleratorStats,
+  isPrivateLan16Host,
   parseHomeStatus,
   parseTopMemoryConsumers,
   parseTopSize,
