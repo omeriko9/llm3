@@ -1979,6 +1979,54 @@ app.post("/api/websites/control", async (req, res) => {
   }
 });
 
+// ---- "at home" top-bar indicator ------------------------------------------
+//
+// A LAN service answers {"isHome": true|false}. Asked from the server, not the
+// browser, so CORS never matters and every open dashboard shares one request.
+// Machine-specific, so it lives in .env; unset means the indicator stays hidden.
+const HOME_STATUS_URL = String(process.env.LLM3_HOME_STATUS_URL || "").trim();
+const HOME_STATUS_TTL_MS = 5000;
+let homeStatusCache = { at: 0, value: null };
+
+function parseHomeStatus(body) {
+  if (body && typeof body === "object" && "isHome" in body) {
+    return body.isHome === true || String(body.isHome).toLowerCase() === "true";
+  }
+  return String(body).trim().toLowerCase() === "true";
+}
+
+async function readHomeStatus() {
+  if (!HOME_STATUS_URL) {
+    return { configured: false, available: false, isHome: false };
+  }
+  if (homeStatusCache.value && Date.now() - homeStatusCache.at < HOME_STATUS_TTL_MS) {
+    return homeStatusCache.value;
+  }
+  let value;
+  try {
+    const response = await fetch(HOME_STATUS_URL, { signal: AbortSignal.timeout(2000) });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const text = await response.text();
+    let body = text;
+    try {
+      body = JSON.parse(text);
+    } catch (_error) {
+      // a bare "true"/"false" is accepted too
+    }
+    value = { configured: true, available: true, isHome: parseHomeStatus(body), checkedAt: new Date().toISOString() };
+  } catch (error) {
+    value = { configured: true, available: false, isHome: false, error: String(error?.message || error), checkedAt: new Date().toISOString() };
+  }
+  homeStatusCache = { at: Date.now(), value };
+  return value;
+}
+
+app.get("/api/home/status", async (_req, res) => {
+  res.json(await readHomeStatus());
+});
+
 // ---- ComfyUI top-bar indicator -------------------------------------------
 //
 // ComfyUI sits behind comfy-waker (port 8188), which starts it on the first real
@@ -18669,6 +18717,7 @@ module.exports = {
   getChatTemplateOptionsForModel,
   isQwenFixedTemplateModel,
   parseIoAcceleratorStats,
+  parseHomeStatus,
   parseTopMemoryConsumers,
   parseTopSize,
   resolveChatTemplateKey,

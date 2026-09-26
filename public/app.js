@@ -276,6 +276,7 @@ const state = {
   },
   // ComfyUI behind comfy-waker: what the waker says, plus a click in flight.
   comfy: { status: null, loading: false, busy: "" },
+  home: { status: null, loading: false },
   benchmarkStartInFlight: {},
   voiceBenchmark: {
     text: loadPersistedVoiceBenchmarkText(),
@@ -808,6 +809,8 @@ const els = {
   hermesLocalIndicator: $("#hermesLocalIndicator"),
   topbarBusyIndicator: $("#topbarBusyIndicator"),
   comfyIndicator: $("#comfyIndicator"),
+  homeIndicator: $("#homeIndicator"),
+  homeIndicatorMobile: $("#homeIndicatorMobile"),
   comfyIndicatorMobile: $("#comfyIndicatorMobile"),
   topbarMemoryMetric: $("#topbarMemoryMetric"),
   topbarGpuMetric: $("#topbarGpuMetric"),
@@ -979,6 +982,8 @@ document.addEventListener("DOMContentLoaded", () => {
   refreshAll();
   refreshDiagnostics();
   refreshHermesStatus();
+  refreshComfyStatus();
+  refreshHomeStatus();
   refreshHfDownloads();
   // Prefetch so the Hugging Face tab is populated when it is first opened.
   // `background` keeps it out of the topbar spinner: the user did not ask for
@@ -1003,6 +1008,7 @@ const POLLERS = [
   [refreshDiagnostics, 5000],
   [refreshHermesStatus, 5000],
   [refreshComfyStatus, 5000],
+  [refreshHomeStatus, 10000],
   [() => state.hermesFeedModal.open && refreshHermesFeed(), 4000],
   [refreshActiveBenchmarks, 1000],
   [refreshVoiceBenchmarkState, 1000],
@@ -3744,6 +3750,48 @@ async function refreshDiagnostics() {
   if (state.activeSection === "diagnostics") {
     renderDiagnostics();
   }
+}
+
+async function refreshHomeStatus() {
+  if (state.home.loading) {
+    return;
+  }
+  state.home.loading = true;
+  try {
+    state.home.status = await fetchJson("/api/home/status");
+  } catch (_error) {
+    state.home.status = { available: false, error: "llm3 could not be reached" };
+  } finally {
+    state.home.loading = false;
+    renderHomeIndicators();
+  }
+}
+
+function homeIndicatorView(status) {
+  if (!status || !status.available) {
+    return { state: "unknown", title: `Home status unavailable${status?.error ? ` (${status.error})` : ""}` };
+  }
+  return status.isHome
+    ? { state: "home", title: "At home" }
+    : { state: "away", title: "Not at home" };
+}
+
+function renderHomeIndicators() {
+  const view = homeIndicatorView(state.home.status);
+  [els.homeIndicator, els.homeIndicatorMobile].forEach((element) => {
+    if (!element) {
+      return;
+    }
+    // Nothing to show until .env names a presence service.
+    element.hidden = state.home.status?.configured === false;
+    for (const name of ["home", "away", "unknown"]) {
+      element.classList.toggle(name, name === view.state);
+    }
+    setLiveTitle(element, view.title);
+    if (element.getAttribute("aria-label") !== view.title) {
+      element.setAttribute("aria-label", view.title);
+    }
+  });
 }
 
 async function refreshComfyStatus() {

@@ -90,3 +90,19 @@ test("the busy indicator has a calm idle state instead of a frozen spinner", () 
   const css = fs.readFileSync(path.join(__dirname, "..", "public", "styles.css"), "utf8");
   assert.match(css, /\.topbar-busy-indicator\.idle \.topbar-busy-spinner \{[^}]*animation: none/);
 });
+
+test("the home service's answer is read as JSON or as a bare word", () => {
+  assert.equal(server.parseHomeStatus({ isHome: true }), true);
+  assert.equal(server.parseHomeStatus({ isHome: false }), false);
+  assert.equal(server.parseHomeStatus({ isHome: "true" }), true);
+  assert.equal(server.parseHomeStatus("true"), true);
+  assert.equal(server.parseHomeStatus("nope"), false);
+});
+
+test("the house is yellow at home, grey away, dim when the service is down", () => {
+  const view = (status) => runInApp(["homeIndicatorView"], `homeIndicatorView(${JSON.stringify(status)})`);
+  assert.equal(view({ available: true, isHome: true }).state, "home");
+  assert.equal(view({ available: true, isHome: false }).state, "away");
+  assert.equal(view({ available: false, error: "timeout" }).state, "unknown");
+  assert.match(view({ available: false, error: "timeout" }).title, /unavailable \(timeout\)/);
+});

@@ -451,12 +451,55 @@ a { color: var(--accent); text-decoration: none; }
   background: rgba(148, 163, 184, 0.55);
 }
 
+/* "At home": yellow when the LAN presence service says so, grey otherwise. */
+.home-indicator[hidden] {
+  display: none;
+}
+.home-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: rgba(24, 24, 27, 0.84);
+  color: #6b7280;
+  transition: color 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+
+.home-indicator svg {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.home-indicator.home {
+  color: #facc15;
+  border-color: rgba(250, 204, 21, 0.35);
+  box-shadow: 0 0 12px rgba(250, 204, 21, 0.28);
+}
+
+.home-indicator.home svg {
+  fill: rgba(250, 204, 21, 0.18);
+}
+
+.home-indicator.unknown {
+  opacity: 0.5;
+}
+
 /* ComfyUI (behind comfy-waker): purple while it runs, grey while it sleeps. */
 .comfy-indicator {
   display: inline-flex;
   align-items: center;
-  gap: 0.45rem;
-  padding: 0.42rem 0.62rem;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: rgba(24, 24, 27, 0.84);
@@ -476,13 +519,6 @@ a { color: var(--accent); text-decoration: none; }
   background: #6b7280;
   box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04);
   transition: background 140ms ease, box-shadow 140ms ease;
-}
-
-.comfy-indicator-label {
-  font-size: 0.72rem;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  font-family: var(--mono);
 }
 
 .comfy-indicator.online {
