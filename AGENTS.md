@@ -173,6 +173,20 @@ neutral default in the code and a line in `.env.example`.
 added lines and the messages of every outgoing commit, but it is the last
 guard, not the check to rely on.
 
+**Private LAN addresses are refused at commit time.** `tests/no-lan-addresses.test.js`
+fails if the private /16 LAN prefix appears anywhere in a staged or tracked file —
+code, comments and docs included (code that must recognise the range compares
+octets; see `isPrivateLan16Host`). Two hooks enforce it before a commit exists:
+
+```bash
+ln -sf ../../scripts/pre-commit-guard.sh .git/hooks/pre-commit   # staged files: LAN prefix + personal data
+ln -sf ../../scripts/commit-msg-guard.sh .git/hooks/commit-msg   # the commit message
+ln -sf ../../scripts/pre-push-guard.sh   .git/hooks/pre-push     # outgoing history
+```
+
+Hooks are not versioned: link all three in every new clone. Never bypass them
+with `--no-verify`.
+
 ### Where the old history went
 
 The pre-publication history (233 commits, including `node_modules`, benchmark
