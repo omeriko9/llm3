@@ -2,6 +2,17 @@
 
 PLEASE COMMIT TO GIT AND REFRESH PM2
 
+> **PRIVATE DATA NEVER GOES INTO A COMMIT — NOT IN THE CODE, NOT IN THE MESSAGE.**
+> This repository is public. A commit message is published with the history and
+> cannot be taken back after a push. Do not write LAN addresses, host:port pairs,
+> private URLs, usernames, email addresses, home paths, hostnames, or the owner's
+> site and app names in a commit message or in a tracked file. Name the setting
+> (`LLM3_HOME_STATUS_URL`), never its value. Before **every** commit, not only
+> before a push: run `node --test tests/no-personal-data.test.js` and read the
+> commit message for private data. If private data gets into a commit anyway,
+> stop and tell the owner at once — do not fix it quietly and do not leave it
+> for the owner to find.
+
 > A benchmark run survives `pm2 restart llm3`: the runner starts detached and the
 > session is persisted in `benchmarks/.session/session.json`, which the restarted
 > server re-adopts. The scene queue behind a run is persisted too. Still check
@@ -151,7 +162,16 @@ key; add new keys to both.
 
 `tests/no-personal-data.test.js` enforces this: it scans every tracked file for
 personal markers, credentials, and committed build artifacts, and fails the
-suite if any appear. Run `npm test` before pushing.
+suite if any appear. Run it before every commit, and `npm test` before pushing.
+
+**Commit messages are covered by the same rule.** The test scans files, not
+messages, so the message is the author's job: describe what changed and which
+setting controls it, never the machine value that the setting holds. A value
+the owner gives for their own machine goes into `.env`, with an empty or
+neutral default in the code and a line in `.env.example`.
+`scripts/pre-push-guard.sh` (linked as `.git/hooks/pre-push`) also scans the
+added lines and the messages of every outgoing commit, but it is the last
+guard, not the check to rely on.
 
 ### Where the old history went
 
