@@ -468,6 +468,20 @@ a { color: var(--accent); text-decoration: none; }
   transition: color 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
 }
 
+button.home-indicator {
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+}
+
+button.home-indicator:disabled {
+  cursor: default;
+}
+
+button.home-indicator:not(:disabled):hover {
+  border-color: rgba(250, 204, 21, 0.5);
+}
+
 .home-indicator svg {
   width: 1rem;
   height: 1rem;

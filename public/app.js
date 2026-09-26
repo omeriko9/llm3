@@ -1241,6 +1241,8 @@ function wireEvents() {
   });
   els.hermesRemoteIndicator?.addEventListener("click", () => openHermesFeedModal("remote"));
   els.comfyIndicator?.addEventListener("click", onComfyIndicatorClick);
+  els.homeIndicator?.addEventListener("click", onHomeIndicatorClick);
+  els.homeIndicatorMobile?.addEventListener("click", onHomeIndicatorClick);
   els.comfyIndicatorMobile?.addEventListener("click", onComfyIndicatorClick);
   els.hermesLocalIndicator?.addEventListener("click", () => openHermesFeedModal("local"));
   els.hermesRemoteIndicatorMobile?.addEventListener("click", () => openHermesFeedModal("remote"));
@@ -3768,12 +3770,20 @@ async function refreshHomeStatus() {
 }
 
 function homeIndicatorView(status) {
+  const click = status?.link ? "\nClick to open it in a new tab" : "";
   if (!status || !status.available) {
-    return { state: "unknown", title: `Home status unavailable${status?.error ? ` (${status.error})` : ""}` };
+    return { state: "unknown", title: `Home status unavailable${status?.error ? ` (${status.error})` : ""}${click}` };
   }
   return status.isHome
-    ? { state: "home", title: "At home" }
-    : { state: "away", title: "Not at home" };
+    ? { state: "home", title: `At home${click}` }
+    : { state: "away", title: `Not at home${click}` };
+}
+
+function onHomeIndicatorClick() {
+  const link = state.home.status?.link;
+  if (link) {
+    window.open(link, "_blank", "noopener,noreferrer");
+  }
 }
 
 function renderHomeIndicators() {
@@ -3784,6 +3794,7 @@ function renderHomeIndicators() {
     }
     // Nothing to show until .env names a presence service.
     element.hidden = state.home.status?.configured === false;
+    element.disabled = !state.home.status?.link;
     for (const name of ["home", "away", "unknown"]) {
       element.classList.toggle(name, name === view.state);
     }

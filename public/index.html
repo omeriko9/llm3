@@ -12,7 +12,7 @@
        woff/ttf fallbacks are never requested. -->
   <link rel="stylesheet" href="/vendor/katex/katex.min.css">
   <link rel="stylesheet" href="/vendor/markdown-it-texmath/texmath.css">
-  <link rel="stylesheet" href="/styles.css?v=20260926-home-indicator">
+  <link rel="stylesheet" href="/styles.css?v=20260926-home-button">
   <link rel="stylesheet" href="/benchmarks-tab.css?v=20260820-rowdel">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -129,9 +129,9 @@
           <div class="topbar-left-stack">
             <h2 id="pageTitle">Models</h2>
             <div id="hermesIndicatorsMobile" class="hermes-indicators hermes-indicators-mobile" aria-label="Hermes activity">
-              <div id="homeIndicatorMobile" class="home-indicator unknown" role="img" title="Home status unavailable" aria-label="Home status unavailable">
+              <button id="homeIndicatorMobile" class="home-indicator unknown" type="button" title="Home status unavailable" aria-label="Home status unavailable">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 11.2 12 4l8.5 7.2"/><path d="M5.8 9.6V20h4.4v-5.2h3.6V20h4.4V9.6"/></svg>
-              </div>
+              </button>
               <button id="comfyIndicatorMobile" class="comfy-indicator unknown" type="button" title="ComfyUI status unavailable" aria-label="ComfyUI status unavailable">
                 <span class="comfy-indicator-dot" aria-hidden="true"></span>
               </button>
@@ -196,9 +196,9 @@
         </div>
         <div class="topbar-right">
           <div id="hermesIndicators" class="hermes-indicators" aria-label="Hermes activity">
-            <div id="homeIndicator" class="home-indicator unknown" role="img" title="Home status unavailable" aria-label="Home status unavailable">
+            <button id="homeIndicator" class="home-indicator unknown" type="button" title="Home status unavailable" aria-label="Home status unavailable">
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 11.2 12 4l8.5 7.2"/><path d="M5.8 9.6V20h4.4v-5.2h3.6V20h4.4V9.6"/></svg>
-            </div>
+            </button>
             <button id="comfyIndicator" class="comfy-indicator unknown" type="button" title="ComfyUI status unavailable" aria-label="ComfyUI status unavailable">
               <span class="comfy-indicator-dot" aria-hidden="true"></span>
             </button>
@@ -941,6 +941,6 @@
   <script src="/vendor/katex/katex.min.js"></script>
   <script src="/vendor/markdown-it/markdown-it.umd.min.js"></script>
   <script src="/vendor/markdown-it-texmath/texmath.js"></script>
-  <script src="/app.js?v=20260926-home-indicator-2"></script>
+  <script src="/app.js?v=20260926-home-button"></script>
 </body>
 </html>

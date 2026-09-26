@@ -1992,6 +1992,8 @@ app.post("/api/websites/control", async (req, res) => {
 // browser, so CORS never matters and every open dashboard shares one request.
 // Machine-specific, so it lives in .env; unset means the indicator stays hidden.
 const HOME_STATUS_URL = String(process.env.LLM3_HOME_STATUS_URL || "").trim();
+// Where a click on the house goes (a new tab). Also machine-specific: .env only.
+const HOME_LINK_URL = String(process.env.LLM3_HOME_LINK_URL || "").trim();
 const HOME_STATUS_TTL_MS = 5000;
 let homeStatusCache = { at: 0, value: null };
 
@@ -2031,7 +2033,7 @@ async function readHomeStatus() {
 }
 
 app.get("/api/home/status", async (_req, res) => {
-  res.json(await readHomeStatus());
+  res.json({ ...(await readHomeStatus()), link: HOME_LINK_URL || null });
 });
 
 // ---- ComfyUI top-bar indicator -------------------------------------------

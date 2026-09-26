@@ -106,3 +106,9 @@ test("the house is yellow at home, grey away, dim when the service is down", () 
   assert.equal(view({ available: false, error: "timeout" }).state, "unknown");
   assert.match(view({ available: false, error: "timeout" }).title, /unavailable \(timeout\)/);
 });
+
+test("the house tells the user a click opens its link, only when one is set", () => {
+  const view = (status) => runInApp(["homeIndicatorView"], `homeIndicatorView(${JSON.stringify(status)})`);
+  assert.match(view({ available: true, isHome: true, link: "http://example.test" }).title, /Click to open it in a new tab/);
+  assert.doesNotMatch(view({ available: true, isHome: true, link: null }).title, /Click/);
+});
