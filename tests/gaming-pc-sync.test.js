@@ -155,6 +155,7 @@ test("OpenCode PC transform fails loudly on a config it does not recognise", () 
 
 const {
   isQwen38TwentySevenBModel,
+  isQwenFixedTemplateModel,
   getChatTemplateOptionsForModel,
   resolveChatTemplateKey,
   normalizeChatTemplateParam,
@@ -174,41 +175,54 @@ test("only the 27B Qwen3.8 variants are recognised", () => {
   assert.equal(isQwen38TwentySevenBModel(QWEN36_35B), false, "Qwen3.6 is a different generation");
 });
 
-test("the Qwen Sharp template is offered only where llama.cpp can load it", () => {
-  assert.deepEqual(getChatTemplateOptionsForModel(QWEN38_27B).map((e) => e.key), ["qwen-sharp"]);
-  assert.deepEqual(getChatTemplateOptionsForModel(QWEN38_9B), []);
-  assert.deepEqual(getChatTemplateOptionsForModel(QWEN36_35B), []);
+test("Qwen 3.5, 3.6 and 3.8 in any size get the fixed template", () => {
+  assert.equal(isQwenFixedTemplateModel(QWEN38_27B), true);
+  assert.equal(isQwenFixedTemplateModel(QWEN38_9B), true);
+  assert.equal(isQwenFixedTemplateModel(QWEN36_35B), true);
+  assert.equal(isQwenFixedTemplateModel({ label: "Qwen 3.6 MXFP4_MOE", key: "/m/qwen36-mxfp4/x.gguf", runtime: "gguf" }), true);
+  assert.equal(isQwenFixedTemplateModel({ label: "Qwen3.8 Flash Next Uncensored IQ2 M", runtime: "gguf" }), true);
+  assert.equal(isQwenFixedTemplateModel({ label: "Qwen3.5 9B Q8", runtime: "gguf" }), true);
+  assert.equal(isQwenFixedTemplateModel({ label: "Qwen3 32B Q8", runtime: "gguf" }), false, "Qwen 3 is not covered");
+  assert.equal(isQwenFixedTemplateModel({ label: "Gemma 4 26B", runtime: "gguf" }), false);
+});
+
+test("templates are offered only where llama.cpp can load them", () => {
+  assert.deepEqual(getChatTemplateOptionsForModel(QWEN38_27B).map((e) => e.key), ["qwen-fixed", "qwen-sharp"]);
+  assert.deepEqual(getChatTemplateOptionsForModel(QWEN38_9B).map((e) => e.key), ["qwen-fixed"]);
+  assert.deepEqual(getChatTemplateOptionsForModel(QWEN36_35B).map((e) => e.key), ["qwen-fixed"]);
   // MLX is not launched through llama.cpp, so --chat-template-file does not apply.
   assert.deepEqual(getChatTemplateOptionsForModel(QWEN38_27B_MLX), []);
 });
 
-test("Qwen Sharp is the default until the model default is explicitly saved", () => {
-  assert.equal(resolveChatTemplateKey(QWEN38_27B, ""), "qwen-sharp", "unsaved -> preferred template");
-  assert.equal(resolveChatTemplateKey(QWEN38_27B, "qwen-sharp"), "qwen-sharp");
+test("Qwen Fixed is the default until another choice is explicitly saved", () => {
+  assert.equal(resolveChatTemplateKey(QWEN38_27B, ""), "qwen-fixed", "unsaved -> preferred template");
+  assert.equal(resolveChatTemplateKey(QWEN38_27B, "qwen-sharp"), "qwen-sharp", "Qwen Sharp stays selectable");
   assert.equal(resolveChatTemplateKey(QWEN38_27B, "model-default"), "model-default", "saving the original must stick");
-  assert.equal(resolveChatTemplateKey(QWEN38_27B, "no-such-template"), "qwen-sharp", "stale key falls back");
-  // Models with no alternatives always keep their own template.
-  assert.equal(resolveChatTemplateKey(QWEN36_35B, "qwen-sharp"), "model-default");
+  assert.equal(resolveChatTemplateKey(QWEN38_27B, "no-such-template"), "qwen-fixed", "stale key falls back");
+  assert.equal(resolveChatTemplateKey(QWEN36_35B, ""), "qwen-fixed");
+  // Qwen Sharp is 27B-only; asking for it elsewhere falls back to the default.
+  assert.equal(resolveChatTemplateKey(QWEN36_35B, "qwen-sharp"), "qwen-fixed");
 });
 
 test("a template request for an ineligible model is discarded", () => {
   assert.equal(normalizeChatTemplateParam(QWEN38_27B, { chatTemplate: "qwen-sharp" }), "qwen-sharp");
+  assert.equal(normalizeChatTemplateParam(QWEN38_27B, { chatTemplate: "qwen-fixed" }), "qwen-fixed");
   assert.equal(normalizeChatTemplateParam(QWEN38_27B, { chatTemplate: "model-default" }), "model-default");
   assert.equal(normalizeChatTemplateParam(QWEN36_35B, { chatTemplate: "qwen-sharp" }), "model-default");
-  assert.equal(normalizeChatTemplateParam(QWEN38_9B, { chatTemplate: "qwen-sharp" }), "model-default");
+  assert.equal(normalizeChatTemplateParam(QWEN38_27B_MLX, { chatTemplate: "qwen-fixed" }), "model-default");
 });
 
 test("the options payload is only built for models with a choice", () => {
   const payload = buildChatTemplateOptionsPayload(QWEN38_27B, "");
-  assert.equal(payload.selected, "qwen-sharp");
+  assert.equal(payload.selected, "qwen-fixed");
   assert.equal(payload.saved, null);
-  assert.deepEqual(payload.options.map((o) => o.key), ["model-default", "qwen-sharp"]);
+  assert.deepEqual(payload.options.map((o) => o.key), ["model-default", "qwen-fixed", "qwen-sharp"]);
 
   const saved = buildChatTemplateOptionsPayload(QWEN38_27B, "model-default");
   assert.equal(saved.selected, "model-default");
   assert.equal(saved.saved, "model-default");
 
-  assert.equal(buildChatTemplateOptionsPayload(QWEN36_35B, ""), null);
+  assert.equal(buildChatTemplateOptionsPayload({ label: "Gemma 4 26B", runtime: "gguf" }, ""), null);
 });
 
 test("the launcher only receives --chat-template-file when a file was resolved", () => {

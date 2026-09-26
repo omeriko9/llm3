@@ -3257,6 +3257,24 @@ const CHAT_TEMPLATE_CACHE_DIR = process.env.LLM3_CHAT_TEMPLATE_CACHE_DIR
   || path.join(HOME, "models", ".llm3-chat-templates");
 const CHAT_TEMPLATE_CATALOG = [
   {
+    // Default for every Qwen 3.5 / 3.6 / 3.8 GGUF (one file covers all sizes and
+    // Flash-Next). Fixes the official templates' xhigh-by-default reasoning (which
+    // ran replies into max_tokens), empty-think poisoning, stringified tool-argument
+    // crashes and history re-rendering that broke the prefix KV cache. Pinned to a
+    // commit so an upstream edit cannot change a running setup; bump revision and
+    // fileName together to update.
+    key: "qwen-fixed",
+    label: "Qwen Fixed (froggeric)",
+    source: "froggeric",
+    description: "Fixed Qwen 3.5/3.6/3.8 template (v22.5): medium reasoning by default instead of xhigh, reasoning-effort aliases and inline <|think_*|> tags, robust tool calls, prefix-cache-safe history.",
+    repoId: "froggeric/Qwen-Fixed-Chat-Templates",
+    revision: "855bffc49448e299789730ff92c9b8d834d6cc14",
+    remotePath: "chat_template.jinja",
+    fileName: "qwen-fixed-froggeric-v22.5.jinja",
+    preferred: true,
+    supports: (model) => isQwenFixedTemplateModel(model),
+  },
+  {
     key: "qwen-sharp",
     label: "Qwen Sharp",
     source: "peculiar-ragdoll",
@@ -3265,10 +3283,16 @@ const CHAT_TEMPLATE_CATALOG = [
     revision: "main",
     remotePath: "chat_template.jinja",
     fileName: "qwen-sharp.jinja",
-    preferred: true,
+    preferred: false,
     supports: (model) => isQwen38TwentySevenBModel(model),
   },
 ];
+
+// Qwen 3.5, 3.6 and 3.8 in any size, dense or MoE, including 3.8 Flash-Next.
+function isQwenFixedTemplateModel(model) {
+  const compact = modelTraitText(model).replace(/[\s._\-/]/g, "");
+  return /qwen3(5|6|8)/.test(compact);
+}
 
 function isQwen38TwentySevenBModel(model) {
   // Strip separators so "Qwen3.8-27B", "qwen_3_8 27b" and "Qwen3.8 27B" all match.
@@ -18395,6 +18419,7 @@ module.exports = {
   isVisionProjectorFile,
   isQwen38TwentySevenBModel,
   getChatTemplateOptionsForModel,
+  isQwenFixedTemplateModel,
   resolveChatTemplateKey,
   normalizeChatTemplateParam,
   buildChatTemplateOptionsPayload,
