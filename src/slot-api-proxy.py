@@ -633,6 +633,73 @@ def thinking_off_requested(payload: dict) -> bool:
     return True
 
 
+# A reasoning effort the backend does not offer. Levels differ per model: the
+# Sushi runtime serves Qwen3.8-Flash-Next with off / low / medium / xhigh and
+# answers 400 to "high", which hermes does not retry -- a podG Tell-me turn
+# failed on it (2026-09-28). A backend that lists its levels in /v1/models
+# ("reasoning_efforts") gets the nearest one it has; a tie goes to the lower
+# level, because the lower one costs less time. A backend that lists nothing
+# gets the request unchanged.
+REASONING_EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
+BACKEND_EFFORTS_TTL_SECONDS = 60.0
+_backend_efforts = {"levels": None, "checkedAt": 0.0}
+_backend_efforts_lock = threading.Lock()
+
+
+def backend_reasoning_efforts() -> "list | None":
+    """The effort levels the backend's model lists in /v1/models, cached for a minute."""
+    with _backend_efforts_lock:
+        if time.time() - _backend_efforts["checkedAt"] < BACKEND_EFFORTS_TTL_SECONDS:
+            return _backend_efforts["levels"]
+        levels = None
+        conn = http.client.HTTPConnection(ARGS.backend_host, ARGS.backend_port, timeout=5)
+        resp = None
+        try:
+            headers = {"Authorization": f"Bearer {ARGS.backend_api_key}"} if ARGS.backend_api_key else {}
+            conn.request("GET", "/v1/models", headers=headers)
+            resp = conn.getresponse()
+            payload = json.loads(resp.read().decode("utf-8")) if resp.status == 200 else {}
+            entries = payload.get("data") if isinstance(payload, dict) else None
+            entries = [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+            wanted = str(ARGS.backend_model_id or "").strip()
+            entry = next((e for e in entries if wanted and e.get("id") == wanted), entries[0] if entries else {})
+            listed = entry.get("reasoning_efforts")
+            if isinstance(listed, list) and listed:
+                levels = [str(level).strip().lower() for level in listed if isinstance(level, str)]
+        except Exception:
+            levels = None
+        finally:
+            close_backend(resp, conn)
+        _backend_efforts["levels"] = levels
+        _backend_efforts["checkedAt"] = time.time()
+        return levels
+
+
+def nearest_reasoning_effort(effort: str, levels: "list | None") -> "str | None":
+    """The offered level closest to `effort`, or None when no change is needed or possible."""
+    effort = effort.strip().lower()
+    if not levels or effort in levels or effort not in REASONING_EFFORT_ORDER:
+        return None
+    offered = [level for level in levels if level in REASONING_EFFORT_ORDER]
+    if not offered:
+        return None
+    wanted = REASONING_EFFORT_ORDER.index(effort)
+    return min(offered, key=lambda level: (abs(REASONING_EFFORT_ORDER.index(level) - wanted), REASONING_EFFORT_ORDER.index(level)))
+
+
+def map_unsupported_reasoning_effort(payload: dict) -> bool:
+    """Replace a reasoning_effort the backend does not offer. True if it did."""
+    effort = payload.get("reasoning_effort")
+    if not isinstance(effort, str) or not effort.strip():
+        return False
+    replacement = nearest_reasoning_effort(effort, backend_reasoning_efforts())
+    if replacement is None:
+        return False
+    append_proxy_line(f"[proxy] reasoning_effort {effort!r} is not offered by the model; sent {replacement!r}")
+    payload["reasoning_effort"] = replacement
+    return True
+
+
 def normalize_request(path: str, body: bytes) -> "tuple[bytes, dict | None]":
     """Apply the slot's sampling defaults and the optiq model-id remap.
 
@@ -659,6 +726,8 @@ def normalize_request(path: str, body: bytes) -> "tuple[bytes, dict | None]":
             payload[key] = value
             changed = True
     if thinking_off_requested(payload):
+        changed = True
+    elif map_unsupported_reasoning_effort(payload):
         changed = True
     if not changed:
         # Byte-for-byte what the client sent.

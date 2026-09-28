@@ -397,3 +397,36 @@ test("reasoning_effort none becomes the thinking switch, and a real level passes
   assert.equal(kept.reasoning_effort, "medium");
   assert.equal("enable_thinking" in kept, false);
 });
+
+test("a reasoning effort the model does not offer is sent as the nearest one it has", async (t) => {
+  // The Sushi runtime serves some models with off / low / medium / xhigh only and
+  // answers 400 to "high"; hermes does not retry a 400, so the turn failed.
+  const seen = [];
+  const backend = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      if (req.url.startsWith("/v1/models")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ object: "list", data: [{ id: "sushi-model", reasoning_efforts: ["off", "low", "medium", "xhigh"] }] }));
+        return;
+      }
+      const parsed = JSON.parse(raw || "{}");
+      seen.push(parsed.reasoning_effort);
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "x", object: "chat.completion", model: parsed.model, choices: [{ message: { role: "assistant", content: "ok" } }] }));
+    });
+  });
+  await new Promise((resolve) => backend.listen(0, "127.0.0.1", resolve));
+  t.after(() => backend.close());
+  const proxy = await startProxy(t, { backendPort: backend.address().port });
+  for (const effort of ["high", "medium", "xhigh", "max", "bogus"]) {
+    const response = await chat(proxy.base, { model: "sushi-model", messages: [{ role: "user", content: "hi" }], reasoning_effort: effort });
+    assert.equal(response.status, 200);
+    await response.text();
+  }
+  // high sits between medium and xhigh: the tie goes to the cheaper level.
+  // Offered levels and unknown words pass unchanged.
+  assert.deepEqual(seen, ["medium", "medium", "xhigh", "xhigh", "bogus"]);
+  assert.match(proxy.output(), /reasoning_effort 'high' is not offered by the model; sent 'medium'/);
+});
