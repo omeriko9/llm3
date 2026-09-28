@@ -28,6 +28,7 @@ const MODEL_LAUNCHERS = [
   "run-mlx-dspark-api.sh",
   "run-mlx-vlm-api.sh",
   "run-ds4-api.sh",
+  "run-sushi-api.sh",
   "run-optiq-api.sh",
   "run-qwen36-dflash-api.sh",
   "run-qwen36-mlx-api.sh",
@@ -38,7 +39,7 @@ const VOICE_LAUNCHERS = ["voice-tts.sh", "voice-stt.sh"];
 // --list-json is a model-launcher mode; these launchers list through the
 // server's own model scan instead (ds4 among them: its pack is discovered as a
 // GGUF repo directory like any other).
-const NO_LIST_JSON = new Set(["run-mlx-dspark-api.sh", "run-mlx-vlm-api.sh", "run-ds4-api.sh"]);
+const NO_LIST_JSON = new Set(["run-mlx-dspark-api.sh", "run-mlx-vlm-api.sh", "run-ds4-api.sh", "run-sushi-api.sh"]);
 
 let tempHome;
 test.before(async () => {

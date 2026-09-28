@@ -297,6 +297,12 @@ const MLX_VLM_LAUNCHER = process.env.MLX_VLM_LAUNCHER || path.join(BIN_DIR, "run
 // with MTP, against 24-28 on mlx-vlm). See bin/run-ds4-api.sh.
 const DS4_HOME = process.env.DS4_HOME || path.join(HOME, "ds4-metal");
 const DS4_LAUNCHER = process.env.DS4_LAUNCHER || path.join(BIN_DIR, "run-ds4-api.sh");
+// sushi (beamivalice/sushi) is a native MLX engine for Qwen3.8-Flash-Next
+// "Sushi" packs: EXL3 routed experts plus an SSD-read ngram_table.bin, which no
+// other launcher here can decode. A prebuilt release binary, not a build tree.
+// See bin/run-sushi-api.sh.
+const SUSHI_HOME = process.env.SUSHI_HOME || path.join(HOME, "sushi", "sushi-macos-arm64");
+const SUSHI_LAUNCHER = process.env.SUSHI_LAUNCHER || path.join(BIN_DIR, "run-sushi-api.sh");
 const MLX_VLM_PYTHON = process.env.MLX_VLM_PYTHON || MLX_DSPARK_PYTHON;
 const OPTIQ_LAUNCHER = process.env.QWEN_OPTIQ || path.join(BIN_DIR, "run-optiq-api.sh");
 const MTPLX_BINARY = process.env.MTPLX_BINARY || path.join(HOME, ".venvs", "rapid-mlx", "bin", "mtplx");
@@ -506,6 +512,19 @@ const LAUNCHER_DEFINITIONS = Object.freeze([
     buildDirs: [],
   },
   {
+    // A release binary with its own self-updater (`sushi update`).
+    key: "sushi",
+    name: "sushi",
+    family: "mlx",
+    accent: "mlx",
+    path: SUSHI_LAUNCHER,
+    versionKind: "binary",
+    versionPath: path.join(SUSHI_HOME, "sushi"),
+    updateKind: "self",
+    updatePath: path.join(SUSHI_HOME, "sushi"),
+    buildDirs: [],
+  },
+  {
     key: "optiq",
     name: "OptIQ",
     family: "mlx",
@@ -624,6 +643,8 @@ function buildLauncherCommandTemplate(launcherKey) {
       return `${launcherPath} --slot ${slot} --model ${modelPath} --mode <mode> --reasoning-effort <reasoning-effort> --context-size ${contextSize} --parallel ${parallel} --port <public-port> --temperature ${temperature} --top-p ${topP} --top-k ${topK} --min-p ${minP} --presence-penalty ${presencePenalty} --repetition-penalty ${repetitionPenalty} --start`;
     case "mlx-vlm":
       return `${launcherPath} --slot ${slot} --model ${modelPath} --reasoning-effort <reasoning-effort> --context-size ${contextSize} --parallel ${parallel} --port <public-port> --temperature ${temperature} --top-p ${topP} --top-k ${topK} --min-p ${minP} --presence-penalty ${presencePenalty} --repetition-penalty ${repetitionPenalty} --start`;
+    case "sushi":
+      return `${launcherPath} --slot ${slot} --model ${modelPath} --context-size ${contextSize} --port <public-port> --mtp on|off --mtp-draft <n|0=adaptive> --kv-quant off|4|8 --temperature ${temperature} --top-p ${topP} --top-k ${topK} --start`;
     case "ds4":
       return `${launcherPath} --slot ${slot} --model ${modelPath} --context-size ${contextSize} --parallel ${parallel} --port <public-port> --mtp on|off --mtp-draft <n> --temperature ${temperature} --top-p ${topP} --top-k ${topK} --min-p ${minP} --presence-penalty ${presencePenalty} --repetition-penalty ${repetitionPenalty} --start`;
     case "gguf-tq3":
@@ -737,6 +758,14 @@ async function readLauncherVersion(definition) {
   }
   if (definition.versionKind === "python-packages") {
     return readPythonPackageVersions(definition.pythonPath, definition.packages);
+  }
+  if (definition.versionKind === "binary") {
+    try {
+      const { stdout } = await execFileAsync(definition.versionPath, ["--version"], getExecOptions({ timeout: 10000 }));
+      return String(stdout || "").split("\n")[0].trim() || "unknown";
+    } catch (_error) {
+      return "missing";
+    }
   }
   return "unknown";
 }
@@ -870,7 +899,9 @@ async function updateLauncher(launcherKey) {
   }
   const stdout = definition.updateKind === "git"
     ? await runGitLauncherUpdate(definition)
-    : await runPipLauncherUpdate(definition);
+    : definition.updateKind === "self"
+      ? formatExecResult(await execFileAsync(definition.updatePath, ["update"], getExecOptions({ maxBuffer: 8 * 1024 * 1024, timeout: 20 * 60 * 1000 })))
+      : await runPipLauncherUpdate(definition);
   return {
     ok: true,
     launcherKey: definition.key,
@@ -2514,6 +2545,15 @@ function getDefaultLogs(slot, runtime) {
     };
   }
 
+  if (runtime === "sushi") {
+    const stateDir = path.join(DEFAULT_XDG_STATE_HOME, "sushi", slot.id);
+    return {
+      server: path.join(stateDir, "sushi-api.log"),
+      traffic: path.join(stateDir, "traffic.log"),
+      proxy: path.join(stateDir, "proxy.log"),
+    };
+  }
+
   if (runtime === "ds4") {
     const stateDir = path.join(DEFAULT_XDG_STATE_HOME, "ds4", slot.id);
     return {
@@ -2856,6 +2896,10 @@ function normalizeModelRuntime(value) {
   if (runtime === "mlx-vlm") {
     return "mlx";
   }
+  // sushi serves a Sushi pack directory, which is scanned as an MLX model.
+  if (runtime === "sushi") {
+    return "mlx";
+  }
   return "gguf";
 }
 
@@ -2935,6 +2979,34 @@ function isDs4PackModel(model) {
   }
   const text = modelTraitText(model);
   return text.includes("ds4-iq2") || text.includes("ds4-q4") || text.includes("dwarfstar");
+}
+
+// A Sushi pack is an MLX-looking directory (config.json + safetensors) whose
+// config names an external "ngram_table" and an "expert_quant" block for its
+// EXL3 routed experts. mlx-vlm and mlx-dspark accept the config and then fail on
+// the weights, so a pack must go to sushi and only there.
+const sushiPackCache = new Map();
+function isSushiPackModel(model) {
+  const dir = String(model?.path || model?.key || "").trim();
+  if (!dir) {
+    return false;
+  }
+  if (sushiPackCache.has(dir)) {
+    return sushiPackCache.get(dir);
+  }
+  let result = false;
+  try {
+    const config = JSON.parse(fsSync.readFileSync(path.join(dir, "config.json"), "utf8"));
+    result = Boolean(config?.ngram_table && config?.expert_quant);
+  } catch (_error) {
+    result = false;
+  }
+  sushiPackCache.set(dir, result);
+  return result;
+}
+
+function sushiInstalled() {
+  return fsSync.existsSync(SUSHI_LAUNCHER) && fsSync.existsSync(path.join(SUSHI_HOME, "sushi"));
 }
 
 function isMtpGgufModel(model) {
@@ -3179,6 +3251,11 @@ function getLaunchersForModel(model) {
   }
   if (runtime === "mlx" && isOptiqPairBundleModel(model)) {
     return experimentalMlxLaunchersEnabled() ? ["optiq"] : [];
+  }
+  // Before the mlx-vlm fallback below, which would claim the pack by its
+  // qwen4_exp model_type and then fail to load the EXL3 experts.
+  if ((runtime === "mlx" || runtime === "sushi") && isSushiPackModel(model)) {
+    return sushiInstalled() ? ["sushi"] : [];
   }
   const launchers = getLaunchersForRuntime(runtime);
   if (experimentalMlxLaunchersEnabled() && (runtime === "mlx" || runtime === "mtplx") && modelCanRunRapidMlx(model) && !launchers.includes("rapid-mlx")) {
@@ -3561,9 +3638,10 @@ function normalizeUbatchSizeParam(model, params = {}) {
 }
 
 function normalizeMtpDraftMaxParam(model, params = {}) {
-  // ds4 has its own embedded MTP head and the same depth knob (--mtp-draft),
-  // so it keeps this control even though supportsGgufExtras excludes it.
-  if (!supportsGgufExtras(model) && String(model?.launcher || "").trim() !== "ds4") {
+  // ds4 and sushi have their own embedded MTP head and a depth knob
+  // (--mtp-draft), so they keep this control even though supportsGgufExtras
+  // excludes them.
+  if (!supportsGgufExtras(model) && !["ds4", "sushi"].includes(String(model?.launcher || "").trim())) {
     return null;
   }
   const value = Number.parseInt(String(params.mtpDraftMax ?? ""), 10);
@@ -5855,6 +5933,38 @@ app.post("/api/slot-config", async (req, res) => {
   res.json({ ok: true, slotId: slot.id, runtimeBaseUrl, ...overview });
 });
 
+// Favorites are a UI preference kept in dashboard-config.json, so they follow
+// the user across browsers. Like a slot rename, this is not a runtime action
+// and does not wait for requireIdle. Body: { modelKey, favorite, color? };
+// favorite:false removes the entry, a color alone recolors an existing one.
+app.post("/api/models/favorite", async (req, res) => {
+  const modelKey = String(req.body?.modelKey || "").trim();
+  if (!modelKey || modelKey.length > 1024) {
+    res.status(400).json({ error: "modelKey is required." });
+    return;
+  }
+  const favorite = req.body?.favorite !== false;
+  try {
+    let modelFavorites = {};
+    await updateDashboardConfig((dashboardConfig) => {
+      const next = { ...(dashboardConfig.modelFavorites || {}) };
+      if (favorite) {
+        next[modelKey] = {
+          color: normalizeModelFavoriteColor(req.body?.color || next[modelKey]?.color),
+        };
+      } else {
+        delete next[modelKey];
+      }
+      modelFavorites = normalizeModelFavorites(next);
+      return { ...dashboardConfig, modelFavorites };
+    });
+    clearOverviewCache();
+    res.json({ ok: true, modelKey, favorite, modelFavorites });
+  } catch (error) {
+    res.status(500).json({ error: error.message || "Unable to save the favorite." });
+  }
+});
+
 // Renaming a slot is a label change, not a runtime action, so it does not go
 // through requireIdle: it must work while models are loaded.
 app.post("/api/slots/name", async (req, res) => {
@@ -6146,6 +6256,7 @@ async function stopAllRuntimes({ slotId = "" } = {}) {
     output.push(await safeStop(MLX_DSPARK_LAUNCHER, currentSlot));
     output.push(await safeStop(MLX_VLM_LAUNCHER, currentSlot));
     output.push(await safeStop(DS4_LAUNCHER, currentSlot));
+    output.push(await safeStop(SUSHI_LAUNCHER, currentSlot));
     output.push(await safeStop(RAPID_MLX_LAUNCHER, currentSlot));
     output.push(await safeStop(DFLASH_LAUNCHER, currentSlot));
     output.push(await safeStop(MLX_LAUNCHER, currentSlot));
@@ -6566,6 +6677,41 @@ async function startModel(slot, model, params) {
     ]);
   }
 
+  // sushi takes the pack directory. MTP (on, adaptive depth) and the 8-bit KV
+  // cache are the launcher's defaults; the MTP depth control caps the adaptive
+  // controller when set. Sampling goes in as serve-mode defaults.
+  if (launcher === "sushi") {
+    return runLauncher(SUSHI_LAUNCHER, [
+      "--slot",
+      slot.id,
+      "--model",
+      model.key,
+      ...reasoningEffortLauncherArgs(params),
+      "--context-size",
+      String(params.ctxSize),
+      "--parallel",
+      String(params.parallel),
+      "--port",
+      String(slot.publicPort),
+      "--temperature",
+      String(params.temperature),
+      "--top-p",
+      String(params.topP),
+      "--top-k",
+      String(params.topK),
+      "--min-p",
+      String(params.minP),
+      "--presence-penalty",
+      String(params.presencePenalty),
+      "--repetition-penalty",
+      String(params.repetitionPenalty),
+      ...(Number.isInteger(params.mtpDraftMax) && params.mtpDraftMax >= 1
+        ? ["--mtp-draft", String(params.mtpDraftMax)]
+        : []),
+      "--start",
+    ]);
+  }
+
   if (launcher === "mlx-vlm") {
     return runLauncher(MLX_VLM_LAUNCHER, [
       "--slot",
@@ -6862,6 +7008,34 @@ async function setLauncherDefaults(slot, model, params) {
       "--slot",
       slot.id,
       "--set-defaults",
+      "--context-size",
+      String(params.ctxSize),
+      "--parallel",
+      String(params.parallel),
+      "--temperature",
+      String(params.temperature),
+      "--top-p",
+      String(params.topP),
+      "--top-k",
+      String(params.topK),
+      "--min-p",
+      String(params.minP),
+      "--presence-penalty",
+      String(params.presencePenalty),
+      "--repetition-penalty",
+      String(params.repetitionPenalty),
+      ...(Number.isInteger(params.mtpDraftMax) && params.mtpDraftMax >= 1
+        ? ["--mtp-draft", String(params.mtpDraftMax)]
+        : []),
+    ]);
+  }
+
+  if (launcher === "sushi") {
+    return runLauncher(SUSHI_LAUNCHER, [
+      "--slot",
+      slot.id,
+      "--set-defaults",
+      ...reasoningEffortLauncherArgs(params),
       "--context-size",
       String(params.ctxSize),
       "--parallel",
@@ -7201,10 +7375,19 @@ async function scanDownloadedModels() {
     const relativeGgufPath = (filePath) => path.relative(repoDir, filePath).replace(/\\/g, "/");
     // The ds4 pack's own base GGUF ends in "-MTP.gguf" and would otherwise be
     // partitioned away as a draft head, leaving the repo with no model at all.
+    // partitionMtpGgufPaths promotes a drafts-only repo to main, which is right
+    // for a "-MTP.gguf" full model (Qwen3.6-35BA3B-MTP.gguf is 35 GB with the
+    // head built in). A file named as a sidecar (mtp- prefix or an MTP/ folder)
+    // is never a model, though: left alone after its base model was deleted
+    // (mtp-ggml-model-bf16.gguf), it has nothing llama.cpp can serve.
+    const isMtpSidecarName = (value) => {
+      const lower = String(value || "").toLowerCase();
+      return /(?:^|\/)mtp\//.test(lower) || (lower.split("/").pop() || "").startsWith("mtp-");
+    };
     const mainGgufPaths = new Set(
       hasDs4PleSidecar
         ? ggufCandidatePaths.map(relativeGgufPath)
-        : partitionMtpGgufPaths(ggufCandidatePaths.map(relativeGgufPath)).main
+        : partitionMtpGgufPaths(ggufCandidatePaths.map(relativeGgufPath)).main.filter((value) => !isMtpSidecarName(value))
     );
     const ggufFiles = ggufCandidatePaths.filter((filePath) => mainGgufPaths.has(relativeGgufPath(filePath)));
 
@@ -9593,6 +9776,7 @@ async function getSlotStatus(slot, models = null) {
     ["mlx-dspark", MLX_DSPARK_LAUNCHER],
     ["mlx-vlm", MLX_VLM_LAUNCHER],
     ["ds4", DS4_LAUNCHER],
+    ["sushi", SUSHI_LAUNCHER],
     ["optiq", OPTIQ_LAUNCHER],
     ["dflash", DFLASH_LAUNCHER],
     ["turboquant", TURBO_QUANT_LAUNCHER],
@@ -9608,7 +9792,7 @@ async function getSlotStatus(slot, models = null) {
   // file behind. Most specific first.
   const statusPrecedence = [
     "turboquant", "rapid-mlx", "dflash", "mtplx", "optiq",
-    "mlx-dspark", "mlx-vlm", "ds4", "mlx", "gguf-tq3", "gguf-prism", "beellama", "gguf",
+    "mlx-dspark", "mlx-vlm", "sushi", "ds4", "mlx", "gguf-tq3", "gguf-prism", "beellama", "gguf",
   ];
   for (const key of statusPrecedence) {
     const candidate = statusByKey.get(key);
@@ -9667,6 +9851,7 @@ async function computeOverviewData() {
         "mlx-dspark": await readDefaultsFromScript(MLX_DSPARK_LAUNCHER, slot),
         "mlx-vlm": await readDefaultsFromScript(MLX_VLM_LAUNCHER, slot),
         ds4: await readDefaultsFromScript(DS4_LAUNCHER, slot),
+        sushi: await readDefaultsFromScript(SUSHI_LAUNCHER, slot),
         optiq: await readDefaultsFromScript(OPTIQ_LAUNCHER, slot),
         dflash: await readDefaultsFromScript(DFLASH_LAUNCHER, slot),
         turboquant: await readDefaultsFromScript(TURBO_QUANT_LAUNCHER, slot),
@@ -9759,6 +9944,7 @@ async function computeOverviewData() {
     preferredLaunchers: dashboardConfig.preferredLaunchers || {},
     modelApplicationPreferences: dashboardConfig.modelApplicationPreferences || {},
     slotApplicationPreferences: dashboardConfig.slotApplicationPreferences || {},
+    modelFavorites: dashboardConfig.modelFavorites || {},
     syncTargetSlotId: integrationTargets.openclaude,
   };
 }
@@ -15863,6 +16049,31 @@ function normalizeSlotNames(value) {
   return normalized;
 }
 
+// Favorite models: { [modelKey]: { color: "#rrggbb" } }. Keys are not checked
+// against the model scan, so a favorite survives a model that is briefly
+// missing (an unmounted drive, a re-download).
+const MODEL_FAVORITE_DEFAULT_COLOR = "#facc15";
+
+function normalizeModelFavoriteColor(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  return /^#[0-9a-f]{6}$/.test(raw) ? raw : MODEL_FAVORITE_DEFAULT_COLOR;
+}
+
+function normalizeModelFavorites(value) {
+  const normalized = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return normalized;
+  }
+  for (const [modelKey, entry] of Object.entries(value)) {
+    const key = String(modelKey || "").trim();
+    if (!key || key.length > 1024) {
+      continue;
+    }
+    normalized[key] = { color: normalizeModelFavoriteColor(entry?.color) };
+  }
+  return normalized;
+}
+
 // A name saved inside the applied profile wins over the global one, so switching
 // profiles renames the slots with them. With no profile applied there is only
 // the global map.
@@ -15978,6 +16189,7 @@ async function readDashboardConfig() {
     modelApplicationPreferences: {},
     slotApplicationPreferences: {},
     slotNames: {},
+    modelFavorites: {},
   };
   await fs.mkdir(SLOT_STATE_DIR, { recursive: true });
   try {
@@ -16021,7 +16233,8 @@ async function readDashboardConfig() {
     const modelApplicationPreferences = normalizeModelApplicationPreferences(payload?.modelApplicationPreferences);
     const slotApplicationPreferences = normalizeSlotApplicationPreferences(payload?.slotApplicationPreferences);
     const slotNames = normalizeSlotNames(payload?.slotNames);
-    return { applicationTargets, integrationTargets, slotRuntimeBaseUrls, voiceRuntimeBaseUrls, profiles, defaultProfileId, activeProfileId, preferredLaunchers, chatTemplates, usedModelKeys, modelApplicationPreferences, slotApplicationPreferences, slotNames };
+    const modelFavorites = normalizeModelFavorites(payload?.modelFavorites);
+    return { applicationTargets, integrationTargets, slotRuntimeBaseUrls, voiceRuntimeBaseUrls, profiles, defaultProfileId, activeProfileId, preferredLaunchers, chatTemplates, usedModelKeys, modelApplicationPreferences, slotApplicationPreferences, slotNames, modelFavorites };
   } catch (_error) {
     try {
       const legacyPayload = JSON.parse(await fs.readFile(LEGACY_SYNC_TARGET_PATH, "utf8"));
@@ -16076,6 +16289,7 @@ async function writeDashboardConfigUnlocked(config) {
     modelApplicationPreferences,
     slotApplicationPreferences,
     slotNames: normalizeSlotNames(config?.slotNames),
+    modelFavorites: normalizeModelFavorites(config?.modelFavorites),
   };
   await fs.mkdir(SLOT_STATE_DIR, { recursive: true });
   await writeJsonAtomic(DASHBOARD_CONFIG_PATH, payload);
