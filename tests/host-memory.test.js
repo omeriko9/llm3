@@ -58,9 +58,11 @@ test("the summary keeps baseline, peak and working average apart", () => {
   });
   assert.equal(summary.method, "host-used");
   assert.equal(summary.baselineBytes, 30 * GB);
-  assert.equal(summary.peakBytes, 60 * GB, "a load spike counts toward the peak");
+  // The 50 GB and 60 GB load readings still hold the previous model's pages,
+  // so the peak comes from the work phase only.
+  assert.equal(summary.peakBytes, 56 * GB, "the peak ignores load-phase readings");
   assert.equal(summary.avgBytes, 54 * GB, "the average covers the working samples only");
-  assert.equal(summary.footprintPeakBytes, 30 * GB);
+  assert.equal(summary.footprintPeakBytes, 26 * GB);
   assert.equal(summary.footprintAvgBytes, 24 * GB);
   assert.equal(summary.samples, 8);
   assert.deepEqual(summary.otherSlots, ["slot1"]);

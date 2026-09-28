@@ -112,7 +112,7 @@ async function otherSlotsListening(slotId) {
 // is not work: the baseline is the LOWEST reading before the model was ready
 // (the slot's previous model is unloaded inside that window, so its trough is
 // the empty-slot level), the average covers only the readings after ready(),
-// and the peak covers both, since a load can itself be the high point.
+// and so does the peak (see summarizeMemorySamples).
 function createMemorySampler({ intervalMs = SAMPLE_INTERVAL_MS, read = readHostUsedBytes, slotId = "" } = {}) {
   const loadSamples = [];
   const workSamples = [];
@@ -172,7 +172,11 @@ function summarizeMemorySamples({ loadSamples = [], workSamples = [], intervalMs
     return null;
   }
   const baselineBytes = loadSamples.length ? Math.min(...loadSamples) : null;
-  const peakBytes = Math.max(...all);
+  // The peak comes from the work phase when there is one. During the load the
+  // previous model's wired pages are still being released, so a load-phase
+  // reading measured the model BEFORE this one: a 9B scene reported the 27B's
+  // 78 GB as its peak.
+  const peakBytes = Math.max(...(workSamples.length ? workSamples : all));
   const avgBytes = workSamples.length
     ? Math.round(workSamples.reduce((total, value) => total + value, 0) / workSamples.length)
     : null;

@@ -923,12 +923,26 @@ async function startModelInSlot(slotId, modelKey, params) {
   throw new Error(`could not load model into ${slotId}: ${detail}`);
 }
 
-async function waitForSlotReady(baseUrl) {
+// The id to send is the loaded model's, not simply the first one listed:
+// mlx-vlm's server also lists every model in the Hugging Face cache, and a
+// Mage VL scene sent "omnivoice" (a TTS repo listed first), which mlx-vlm then
+// tried to load and failed with "Model type omnivoice not supported".
+function pickLoadedModelId(data, modelKey) {
+  const ids = data.map((item) => String(item?.id || "")).filter(Boolean);
+  const key = String(modelKey || "").replace(/\/+$/, "");
+  const base = path.basename(key).toLowerCase();
+  return ids.find((id) => id === key)
+    || ids.find((id) => base && path.basename(id.replace(/\/+$/, "")).toLowerCase() === base)
+    || ids[0]
+    || "";
+}
+
+async function waitForSlotReady(baseUrl, modelKey = "") {
   const deadline = nowMs() + SLOT_READY_TIMEOUT_MS;
   while (nowMs() < deadline) {
     const models = await getJson(`${baseUrl}/v1/models`, 5_000);
     if (models && Array.isArray(models.data) && models.data.length) {
-      return String(models.data[0].id || "");
+      return pickLoadedModelId(models.data, modelKey);
     }
     await sleep(SLOT_POLL_INTERVAL_MS);
   }
@@ -986,6 +1000,30 @@ async function describeOtherLoadedSlots(slotId) {
   }
 }
 
+// ds4 and sushi have no launch-time thinking switch: the slot's reasoning
+// effort is only recorded, and both read thinking per request. Without these
+// fields a thinking-off scene on ds4 spent its whole 12000-token budget
+// reasoning and wrote no page. Both servers read chat_template_kwargs
+// enable_thinking and reasoning_effort (ds4: parse_chat_template_kwargs in
+// ds4_server.c). The other launchers get thinking from their launch flags, so
+// their requests stay unchanged.
+const PER_REQUEST_THINKING_LAUNCHERS = ["ds4", "sushi"];
+
+function perRequestThinkingFields(slotId, slotParams) {
+  const launcher = PER_REQUEST_THINKING_LAUNCHERS.find((name) =>
+    fsSync.existsSync(path.join(stateHome, name, String(slotId), "current.json")));
+  if (!launcher) {
+    return {};
+  }
+  if (slotParams.thinking !== true) {
+    return { chat_template_kwargs: { enable_thinking: false }, reasoning_effort: "none" };
+  }
+  return {
+    chat_template_kwargs: { enable_thinking: true },
+    reasoning_effort: slotParams.thinkingEffort || "medium",
+  };
+}
+
 // Host memory is sampled around the whole of one model's turn: from before the
 // load request (the previous model is unloaded inside it, so the lowest reading
 // before ready is the empty-slot baseline) to the end of generation.
@@ -1025,7 +1063,7 @@ async function runOneMeasured(entry, slotId, publicBase, slotParams, test, sampl
   const target = path.join(outputRoot, `${fileBase}.html`);
 
   await startModelInSlot(slotId, entry.modelKey, slotParams);
-  const modelId = await waitForSlotReady(publicBase);
+  const modelId = await waitForSlotReady(publicBase, entry.modelKey);
   await sampler.ready();
 
   const session = sessions[test.id];
@@ -1047,6 +1085,7 @@ async function runOneMeasured(entry, slotId, publicBase, slotParams, test, sampl
       model: modelId || "voxel",
       messages: [{ role: "user", content: test.prompt(target) }],
       max_tokens: MAX_TOKENS,
+      ...perRequestThinkingFields(slotId, slotParams),
     },
     GENERATION_TIMEOUT_MS,
     {
@@ -1445,6 +1484,8 @@ function activeSceneWork() {
 restore();
 
 module.exports = {
+  perRequestThinkingFields,
+  pickLoadedModelId,
   startVoxelTest,
   cancelVoxelTest,
   rerunModel,
