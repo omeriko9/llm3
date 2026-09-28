@@ -2237,6 +2237,227 @@ button.home-indicator:not(:disabled):hover {
   min-width: 0;
 }
 
+/* The card is a column so the path and footer sit at the bottom of every card
+   in a row, whatever the header and notes above them take. */
+.model-grid:not(.table-mode):not(.profiles-mode) .model-card {
+  display: flex;
+  flex-direction: column;
+}
+
+.model-card-title {
+  min-width: 0;
+}
+
+.model-card .table-name-row {
+  align-items: flex-start;
+}
+
+.model-card .table-name-row .model-name-token {
+  min-width: 0;
+}
+
+.model-meta {
+  margin-bottom: 0;
+}
+
+.meta-item {
+  min-width: 0;
+}
+
+.meta-item dd {
+  margin: 0.15rem 0 0;
+}
+
+.model-quant-cell {
+  max-width: 9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-card-slots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.model-card-notes {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 0.75rem;
+}
+
+.model-card-note {
+  margin: 0;
+  padding: 0.4rem 0.6rem;
+  border-radius: 8px;
+  border: 1px solid rgba(96, 165, 250, 0.25);
+  background: rgba(96, 165, 250, 0.08);
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  line-height: 1.4;
+}
+
+.model-card-note span {
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.model-card-note.warning {
+  border-color: rgba(251, 191, 36, 0.3);
+  background: rgba(251, 191, 36, 0.08);
+}
+
+.model-card-path {
+  margin-top: auto;
+  padding-top: 0.75rem;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge-note {
+  background: rgba(96, 165, 250, 0.12);
+  color: #93c5fd;
+  border: 1px solid rgba(96, 165, 250, 0.3);
+  cursor: help;
+}
+
+.badge-note-warning {
+  background: rgba(251, 191, 36, 0.12);
+  color: #fcd34d;
+  border: 1px solid rgba(251, 191, 36, 0.3);
+  cursor: help;
+}
+
+.model-family-cell {
+  white-space: nowrap;
+}
+
+.model-runtime-stack {
+  display: grid;
+  justify-items: start;
+  gap: 0.25rem;
+}
+
+.model-launcher-label {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+/* ---- Favorite star ---- */
+.model-fav {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.15rem;
+  flex: 0 0 auto;
+  --fav-color: #facc15;
+}
+
+.model-fav-star {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: color var(--transition), background var(--transition);
+}
+
+.model-fav-star:hover {
+  color: var(--fav-color);
+  background: var(--bg-hover);
+}
+
+.model-fav.is-favorite .model-fav-star {
+  color: var(--fav-color);
+}
+
+.model-fav-swatch {
+  width: 0.6rem;
+  height: 0.6rem;
+  padding: 0;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: var(--fav-color);
+  cursor: pointer;
+}
+
+.model-fav-swatch:hover {
+  transform: scale(1.25);
+}
+
+.model-fav-palette {
+  position: fixed;
+  z-index: 1000;
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.6rem;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  box-shadow: var(--shadow-lg);
+}
+
+.model-fav-palette-swatches {
+  display: grid;
+  grid-template-columns: repeat(4, 1.6rem);
+  gap: 0.4rem;
+}
+
+.model-fav-palette-swatch {
+  width: 1.6rem;
+  height: 1.6rem;
+  padding: 0;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background: var(--fav-color);
+  cursor: pointer;
+}
+
+.model-fav-palette-swatch:hover,
+.model-fav-palette-swatch.active {
+  border-color: var(--text);
+}
+
+.model-fav-palette-remove {
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 0.74rem;
+  cursor: pointer;
+}
+
+.model-fav-palette-remove:hover {
+  color: var(--text);
+  border-color: var(--border-light);
+}
+
+.filter-chip-divider {
+  align-self: center;
+  width: 1px;
+  height: 1.1rem;
+  margin: 0 0.15rem;
+  background: var(--border);
+}
+
+.filter-chip-favorites {
+  color: #facc15;
+}
+
 /* ---- Launch Section ---- */
 .launch-layout {
   display: grid;

@@ -254,6 +254,8 @@ const state = {
   busyAction: null,
   thinkingClearOffsets: loadPersistedThinkingClearOffsets(),
   activeFilter: "all",
+  // { [modelKey]: { color } }, served by /api/overview from dashboard-config.json.
+  modelFavorites: {},
   modelSearch: "",
   modelSort: { field: "runtime", direction: "asc" },
   modelView: "table",
@@ -1598,6 +1600,17 @@ function wireEvents() {
     if (event.target.closest(".link")) {
       return;
     }
+    const favoriteSwatch = event.target.closest("[data-model-favorite-color]");
+    if (favoriteSwatch) {
+      openModelFavoritePalette(favoriteSwatch.dataset.modelFavoriteColor, favoriteSwatch);
+      return;
+    }
+    const favoriteStar = event.target.closest("[data-model-favorite]");
+    if (favoriteStar) {
+      const key = favoriteStar.dataset.modelFavorite;
+      setModelFavorite(key, !getModelFavorite(getModel(key)));
+      return;
+    }
     const deleteButton = event.target.closest("[data-delete-model]");
     if (deleteButton) {
       const model = getModel(deleteButton.dataset.deleteModel);
@@ -1625,6 +1638,16 @@ function wireEvents() {
       return;
     }
     runLaunchModelWithDefaults(launchButton.dataset.launchModel);
+  });
+
+  // Right-click on a star picks its color (starring the model if it was not).
+  els.modelGrid.addEventListener("contextmenu", (event) => {
+    const favoriteStar = event.target.closest("[data-model-favorite]");
+    if (!favoriteStar) {
+      return;
+    }
+    event.preventDefault();
+    openModelFavoritePalette(favoriteStar.dataset.modelFavorite, favoriteStar);
   });
 
   els.statusContent.addEventListener("click", (event) => {
@@ -3639,6 +3662,7 @@ function applyOverview(data) {
   state.preferredLaunchers = data.preferredLaunchers || {};
   state.modelApplicationPreferences = data.modelApplicationPreferences || {};
   state.slotApplicationPreferences = data.slotApplicationPreferences || {};
+  state.modelFavorites = data.modelFavorites && typeof data.modelFavorites === "object" ? data.modelFavorites : {};
   if (!getProfileById(state.selectedProfileId)) {
     state.selectedProfileId = state.activeProfileId
       || state.defaultProfileId
@@ -5030,28 +5054,19 @@ function renderFilters() {
     return;
   }
   renderModelsSlotStrip();
-  const models = state.models;
-  const chips = [
-    { key: "all", label: "All", count: models.length },
-    { key: "gguf", label: "GGUF", count: models.filter((model) => model.runtime === "gguf").length },
-    { key: "mlx", label: "MLX", count: models.filter((model) => model.runtime === "mlx").length },
-    { key: "dflash", label: "DFlash", count: models.filter((model) => model.runtime === "dflash").length },
-  ];
-
-  [...new Set(models.map((model) => model.family).filter(Boolean))].forEach((family) => {
-    chips.push({
-      key: `family:${family}`,
-      label: family,
-      count: models.filter((model) => model.family === family).length,
-    });
-  });
-
+  const chips = buildModelFilterChips(state.models);
+  if (!chips.some((chip) => chip.key === state.activeFilter)) {
+    state.activeFilter = "all";
+  }
+  let previousGroup = "";
   els.filterChips.innerHTML = chips
-    .filter((chip) => chip.count > 0)
-    .map((chip) => (
-      `<button class="filter-chip${chip.key === state.activeFilter ? " active" : ""}" data-filter="${chip.key}">` +
-      `${esc(chip.label)}<span class="count">${chip.count}</span></button>`
-    ))
+    .map((chip) => {
+      const divider = previousGroup && chip.group !== previousGroup ? `<span class="filter-chip-divider" aria-hidden="true"></span>` : "";
+      previousGroup = chip.group;
+      return divider +
+        `<button class="filter-chip${chip.key === state.activeFilter ? " active" : ""}${chip.group === "favorites" ? " filter-chip-favorites" : ""}" data-filter="${esc(chip.key)}" title="${esc(chip.title || chip.label)}">` +
+        `${esc(chip.label)}<span class="count">${chip.count}</span></button>`;
+    })
     .join("");
 
   if (els.modelSearchInput && document.activeElement !== els.modelSearchInput) {
@@ -5229,7 +5244,9 @@ function renderModelsSlotStripCard(item) {
             ${item.models.length && !state.actionInFlight ? "" : "disabled"}
           >
             <option value="">${esc(item.models.length ? selectPlaceholder : "No models available")}</option>
-            ${item.models.map((modelOption) => renderModelsSlotOption(item, modelOption, selectedModelKey)).join("")}
+            ${item.kind === "llm"
+              ? renderSlotModelOptions(item.models, (modelOption, favorite) => renderModelsSlotOption(item, modelOption, selectedModelKey, favorite))
+              : item.models.map((modelOption) => renderModelsSlotOption(item, modelOption, selectedModelKey)).join("")}
           </select>
         </label>
       </div>
@@ -5334,10 +5351,10 @@ async function commitSlotRename() {
   await runAction("/api/slots/name", { slotId, name }, { preserveModal: false });
 }
 
-function renderModelsSlotOption(item, model, selectedModelKey = "") {
+function renderModelsSlotOption(item, model, selectedModelKey = "", favorite = null) {
   const runtimePart = item.kind === "llm" ? ` · ${runtimeLabel(model.runtime)}` : "";
   const selected = String(model.key || "") === String(selectedModelKey || "") ? " selected" : "";
-  return `<option value="${esc(model.key)}"${selected}>${esc(model.label)}${esc(runtimePart)} · ${esc(model.sizeLabel || "n/a")}</option>`;
+  return `<option value="${esc(model.key)}"${selected}${favoriteOptionAttrs(favorite)}>${favorite ? "\u2605 " : ""}${esc(model.label)}${esc(runtimePart)} · ${esc(model.sizeLabel || "n/a")}</option>`;
 }
 
 function renderModelsSlotApplicationsTooltip(item) {
@@ -5549,54 +5566,68 @@ function renderModels() {
     return;
   }
 
-  writeGrid(els.modelGrid, filteredModels.map((model) => {
-    const runtime = model.runtime || "gguf";
-    const style = paletteStyle(palette.get(model.key), runtime);
-    const activeClass = isModelActive(model) ? " active-model" : "";
-    const stopDisabled = isModelActive(model) && !state.actionInFlight ? "" : "disabled";
-    return `
-      <article class="model-card ${runtimeClass(runtime)}${activeClass}" style="${style}">
+  writeGrid(els.modelGrid, filteredModels.map((model) => renderModelCard(model, palette)).join(""));
+}
+
+// The card carries the same facts as a table row (name chip, badges, runtime,
+// launcher, family, quant, size, slots, path) plus thinking support and the
+// launcher notes, which the table only shows as a badge tooltip.
+function renderModelCard(model, palette) {
+  const runtime = model.runtime || "gguf";
+  const style = paletteStyle(palette.get(model.key), runtime);
+  const active = isModelActive(model);
+  const blockReason = modelLaunchBlockReason(model);
+  const launchTitle = blockReason || buildLaunchButtonTitle(model);
+  const quant = modelQuantLabel(model);
+  const notes = getModelNotes(model);
+  const thinking = launcherSupportsThinking(model, model.preferredLauncher || model.launcher);
+  return `
+      <article class="model-card ${runtimeClass(runtime)}${active ? " active-model" : ""}" style="${style}">
         <div class="model-card-header">
-          <div>
-            <div class="model-name">${esc(model.label)}</div>
-            <div class="model-family">${esc(model.family || "Unknown family")}</div>
+          <div class="model-name-stack model-card-title">
+            <div class="table-name-row">
+              ${renderModelFavoriteControl(model)}
+              ${renderTableModelName(model)}
+            </div>
+            <div class="model-family">${esc(deriveModelFamily(model))}</div>
           </div>
           <div class="model-badges">
             ${renderBenchmarkBadge(model)}
             ${renderIncompleteBadge(model)}
             ${renderUnsupportedBadge(model)}
             ${model.isNew ? `<span class="badge badge-new" title="Downloaded and not launched yet">New</span>` : ""}
-            <span class="badge badge-runtime">${runtimeLabel(runtime)}</span>
-            ${renderModelSlotBadges(model)}
           </div>
         </div>
-        <div class="model-meta">
+        <dl class="model-meta">
+          <div class="meta-item"><dt>Runtime</dt><dd><span class="runtime-pill ${runtimeClass(runtime)}">${runtimeLabel(runtime)}</span></dd></div>
+          <div class="meta-item"><dt>Launcher</dt><dd title="${esc(buildModelLauncherTitle(model))}">${esc(buildModelLauncherText(model))}</dd></div>
+          <div class="meta-item"><dt>Quant</dt><dd class="model-quant-cell" title="${esc(quant)}">${esc(quant || "n/a")}</dd></div>
           <div class="meta-item"><dt>Size</dt><dd>${esc(model.sizeLabel || "n/a")}</dd></div>
-          <div class="meta-item"><dt>Variant</dt><dd>${esc(getModelVariant(model) || "default")}</dd></div>
-          <div class="meta-item"><dt>Thinking</dt><dd>${launcherSupportsThinking(model, model.launcher) ? "On" : "Off"}</dd></div>
-          <div class="meta-item"><dt>Slots</dt><dd>${getRunningModelSlots(model).length ? `${getRunningModelSlots(model).length} live` : "Idle"}</dd></div>
-        </div>
+          <div class="meta-item"><dt>Thinking</dt><dd>${thinking ? "Supported" : "No"}</dd></div>
+          <div class="meta-item"><dt>Slots</dt><dd class="model-card-slots">${renderModelSlotBadges(model) || "<span class=\"status-text\">idle</span>"}</dd></div>
+        </dl>
+        ${notes.length ? `<div class="model-card-notes">${notes.map((note) => `<p class="model-card-note ${esc(note.severity)}" title="${esc(note.message)}"><span>${esc(note.message)}</span></p>`).join("")}</div>` : ""}
+        <div class="mono model-card-path" title="${esc(model.path || model.key)}">${esc(model.path || model.key)}</div>
         <div class="model-card-footer">
           <div class="table-actions">
-            <button class="btn btn-primary btn-sm" data-launch-model="${model.key}" ${state.actionInFlight || modelLaunchBlockReason(model) ? "disabled" : ""} title="${esc(modelLaunchBlockReason(model) || buildLaunchButtonTitle(model))}" aria-label="${esc(modelLaunchBlockReason(model) || buildLaunchButtonTitle(model))}">
+            <button class="btn btn-primary btn-sm" data-launch-model="${model.key}" ${state.actionInFlight || blockReason ? "disabled" : ""} title="${esc(launchTitle)}" aria-label="${esc(launchTitle)}">
               Launch
             </button>
             <button class="btn btn-icon icon-action" data-model-settings="${model.key}" ${state.actionInFlight ? "disabled" : ""} title="Open ${esc(model.label)} settings" aria-label="Open ${esc(model.label)} settings">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01A1.65 1.65 0 0 0 10.91 3H11a2 2 0 1 1 4 0h.09a1.65 1.65 0 0 0 1.51 1 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01A1.65 1.65 0 0 0 21 10.91V11a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
             </button>
-            <button class="btn btn-icon icon-action btn-danger" data-stop-model="${model.key}" ${stopDisabled} title="Stop ${esc(model.label)}" aria-label="Stop ${esc(model.label)}">
+            <button class="btn btn-icon icon-action btn-danger" data-stop-model="${model.key}" ${active && !state.actionInFlight ? "" : "disabled"} title="Stop ${esc(model.label)}" aria-label="Stop ${esc(model.label)}">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
             </button>
           </div>
           <div class="model-card-actions">
             ${model.hfUrl ? `<a class="link" href="${safeHref(model.hfUrl)}" target="_blank" rel="noreferrer">Hugging Face &rarr;</a>` : ""}
-            <button class="btn btn-danger btn-sm" data-delete-model="${model.key}" ${state.actionInFlight ? "disabled" : ""} title="Delete model">
-              Delete
+            <button class="btn btn-icon icon-action btn-danger" data-delete-model="${model.key}" ${state.actionInFlight ? "disabled" : ""} title="Delete ${esc(model.label)}" aria-label="Delete ${esc(model.label)}">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
             </button>
           </div>
         </div>
       </article>`;
-  }).join(""));
 }
 
 function renderProfilesGrid() {
@@ -5809,6 +5840,206 @@ function renderUnsupportedBadge(model) {
   return `<span class="badge badge-unsupported" title="${esc(model.performanceWarning || "No active launcher for this runtime.")}">No launcher</span>`;
 }
 
+// Launcher notes and the performance warning, without the text the "No
+// launcher" badge already shows. Duplicate messages collapse to one.
+function getModelNotes(model) {
+  const notes = [];
+  const seen = new Set();
+  const add = (message, severity) => {
+    const text = String(message || "").trim();
+    if (text && !seen.has(text)) {
+      seen.add(text);
+      notes.push({ message: text, severity: severity === "warning" || severity === "error" ? "warning" : "info" });
+    }
+  };
+  (Array.isArray(model?.launcherWarnings) ? model.launcherWarnings : []).forEach((entry) => add(entry?.message, entry?.severity));
+  if (!model?.unsupported) {
+    add(model?.performanceWarning, "warning");
+  }
+  return notes;
+}
+
+function renderModelNoteBadge(model) {
+  const notes = getModelNotes(model);
+  if (!notes.length) {
+    return "";
+  }
+  const warning = notes.some((note) => note.severity === "warning");
+  return `<span class="badge ${warning ? "badge-note-warning" : "badge-note"}" title="${esc(notes.map((note) => note.message).join("\n\n"))}">${warning ? "Warning" : "Note"}</span>`;
+}
+
+// The launcher a plain Launch uses, plus how many others the settings offer.
+function buildModelLauncherText(model) {
+  const options = getLauncherOptions(model);
+  const current = String(model?.preferredLauncher || model?.launcher || options[0] || "");
+  const others = options.filter((launcher) => launcher !== current).length;
+  return `${launcherLabel(current)}${others ? ` +${others}` : ""}`;
+}
+
+function buildModelLauncherTitle(model) {
+  const options = getLauncherOptions(model);
+  return options.length > 1
+    ? `Launchers: ${options.map((launcher) => launcherLabel(launcher)).join(", ")}`
+    : `Launcher: ${launcherLabel(options[0])}`;
+}
+
+// ---- Favorite models --------------------------------------------------------
+// Kept server-side in dashboard-config.json (POST /api/models/favorite), so a
+// star follows the user to every browser. A favorite has a color; the slot
+// model menus list favorites first, in that color.
+const MODEL_FAVORITE_COLORS = [
+  { color: "#facc15", name: "Yellow" },
+  { color: "#fb923c", name: "Orange" },
+  { color: "#f87171", name: "Red" },
+  { color: "#f472b6", name: "Pink" },
+  { color: "#a78bfa", name: "Violet" },
+  { color: "#60a5fa", name: "Blue" },
+  { color: "#22d3ee", name: "Cyan" },
+  { color: "#34d399", name: "Green" },
+];
+const MODEL_FAVORITE_DEFAULT_COLOR = MODEL_FAVORITE_COLORS[0].color;
+
+function getModelFavorite(model) {
+  const entry = state.modelFavorites?.[model?.key];
+  return entry ? { color: normalizeHexColor(entry.color) || MODEL_FAVORITE_DEFAULT_COLOR } : null;
+}
+
+function renderModelFavoriteControl(model) {
+  const favorite = getModelFavorite(model);
+  const label = favorite
+    ? `Remove ${model.label} from favorites (right-click the star to change its color)`
+    : `Add ${model.label} to favorites`;
+  return `
+    <span class="model-fav${favorite ? " is-favorite" : ""}"${favorite ? ` style="--fav-color:${favorite.color}"` : ""}>
+      <button class="model-fav-star" type="button" data-model-favorite="${esc(model.key)}" title="${esc(label)}" aria-label="${esc(label)}" aria-pressed="${favorite ? "true" : "false"}">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="${favorite ? "currentColor" : "none"}" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true"><path d="m12 2.8 2.85 5.78 6.38.93-4.62 4.5 1.09 6.35L12 17.36l-5.7 3 1.09-6.35-4.62-4.5 6.38-.93z"/></svg>
+      </button>
+      ${favorite ? `<button class="model-fav-swatch" type="button" data-model-favorite-color="${esc(model.key)}" title="Favorite color" aria-label="Choose the favorite color for ${esc(model.label)}"></button>` : ""}
+    </span>`;
+}
+
+async function setModelFavorite(modelKey, favorite, color = "") {
+  const key = String(modelKey || "").trim();
+  if (!key) {
+    return;
+  }
+  const previous = state.modelFavorites || {};
+  const next = { ...previous };
+  if (favorite) {
+    next[key] = { color: normalizeHexColor(color) || normalizeHexColor(previous[key]?.color) || MODEL_FAVORITE_DEFAULT_COLOR };
+  } else {
+    delete next[key];
+  }
+  // Show it at once; the server answer (or a failure) settles it below.
+  state.modelFavorites = next;
+  renderModelFavoriteViews();
+  try {
+    const result = await fetchJson("/api/models/favorite", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ modelKey: key, favorite: Boolean(favorite), color: next[key]?.color || "" }),
+    });
+    state.modelFavorites = result.modelFavorites || next;
+  } catch (error) {
+    state.modelFavorites = previous;
+    toast(error.message || "Unable to save the favorite.", { type: "error" });
+  }
+  renderModelFavoriteViews();
+}
+
+function renderModelFavoriteViews() {
+  renderFilters();
+  renderModels();
+  renderModelsSlotStrip({ force: true });
+}
+
+function openModelFavoritePalette(modelKey, anchor) {
+  closeModelFavoritePalette();
+  const model = getModel(modelKey);
+  if (!model || !anchor) {
+    return;
+  }
+  const current = getModelFavorite(model)?.color || "";
+  const popover = document.createElement("div");
+  popover.className = "model-fav-palette";
+  popover.setAttribute("role", "dialog");
+  popover.setAttribute("aria-label", `Favorite color for ${model.label}`);
+  popover.innerHTML = `
+    <div class="model-fav-palette-swatches">
+      ${MODEL_FAVORITE_COLORS.map((entry) => `
+        <button type="button" class="model-fav-palette-swatch${entry.color === current ? " active" : ""}" style="--fav-color:${entry.color}" data-fav-palette-color="${entry.color}" title="${entry.name}" aria-label="${entry.name}"></button>
+      `).join("")}
+    </div>
+    ${current ? `<button type="button" class="model-fav-palette-remove" data-fav-palette-remove>Remove favorite</button>` : ""}
+  `;
+  popover.addEventListener("click", (event) => {
+    const swatch = event.target.closest("[data-fav-palette-color]");
+    if (swatch) {
+      closeModelFavoritePalette();
+      setModelFavorite(model.key, true, swatch.dataset.favPaletteColor);
+      return;
+    }
+    if (event.target.closest("[data-fav-palette-remove]")) {
+      closeModelFavoritePalette();
+      setModelFavorite(model.key, false);
+    }
+  });
+  document.body.appendChild(popover);
+  const rect = anchor.getBoundingClientRect();
+  const width = popover.offsetWidth;
+  const left = Math.max(8, Math.min(rect.left, window.innerWidth - width - 8));
+  const below = rect.bottom + 6;
+  const top = below + popover.offsetHeight > window.innerHeight - 8 ? Math.max(8, rect.top - popover.offsetHeight - 6) : below;
+  popover.style.left = `${left}px`;
+  popover.style.top = `${top}px`;
+  modelFavoritePalette.element = popover;
+  // Next tick, so the click that opened it does not close it again.
+  window.setTimeout(() => {
+    document.addEventListener("pointerdown", onModelFavoritePaletteOutside, true);
+    document.addEventListener("keydown", onModelFavoritePaletteKey, true);
+  }, 0);
+}
+
+const modelFavoritePalette = { element: null };
+
+function onModelFavoritePaletteOutside(event) {
+  if (modelFavoritePalette.element && !modelFavoritePalette.element.contains(event.target)) {
+    closeModelFavoritePalette();
+  }
+}
+
+function onModelFavoritePaletteKey(event) {
+  if (event.key === "Escape") {
+    closeModelFavoritePalette();
+  }
+}
+
+function closeModelFavoritePalette() {
+  document.removeEventListener("pointerdown", onModelFavoritePaletteOutside, true);
+  document.removeEventListener("keydown", onModelFavoritePaletteKey, true);
+  modelFavoritePalette.element?.remove();
+  modelFavoritePalette.element = null;
+}
+
+// Options for a slot's model menu: favorites first, each in its color and
+// starred (the star is there for menus that ignore option colors, as native
+// macOS popups do), then everything else in the order given.
+function renderSlotModelOptions(models, renderOption) {
+  const list = Array.isArray(models) ? models : [];
+  const favorites = list.filter((model) => getModelFavorite(model));
+  if (!favorites.length) {
+    return list.map((model) => renderOption(model, null)).join("");
+  }
+  const others = list.filter((model) => !getModelFavorite(model));
+  return `
+    <optgroup label="★ Favorites">${favorites.map((model) => renderOption(model, getModelFavorite(model))).join("")}</optgroup>
+    ${others.length ? `<optgroup label="All models">${others.map((model) => renderOption(model, null)).join("")}</optgroup>` : ""}`;
+}
+
+function favoriteOptionAttrs(favorite) {
+  return favorite ? ` class="model-option-favorite" style="color:${favorite.color}"` : "";
+}
+
 function renderModelTable(models, palette) {
   return `
     <div class="table-shell">
@@ -5819,7 +6050,7 @@ function renderModelTable(models, palette) {
               <th><button class="sortable-th ${state.modelSort.field === "name" ? "active" : ""}" type="button" data-model-sort="name">Name ${modelSortArrow("name")}</button></th>
               <th><button class="sortable-th ${state.modelSort.field === "runtime" ? "active" : ""}" type="button" data-model-sort="runtime">Runtime ${modelSortArrow("runtime")}</button></th>
               <th><button class="sortable-th ${state.modelSort.field === "family" ? "active" : ""}" type="button" data-model-sort="family">Family ${modelSortArrow("family")}</button></th>
-              <th><button class="sortable-th ${state.modelSort.field === "variant" ? "active" : ""}" type="button" data-model-sort="variant">Variant ${modelSortArrow("variant")}</button></th>
+              <th><button class="sortable-th ${state.modelSort.field === "variant" ? "active" : ""}" type="button" data-model-sort="variant">Quant ${modelSortArrow("variant")}</button></th>
               <th><button class="sortable-th ${state.modelSort.field === "size" ? "active" : ""}" type="button" data-model-sort="size">Size ${modelSortArrow("size")}</button></th>
               <th>Slots</th>
               <th>Hugging Face</th>
@@ -5835,18 +6066,25 @@ function renderModelTable(models, palette) {
                 <td class="model-name-cell">
                   <div class="table-name-stack">
                     <div class="table-name-row">
+                      ${renderModelFavoriteControl(model)}
                       ${renderTableModelName(model)}
                       ${renderBenchmarkBadge(model)}
                       ${renderIncompleteBadge(model)}
                       ${renderUnsupportedBadge(model)}
+                      ${renderModelNoteBadge(model)}
                       ${model.isNew ? `<span class="badge badge-new" title="Downloaded and not launched yet">New</span>` : ""}
                     </div>
                     <span class="mono">${esc(model.path || model.key)}</span>
                   </div>
                 </td>
-                <td><span class="runtime-pill ${runtimeClass(model.runtime)}">${runtimeLabel(model.runtime)}</span></td>
-                <td>${esc(model.family || "n/a")}</td>
-                <td>${esc(model.quantization || getModelVariant(model) || "default")}</td>
+                <td>
+                  <div class="model-runtime-stack">
+                    <span class="runtime-pill ${runtimeClass(model.runtime)}">${runtimeLabel(model.runtime)}</span>
+                    <span class="model-launcher-label" title="${esc(buildModelLauncherTitle(model))}">${esc(buildModelLauncherText(model))}</span>
+                  </div>
+                </td>
+                <td class="model-family-cell">${esc(deriveModelFamily(model))}</td>
+                <td class="model-quant-cell" title="${esc(modelQuantLabel(model))}">${esc(modelQuantLabel(model) || "n/a")}</td>
                 <td>${esc(model.sizeLabel || "n/a")}</td>
                 <td>${renderModelSlotBadges(model) || "<span class=\"status-text\">idle</span>"}</td>
                 <td>${model.hfUrl ? `<a class="link" href="${safeHref(model.hfUrl)}" target="_blank" rel="noreferrer">Open</a>` : "<span class=\"status-text\">n/a</span>"}</td>
@@ -11223,7 +11461,7 @@ function renderProfileSlotPanel(slot, draft, model, defaults) {
           <span>${esc(slot.label)} Model</span>
           <select data-profile-slot-input="modelKey" data-slot-id="${slot.id}" title="${esc(model ? buildProfileModelTitle(model) : "Select a model to inspect its runtime, size, and variant.")}">
             <option value="">Do not start this slot</option>
-            ${state.models.map((entry) => `<option value="${esc(entry.key)}" ${entry.key === draft.modelKey ? "selected" : ""}>${esc(buildProfileModelOptionLabel(entry))}</option>`).join("")}
+            ${renderSlotModelOptions(state.models, (entry, favorite) => `<option value="${esc(entry.key)}" ${entry.key === draft.modelKey ? "selected" : ""}${favoriteOptionAttrs(favorite)}>${favorite ? "\u2605 " : ""}${esc(buildProfileModelOptionLabel(entry))}</option>`)}
           </select>
         </label>
         <label class="checkbox-label modal-flag">
@@ -11402,9 +11640,10 @@ function supportsReasoningBudget(model) {
 const EMBEDDED_MTP_PATTERNS = [/qwen\s*3\.?8/];
 
 function supportsMtpDraftTuning(model) {
-  // ds4 has its own MTP head and takes the same depth control (--mtp-draft), so
-  // it keeps this field even though it has no other llama.cpp extra.
-  if (String(model?.launcher || "").toLowerCase() === "ds4") {
+  // ds4 and sushi have their own MTP head and take the same depth control
+  // (--mtp-draft), so they keep this field even though they have no other
+  // llama.cpp extra.
+  if (["ds4", "sushi"].includes(String(model?.launcher || "").toLowerCase())) {
     return true;
   }
   if (!supportsGgufExtras(model)) {
@@ -11906,16 +12145,87 @@ function toggleModelSort(field) {
   state.modelSort.direction = nextField === "size" ? "desc" : "asc";
 }
 
-function getFilteredModels() {
-  const filter = state.activeFilter;
-  let filtered = state.models;
-  if (filter === "gguf" || filter === "mlx" || filter === "dflash") {
-    filtered = filtered.filter((model) => model.runtime === filter);
-  } else {
-    const familyMatch = filter.match(/^family:(.+)$/);
-    if (familyMatch) {
-      filtered = filtered.filter((model) => model.family === familyMatch[1]);
+// The chips are built from the models on disk, never from a fixed list, so a
+// runtime, launcher or family that is gone takes its chip with it and a new one
+// gets a chip without a code change. Groups: favorites, runtime, launcher,
+// capability, family. A chip that matches no model, or every model, is dropped:
+// it would filter nothing.
+function buildModelFilterChips(models) {
+  const list = Array.isArray(models) ? models : [];
+  const candidates = [
+    { key: "favorites", group: "favorites", label: "★ Favorites", title: "Starred models", test: (model) => Boolean(getModelFavorite(model)) },
+  ];
+  const runtimes = [...new Set(list.map((model) => String(model.runtime || "").trim()).filter(Boolean))].sort();
+  runtimes.forEach((runtime) => {
+    candidates.push({ key: `runtime:${runtime}`, group: "runtime", label: runtimeLabel(runtime), title: `${runtimeLabel(runtime)} weights`, test: (model) => model.runtime === runtime });
+  });
+  // A launcher named like a runtime (gguf, mlx) is the runtime's default and its
+  // chip would nearly repeat the runtime chip; the others are worth a filter.
+  const launchers = [...new Set(list.flatMap((model) => getLauncherOptions(model)))]
+    .filter((launcher) => !runtimes.includes(launcher))
+    .sort();
+  launchers.forEach((launcher) => {
+    candidates.push({ key: `launcher:${launcher}`, group: "launcher", label: launcherLabel(launcher), title: `Runs on the ${launcherLabel(launcher)} launcher`, test: (model) => getLauncherOptions(model).includes(launcher) });
+  });
+  candidates.push(
+    { key: "cap:vision", group: "capability", label: "Vision", title: "Accepts images", test: (model) => Boolean(model.vision) },
+    { key: "cap:thinking", group: "capability", label: "Thinking", title: "Can think before it answers", test: (model) => launcherSupportsThinking(model, model.preferredLauncher || model.launcher) },
+    { key: "cap:mtp", group: "capability", label: "MTP", title: "Has a multi-token-prediction head (draft depth is tunable)", test: (model) => supportsMtpDraftTuning(model) },
+  );
+  const families = new Map();
+  list.forEach((model) => {
+    const family = deriveModelFamily(model);
+    const familyKey = family.toLowerCase();
+    if (!families.has(familyKey)) {
+      families.set(familyKey, family);
     }
+  });
+  [...families.entries()].sort((left, right) => left[1].localeCompare(right[1])).forEach(([familyKey, family]) => {
+    candidates.push({ key: `family:${familyKey}`, group: "family", label: family, title: `${family} family`, test: (model) => deriveModelFamily(model).toLowerCase() === familyKey });
+  });
+
+  const chips = [{ key: "all", group: "all", label: "All", title: "All models", count: list.length, test: () => true }];
+  candidates.forEach((chip) => {
+    const count = list.filter(chip.test).length;
+    if (count > 0 && (count < list.length || chip.group === "favorites")) {
+      chips.push({ ...chip, count });
+    }
+  });
+  return chips;
+}
+
+// The family comes from the model's own name, not from model.family: that
+// metadata is often a placeholder ("Downloaded model") or too coarse ("Qwen"
+// for both 3.6 and 3.8). An owner prefix taken from a folder-style alias
+// ("mlx-community__...") is dropped first. Then the family is the first word
+// plus a version that is not a parameter count:
+// "Gemma4 26B" -> "Gemma 4", "DeepSeek V4 Flash" -> "DeepSeek V4",
+// "Qwen3.8-27B" -> "Qwen 3.8", "OrcaSAQ 2 27B" -> "OrcaSAQ 2".
+function deriveModelFamily(model) {
+  let name = String(model?.label || "").replace(/[_-]+/g, " ").trim();
+  const ownerAlias = (Array.isArray(model?.aliases) ? model.aliases : [])
+    .map((alias) => String(alias || ""))
+    .find((alias) => alias.includes("__"));
+  if (ownerAlias) {
+    const owner = ownerAlias.split("__")[0].replace(/[_-]+/g, " ").trim().toLowerCase();
+    if (owner && name.toLowerCase().startsWith(`${owner} `)) {
+      name = name.slice(owner.length).trim();
+    }
+  }
+  const match = name.match(/^([A-Za-z][A-Za-z]*)\s*(v?\d+(?:\.\d+)?)?(?![\d.]*[bB]\b)/i);
+  if (!match) {
+    return String(model?.family || "Other").trim() || "Other";
+  }
+  const word = match[1];
+  const version = match[2] ? match[2].replace(/^v/i, "V") : "";
+  return version ? `${word} ${version}` : word;
+}
+
+function getFilteredModels() {
+  const chip = buildModelFilterChips(state.models).find((entry) => entry.key === state.activeFilter);
+  let filtered = state.models;
+  if (chip) {
+    filtered = filtered.filter(chip.test);
   }
 
   const query = String(state.modelSearch || "").trim().toLowerCase();
@@ -11961,10 +12271,10 @@ function modelSortValue(model, field) {
     return String(model.runtime || "");
   }
   if (field === "family") {
-    return String(model.family || "");
+    return deriveModelFamily(model);
   }
   if (field === "variant") {
-    return String(model.quantization || getModelVariant(model) || "");
+    return modelQuantLabel(model);
   }
   return String(model.label || model.key || "");
 }
@@ -12884,6 +13194,11 @@ function runtimeLabel(runtime) {
 function launcherLabel(launcher) {
   if (launcher === "gguf") return "llama.cpp";
   if (launcher === "gguf-tq3") return "llama.cpp TQ3";
+  if (launcher === "gguf-prism") return "llama.cpp Prism";
+  if (launcher === "mlx-dspark") return "MLX DSpark";
+  if (launcher === "mlx-vlm") return "MLX VLM";
+  if (launcher === "ds4") return "DwarfStar ds4";
+  if (launcher === "sushi") return "Sushi";
   if (launcher === "beellama") return "beellama";
   if (launcher === "mlx") return "MLX API proxy";
   if (launcher === "rapid-mlx") return "rapid-mlx";
@@ -12913,6 +13228,25 @@ function getLauncherOptions(model) {
     return [String(model.launcher)];
   }
   return ["gguf"];
+}
+
+// The quantization from the metadata, else read off the name or an alias
+// ("…MLX 6 bit", "…-Q8_0", "…4bpw"). "" when neither says.
+const MODEL_QUANT_PATTERN = /(?:^|[\s_\-(])((?:UD[-_ ])?(?:I?Q\d(?:[_ ](?:[A-Z]{1,3}|\d))*|MXFP4(?:[_ ]MOE)?|NVFP4|BF16|FP16|F16|FP8|\d+[- ]?bit|\d+(?:\.\d+)?bpw))(?=$|[\s_\-.)])/i;
+
+function modelQuantLabel(model) {
+  const explicit = String(model?.quantization || "").trim();
+  if (explicit) {
+    return explicit;
+  }
+  const sources = [model?.label, ...(Array.isArray(model?.aliases) ? model.aliases : [])];
+  for (const source of sources) {
+    const match = String(source || "").match(MODEL_QUANT_PATTERN);
+    if (match) {
+      return match[1].replace(/ /g, "_").replace(/(\d)[-_]?bit$/i, "$1-bit");
+    }
+  }
+  return "";
 }
 
 function getModelVariant(model) {
