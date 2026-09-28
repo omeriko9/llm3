@@ -1288,6 +1288,11 @@ app.use(createDashboardAuth({ token: DASHBOARD_AUTH_TOKEN, exempt: ["/api/pm2/co
 // under its mount only if its pages use relative URLs.
 const { createEmbedProxy, parseEmbedSites, embedPathForWebsite } = require("./embed_proxy");
 const EMBED_PROXIES = parseEmbedSites(process.env.LLM3_EMBED_SITES);
+// Embed site names whose Websites row opens inside llm3 on a normal click
+// (not in a new tab). From .env only, like LLM3_EMBED_SITES.
+const EMBED_OPEN_DEFAULT = new Set(
+  String(process.env.LLM3_EMBED_OPEN_DEFAULT || "").split(",").map((s) => s.trim()).filter(Boolean)
+);
 for (const proxy of EMBED_PROXIES) {
   app.use(createEmbedProxy(proxy));
 }
@@ -1905,6 +1910,7 @@ app.get("/api/websites", async (_req, res) => {
           pm2,
           pm2App: pm2?.name || null,
           embedPath,
+          embedDefault: Boolean(embedPath && EMBED_OPEN_DEFAULT.has(embedPath.split("/")[2])),
           iconPath,
         };
       })

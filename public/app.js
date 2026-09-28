@@ -4250,7 +4250,7 @@ function renderWebsites() {
         </button>`;
     }
     return `
-      <a class="website-card" data-id="${w.id}" data-online="${w.online ? "1" : "0"}" href="${safeHref(url)}" target="_blank" rel="noopener" title="${esc(url)}" draggable="false"
+      <a class="website-card" data-id="${w.id}" data-online="${w.online ? "1" : "0"}"${w.embedDefault ? ` data-embed-default="${esc(w.embedPath)}" data-embed-title="${esc(w.name)}"` : ""} href="${safeHref(url)}" target="_blank" rel="noopener" title="${esc(url)}" draggable="false"
          style="--wb-bg:${color.bg};--wb-border:${color.border};--wb-icon:${color.icon}">
         <div class="website-card-icon">${iconSvg}</div>
         <span class="website-card-name">${shortName}</span>
@@ -4263,6 +4263,15 @@ function renderWebsites() {
   // Embedded cards open the in-page iframe overlay.
   els.websitesGrid.querySelectorAll(".website-card-embed").forEach((card) => {
     card.addEventListener("click", () => openEmbedOverlay(card.dataset.embed, card.dataset.embedTitle));
+  });
+  // Rows listed in LLM3_EMBED_OPEN_DEFAULT open inside llm3. Ctrl/Cmd/middle click
+  // still opens the site in a new tab.
+  els.websitesGrid.querySelectorAll(".website-card[data-embed-default]").forEach((card) => {
+    card.addEventListener("click", (e) => {
+      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.shiftKey || e.button !== 0) return;
+      e.preventDefault();
+      openEmbedOverlay(card.dataset.embedDefault, card.dataset.embedTitle);
+    });
   });
 
   // Add right-click handler to website cards (desktop) and long-press (mobile)
