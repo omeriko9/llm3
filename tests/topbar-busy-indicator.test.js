@@ -307,6 +307,33 @@ test("the slot strip is not rebuilt under the pointer", () => {
   assert.ok(guardIndex > -1 && writeIndex > -1 && guardIndex < writeIndex, "the guard must come before the rebuild");
 });
 
+test("the slot strip repaints under the pointer when an action ends", () => {
+  // A stop ran with the pointer on the strip. The repaint during the action
+  // built every select as disabled, and the hover guard then kept that markup
+  // after the action ended: no model could be started until the user switched
+  // tabs and back.
+  const strip = { dataset: {}, innerHTML: "", matches: () => true };
+  const context = { state: { actionInFlight: true }, els: { modelsSlotStrip: strip } };
+  vm.createContext(context);
+  vm.runInContext(`${liftFunction("renderModelsSlotStrip")}
+    function isSlotRenameInputFocused() { return false; }
+    function isPointerOver(el) { return el.matches(":hover"); }
+    function buildModelsSlotStripItems() { return [{}]; }
+    function renderModelsSlotStripCard() { return state.actionInFlight ? "<select disabled>" : "<select>"; }
+    renderModelsSlotStrip({ force: true });
+    this.during = els.modelsSlotStrip.innerHTML;
+    state.actionInFlight = false;
+    renderModelsSlotStrip();
+    this.after = els.modelsSlotStrip.innerHTML;
+    els.modelsSlotStrip.innerHTML = "untouched";
+    renderModelsSlotStrip();
+    this.idlePoll = els.modelsSlotStrip.innerHTML;`, context);
+  assert.match(context.during, /disabled/);
+  assert.doesNotMatch(context.after, /disabled/);
+  // With nothing changed, the hover guard still holds.
+  assert.equal(context.idlePoll, "untouched");
+});
+
 // --- the lock the indicator must never touch ---------------------------------
 //
 // Inference is not a slot action. A model generating must never disable Launch,

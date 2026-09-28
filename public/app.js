@@ -5164,9 +5164,16 @@ function renderModelsSlotStrip({ force = false } = {}) {
   // vanished on every poll. The live numbers inside the cards are written in
   // place by updateSlotThroughputReadout, so they keep updating while this is
   // paused -- only the card markup waits for the pointer to move away.
-  if (!force && isPointerOver(els.modelsSlotStrip)) {
+  //
+  // The one exception: the markup was built while an action was in flight, so
+  // every select and Stop button in it is disabled. After a stop, the pointer is
+  // still on the strip, so without this the selects stayed dead until the user
+  // left the tab and came back.
+  const busyChanged = els.modelsSlotStrip.dataset.builtBusy !== String(Boolean(state.actionInFlight));
+  if (!force && !busyChanged && isPointerOver(els.modelsSlotStrip)) {
     return;
   }
+  els.modelsSlotStrip.dataset.builtBusy = String(Boolean(state.actionInFlight));
   const items = buildModelsSlotStripItems();
   if (!items.length) {
     els.modelsSlotStrip.innerHTML = "";
