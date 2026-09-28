@@ -250,7 +250,30 @@
 
 .bm-table th,
 .bm-table td {
-  padding: 0.5rem 0.7rem;
+  padding: 0.5rem 0.4rem;
+}
+
+/* Two-line headers ("Score" over "no-think") keep the paired columns as narrow
+   as their numbers, which is most of what lets the table fit the window. */
+.bm-table th {
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+
+.bm-th-label {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.2rem;
+}
+
+.bm-th-sub {
+  display: block;
+  font-size: 0.62rem;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  text-transform: none;
+  color: var(--text-muted);
+  opacity: 0.85;
 }
 
 .bm-sort {
@@ -274,7 +297,7 @@
 }
 
 .bm-model-cell {
-  min-width: 260px;
+  min-width: 0;
 }
 
 .bm-model-name {
@@ -311,14 +334,16 @@
 
 /* ---- Score ---- */
 
+/* Sized by its content: a fixed 132px minimum on each of the two score columns
+   was most of what pushed the table past a 1440px window. */
 .bm-score-cell {
-  min-width: 132px;
+  white-space: nowrap;
 }
 
 .bm-score {
   display: inline-flex;
   align-items: baseline;
-  gap: 0.3rem;
+  gap: 0.25rem;
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius);
@@ -633,12 +658,66 @@
 /* The live row keeps its own treatment on top of the family band. */
 .bm-table tbody tr.active-model td { background: rgba(124, 92, 252, 0.12); }
 
-/* ---- Resizable model column ---- */
+/* ---- Resizable model column ----
+   Always sized: the default comes from applyModelWidth() and a drag stores
+   its own. The name truncates; its title carries the full text. */
 
 .bm-model-sized th:nth-child(2),
 .bm-model-sized td:nth-child(2) {
   width: var(--bm-model-col);
+  min-width: var(--bm-model-col);
   max-width: var(--bm-model-col);
+  overflow: hidden;
+}
+
+/* Default: the model column absorbs the table's spare width (max-width: 0 lets
+   the name truncate instead of widening the table), floored at the default. */
+.bm-model-fill th:nth-child(2),
+.bm-model-fill td:nth-child(2) {
+  width: 100%;
+  min-width: var(--bm-model-col);
+  max-width: 0;
+  overflow: hidden;
+}
+
+.bm-model-sized .bm-model-line,
+.bm-model-fill .bm-model-line {
+  max-width: 100%;
+}
+
+.bm-model-sized .bm-model-badges,
+.bm-model-fill .bm-model-badges {
+  flex-shrink: 0;
+}
+
+.bm-model-fill .bm-model-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- Memory column ---- */
+
+.bm-mem {
+  font-family: var(--mono);
+  font-size: 0.76rem;
+  white-space: nowrap;
+  cursor: help;
+}
+
+.bm-mem small {
+  color: var(--text-muted);
+  font-size: 0.68rem;
+}
+
+.bm-mem-flag {
+  color: var(--amber, #f59e0b);
+  margin-left: 1px;
+}
+
+.bm-effort {
+  color: var(--text-muted);
+  font-size: 0.66rem;
 }
 
 .bm-model-sized .bm-model-name {
@@ -829,7 +908,7 @@ body.bm-resizing {
 
 .bm-scene-sep {
   color: var(--text-muted);
-  margin: 0 0.3rem;
+  margin: 0 0.2rem;
   opacity: 0.5;
 }
 
@@ -1180,6 +1259,144 @@ body.bm-resizing {
   gap: 1.1rem;
 }
 
+.bm-launch-step {
+  display: grid;
+  grid-template-columns: 1.6rem 1fr;
+  gap: 0.6rem;
+  align-items: start;
+}
+
+.bm-step-num {
+  display: inline-grid;
+  place-items: center;
+  width: 1.45rem;
+  height: 1.45rem;
+  border-radius: 50%;
+  border: 1px solid var(--border-light, var(--border));
+  color: var(--text-secondary);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.bm-step-body {
+  min-width: 0;
+}
+
+.bm-test-group {
+  display: grid;
+  grid-template-columns: 5.2rem 1fr;
+  gap: 0.5rem;
+  align-items: start;
+  margin-bottom: 0.45rem;
+}
+
+.bm-test-label {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  padding-top: 0.35rem;
+}
+
+.bm-pill-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+/* A checkbox that reads as a toggle chip: the input stays in the DOM (and in
+   the tab order), the chip shows its state. */
+.bm-pill-check {
+  position: relative;
+  display: inline-flex;
+  cursor: pointer;
+}
+
+.bm-pill-check input {
+  position: absolute;
+  opacity: 0;
+  inset: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+.bm-pill-check span {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.35rem;
+  padding: 0.3rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.bm-pill-check span em {
+  font-style: normal;
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  color: var(--text-muted);
+}
+
+.bm-pill-check:hover span {
+  border-color: var(--border-light, var(--border));
+  color: var(--text);
+}
+
+.bm-pill-check input:checked + span {
+  border-color: var(--accent);
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, var(--bg-elevated));
+  font-weight: 600;
+}
+
+.bm-pill-check input:checked + span::before {
+  content: "✓";
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.bm-pill-check input:focus-visible + span {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.bm-pill-check.is-disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.bm-mode-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.bm-effort-toggle {
+  margin-left: 0.35rem;
+}
+
+.bm-effort-toggle.is-disabled {
+  opacity: 0.4;
+}
+
+.bm-effort-toggle.is-disabled .bm-view-btn {
+  cursor: not-allowed;
+}
+
+.bm-mode-row + .bm-field-note {
+  margin-top: 0.45rem;
+}
+
+.bm-model-count {
+  margin-left: 0.4rem;
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
 .bm-launch-section h4 {
   font-size: 0.72rem;
   text-transform: uppercase;
@@ -1332,25 +1549,37 @@ body.bm-resizing {
 }
 
 .bm-model-list {
-  max-height: 260px;
+  max-height: 240px;
   overflow: auto;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-elevated);
   padding: 0.3rem;
   display: grid;
-  gap: 0.1rem;
+  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  gap: 0.1rem 0.4rem;
 }
 
 .bm-model-row {
   display: grid;
-  grid-template-columns: auto 1fr auto auto;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  column-gap: 0.5rem;
   align-items: center;
-  gap: 0.6rem;
-  padding: 0.35rem 0.5rem;
+  padding: 0.3rem 0.5rem;
   border-radius: calc(var(--radius) - 4px);
-  font-size: 0.8rem;
+  font-size: 0.78rem;
   cursor: pointer;
+}
+
+.bm-model-row input {
+  grid-row: 1 / span 2;
+}
+
+.bm-model-row-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .bm-model-row:hover {
@@ -1394,10 +1623,36 @@ body.bm-resizing {
   border-top: 1px solid var(--border);
 }
 
+.bm-plan {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
 .bm-plan-summary {
   font-size: 0.78rem;
   color: var(--text-secondary);
   font-family: var(--mono);
+}
+
+.bm-plan-stages {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bm-clear-first {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.76rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  cursor: pointer;
 }
 
 .bm-launch-actions,
@@ -1442,6 +1697,21 @@ body.bm-resizing {
   max-height: 340px;
   overflow: auto;
   margin-top: 0.35rem;
+}
+
+/* Laptop widths: the results table is the thing that has to fit, so the tab
+   gives it the side padding back and the denser cells shrink a notch. */
+@media (max-width: 1600px) {
+  .bm-tab {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  .bm-scene-cell,
+  .bm-mem,
+  .bm-size {
+    font-size: 0.7rem;
+  }
 }
 
 @media (max-width: 900px) {
@@ -1564,9 +1834,17 @@ body.bm-resizing {
   }
 
   .bm-table.bm-model-sized th[data-bm-col="model"],
-  .bm-table.bm-model-sized .bm-model-cell {
+  .bm-table.bm-model-sized .bm-model-cell,
+  .bm-table.bm-model-fill th[data-bm-col="model"],
+  .bm-table.bm-model-fill .bm-model-cell {
     width: 9rem;
+    min-width: 0;
     max-width: 9rem;
+  }
+
+  .bm-table.bm-model-sized .bm-model-name,
+  .bm-table.bm-model-fill .bm-model-name {
+    white-space: normal;
   }
 
   /* One ellipsis at 150px turns Qwen3.8-27B-UD-Q4_K_XL and

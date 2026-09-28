@@ -22,6 +22,8 @@ from typing import Any, Iterable
 from urllib.parse import urlsplit
 import select
 
+from host_memory import HostMemorySampler
+
 
 BENCHMARK_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = BENCHMARK_ROOT.parent
@@ -101,6 +103,13 @@ DEFAULT_SLOT_COUNT = 3
 # equally clever and several printed byte-identical scores. 200 halves it to
 # +/-6.4, for about 4 minutes per dense model and one per MoE.
 DEFAULT_QUALITY_LIMIT = 200
+# Thinking effort as the Benchmarks tab offers it. Mirrors EFFORT_* in
+# src/voxel-test.js: llama.cpp has no effort knob, only a reasoning token
+# budget, so the level picks the budget; mlx-dspark takes --reasoning-effort,
+# and Qwen3.8's template rejects "high", so high is sent as xhigh.
+THINKING_EFFORTS = ("low", "medium", "high")
+EFFORT_REASONING_BUDGET = {"low": 2048, "medium": 8192, "high": 16384}
+EFFORT_LAUNCHER_VALUE = {"low": "low", "medium": "medium", "high": "xhigh"}
 STOP_GRACE_SECONDS = 30
 LISTENER_KILL_GRACE_SECONDS = 10
 MAX_AGENTIC_ROUNDS = 6
@@ -507,6 +516,11 @@ class ModelSpec:
     # "think-tiny", "think-gbnf". Affects launch flags, throughput grammar,
     # and the results directory key.
     variant: str = ""
+    # False for a model llm3 benchmarks whose launcher this runner cannot start
+    # itself (see RUNNER_LAUNCHERS). It stays in the inventory -- scenes load
+    # models through the server and cover it -- but gets no measured row.
+    measurable: bool = True
+    unmeasurable_reason: str = ""
 
     def canonical_id(self) -> str:
         resolved = normalize_ref(self.launch_ref)
@@ -558,12 +572,21 @@ class ModelSpec:
         )
 
     def supports_thinking_toggle(self) -> bool:
+        # mlx-dspark switches thinking at launch through --reasoning-effort
+        # ("off" is --no-thinking), so it gets labelled no-think/think rows too.
+        # Without the switch its runs thought or not by whatever effort the
+        # slot had saved, under a row that did not say which.
+        if self.launcher == "mlx-dspark":
+            return True
         return self.runtime == "gguf" and self.launcher != "gguf-tq3"
 
     def thinking_variants(self, *, include_grammar: bool = True) -> list[str]:
         if not self.supports_thinking_toggle():
             return []
         variants = ["no-think", "think"]
+        if self.launcher == "mlx-dspark":
+            # The grammar variants are llama.cpp features.
+            return variants
         if include_grammar and self.supports_tiny_grammar():
             variants.append("think-tiny")
         if include_grammar and self.supports_structured_gbnf():
@@ -577,7 +600,9 @@ class ModelSpec:
         parallel: int,
         thinking: bool = False,
         enable_tiny_grammar: bool = False,
+        reasoning_effort: str | None = None,
     ) -> list[str]:
+        effort = reasoning_effort if thinking and reasoning_effort in THINKING_EFFORTS else None
         if self.launcher in {"gguf", "gguf-tq3", "beellama"}:
             use_tiny_grammar = enable_tiny_grammar and self.supports_tiny_grammar()
             launcher_path = {
@@ -596,6 +621,8 @@ class ModelSpec:
                 str(parallel),
                 "--thinking" if thinking and self.launcher != "gguf-tq3" else "--no-thinking",
             ]
+            if effort and self.launcher != "gguf-tq3":
+                cmd.extend(["--reasoning-budget", str(EFFORT_REASONING_BUDGET[effort])])
             if use_tiny_grammar:
                 cmd.append("--enable-tiny-grammar")
             else:
@@ -618,7 +645,7 @@ class ModelSpec:
                 str(parallel),
             ]
         if self.launcher == "mlx-dspark":
-            return [
+            cmd = [
                 str(MLX_DSPARK_LAUNCHER),
                 "--slot",
                 slot.name,
@@ -629,6 +656,11 @@ class ModelSpec:
                 "--parallel",
                 str(parallel),
             ]
+            if not thinking:
+                cmd.extend(["--reasoning-effort", "off"])
+            elif effort:
+                cmd.extend(["--reasoning-effort", EFFORT_LAUNCHER_VALUE[effort]])
+            return cmd
         if self.launcher == "rapid-mlx":
             return [
                 str(RAPID_MLX_LAUNCHER),
@@ -701,6 +733,11 @@ class RunnerConfig:
     simple_thinking_variants: bool = False
     thinking_variants: bool = False
     include_apple_tq3_cpu: bool = False
+    # low/medium/high, applied to thinking launches only (EFFORT_* below).
+    reasoning_effort: str | None = None
+    # Drop models without a thinking switch: set on the second pass of a
+    # mode-by-mode launch, where they already produced their one row.
+    toggleable_only: bool = False
 
 
 @dataclasses.dataclass
@@ -1409,9 +1446,13 @@ def discover_models() -> list[ModelSpec]:
             "mtplx",
         )
 
+    return assign_result_dir_names(list(discovered.values()))
+
+
+def assign_result_dir_names(discovered: list[ModelSpec]) -> list[ModelSpec]:
     runtime_rank = {"gguf": 0, "mlx": 1, "mtplx": 2, "dflash": 3}
     models = sorted(
-        discovered.values(),
+        discovered,
         key=lambda model: (
             runtime_rank.get(model.runtime, 99),
             0 if model.discovery_source == "launcher" else 1,
@@ -1443,6 +1484,103 @@ def discover_models() -> list[ModelSpec]:
     return models
 
 
+# Launchers this runner starts itself, through their bin/ scripts. llm3 also
+# has launchers that only its server knows how to start (ds4, sushi, mlx-vlm,
+# gguf-prism); a model on one of those is listed but not measured here.
+RUNNER_LAUNCHERS = {"gguf", "gguf-tq3", "beellama", "mlx", "mlx-dspark", "rapid-mlx", "mtplx", "dflash"}
+
+
+def load_server_models(path: str | None) -> list[dict[str, Any]] | None:
+    """The server's /api/models list, written by the dashboard. None when absent
+    or unreadable, which is the only case the disk scan is used."""
+    if not path:
+        return None
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(payload, dict):
+        payload = payload.get("models")
+    return payload if isinstance(payload, list) else None
+
+
+def models_from_server(server_models: list[dict[str, Any]], disk_models: list[ModelSpec]) -> list[ModelSpec]:
+    """llm3's own model list decides WHICH models and WHICH launchers are
+    benchmarked: each model's benchmarkLaunchers, nothing that is
+    benchmarkExcluded (those still run the scenes). The disk scan contributed sidecars (a ds4 PLE file),
+    MTP draft heads and launchers the server does not offer for a model.
+
+    A model the disk scan found on the same launcher keeps the scan's label,
+    because stored results and scene cells are keyed by it; anything else
+    takes the server's."""
+    disk_by_key: dict[str, ModelSpec] = {}
+    for spec in disk_models:
+        for ref in (spec.key, spec.path, spec.launch_ref):
+            if ref:
+                disk_by_key.setdefault(normalize_ref(ref), spec)
+    specs: list[ModelSpec] = []
+    for entry in server_models:
+        if not isinstance(entry, dict) or entry.get("unsupported"):
+            continue
+        # benchmarkExcluded keeps a model out of the MEASURED metrics only
+        # (Mage VL: an mlx-vlm-only architecture). It still loads through the
+        # server, so it runs every scene on its first launcher.
+        excluded = bool(entry.get("benchmarkExcluded"))
+        key = str(entry.get("key") or "").strip()
+        model_path = str(entry.get("path") or key).strip()
+        if not key:
+            continue
+        disk = disk_by_key.get(normalize_ref(key)) or disk_by_key.get(normalize_ref(model_path))
+        launchers = [str(item) for item in (entry.get("benchmarkLaunchers") or []) if str(item).strip()]
+        if excluded or not launchers:
+            launchers = [str(item) for item in (entry.get("launchers") or []) if str(item).strip()][:1]
+        for launcher in launchers:
+            # The scan's label only carries history when the scan had this
+            # model on this launcher; a ds4 pack it listed as a GGUF file
+            # takes the server's name.
+            if disk is not None and disk.launcher == launcher:
+                base = dataclasses.replace(disk, variant="", result_dir_name="")
+            elif disk is not None:
+                base = dataclasses.replace(
+                    disk,
+                    launcher=launcher,
+                    label=str(entry.get("label") or disk.label),
+                    variant="",
+                    result_dir_name="",
+                )
+            else:
+                base = ModelSpec(
+                    runtime=str(entry.get("runtime") or "gguf"),
+                    launcher=launcher,
+                    key=key,
+                    label=str(entry.get("label") or Path(model_path).stem),
+                    family=str(entry.get("family") or ""),
+                    path=model_path,
+                    launch_ref=key if not key.startswith("/") else model_path,
+                    hf_url=str(entry.get("hfUrl") or ""),
+                    size_label=str(entry.get("sizeLabel") or ""),
+                    size_bytes=entry.get("sizeBytes") if isinstance(entry.get("sizeBytes"), int) else None,
+                    aliases=[str(alias) for alias in (entry.get("aliases") or [])],
+                    discovery_source="server",
+                )
+            # The server's key is what its start API accepts, and scenes launch
+            # through that API.
+            base.key = key
+            if excluded:
+                base.measurable = False
+                base.unmeasurable_reason = (
+                    "llm3 excludes this model from measured benchmarks; it gets scenes only"
+                )
+            elif launcher not in RUNNER_LAUNCHERS:
+                base.measurable = False
+                base.unmeasurable_reason = (
+                    f"the {launcher} launcher is started only by llm3's server; "
+                    "this runner cannot load it, so it gets scenes but no measured row"
+                )
+            specs.append(base)
+    return assign_result_dir_names(specs)
+
+
 def model_inventory_json(models: list[ModelSpec]) -> list[dict[str, Any]]:
     return [
         {
@@ -1459,6 +1597,8 @@ def model_inventory_json(models: list[ModelSpec]) -> list[dict[str, Any]]:
             "aliases": model.aliases,
             "discoverySource": model.discovery_source,
             "resultDirName": model.result_dir_name,
+            "measurable": model.measurable,
+            "unmeasurableReason": model.unmeasurable_reason,
         }
         for model in models
     ]
@@ -1509,6 +1649,8 @@ def resolve_models(models: list[ModelSpec], config: RunnerConfig) -> list[ModelS
         ]
     if not config.include_apple_tq3_cpu:
         filtered = [model for model in filtered if not is_apple_tq3_cpu_only(model)]
+    if getattr(config, "toggleable_only", False):
+        filtered = [model for model in filtered if model.supports_thinking_toggle()]
     if config.limit is not None:
         filtered = filtered[: config.limit]
     # A single-variant run still has to be labelled. Without this, "think only"
@@ -1605,6 +1747,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Include Apple Silicon TQ3 CPU fallback rows; excluded by default because the fork has no working Metal offload locally.",
     )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=THINKING_EFFORTS,
+        help="Thinking level for thinking launches: a reasoning budget on GGUF, --reasoning-effort on mlx-dspark (high = xhigh).",
+    )
+    parser.add_argument(
+        "--toggleable-only",
+        action="store_true",
+        help="Skip models that have no thinking switch (they give the same row in every mode).",
+    )
+    parser.add_argument(
+        "--server-models",
+        help="JSON file with llm3's /api/models list; it decides which models and launchers are benchmarked. Without it the runner scans the disk itself.",
+    )
     parser.add_argument("--limit", type=int, help="Only benchmark the first N selected models.")
     parser.add_argument("--discover-json", action="store_true", help="Print discovered inventory as JSON and exit.")
     return parser.parse_args(argv)
@@ -1657,6 +1813,8 @@ def build_config(args: argparse.Namespace) -> RunnerConfig:
         enable_tiny_grammar=args.enable_tiny_grammar,
         simple_thinking_variants=bool(getattr(args, "simple_thinking_variants", False)) and not bool(getattr(args, "thinking_variants", False)),
         thinking_variants=bool(getattr(args, "thinking_variants", False)),
+        reasoning_effort=getattr(args, "reasoning_effort", None),
+        toggleable_only=bool(getattr(args, "toggleable_only", False)),
         include_apple_tq3_cpu=args.include_apple_tq3_cpu
         or os.environ.get("LLM3_INCLUDE_APPLE_TQ3_CPU_BENCHMARK", "").strip().lower() in {"1", "true", "yes"},
         limit=args.limit,
@@ -2620,6 +2778,9 @@ class BenchmarkRunner:
         # the one quality task whose result depends on thinking, so it is
         # evaluated twice per model+launcher instead of once.
         self._translation_cache: dict[tuple[str, str, str], dict[str, Any]] = {}
+        # Host memory for the row in progress (host_memory.py); started once
+        # the slot is empty, stopped and written into benchmark.json by run().
+        self._memory_sampler: HostMemorySampler | None = None
         self._install_signal_handlers()
 
     def _install_signal_handlers(self) -> None:
@@ -2724,6 +2885,10 @@ class BenchmarkRunner:
             return
 
     def cleanup_slot(self, slot: Slot, log_path: Path | None = None) -> None:
+        # A stopped slot is not the model's footprint; readings resume once a
+        # relaunch answers (launch_model_server).
+        if self._memory_sampler is not None:
+            self._memory_sampler.pause()
         for runtime in ("gguf", "gguf-tq3", "beellama", "mlx", "rapid-mlx", "mtplx", "dflash"):
             started_at = time.monotonic()
             try:
@@ -2765,6 +2930,7 @@ class BenchmarkRunner:
             self.config.parallel,
             thinking,
             enable_tiny_grammar,
+            reasoning_effort=getattr(self.config, "reasoning_effort", None),
         )
         launch_started = time.monotonic()
         stale_pids: set[int] = set()
@@ -2793,6 +2959,8 @@ class BenchmarkRunner:
             extra_headers=runtime_request_headers(model.launcher),
         )
         load_elapsed = time.monotonic() - launch_started
+        if self._memory_sampler is not None:
+            self._memory_sampler.resume()
         return choose_model_id(health_payload, model.key), load_elapsed
 
     def effective_thinking(self, model: ModelSpec) -> bool:
@@ -2833,6 +3001,14 @@ class BenchmarkRunner:
                     "simpleThinkingVariantsRequested": self.config.simple_thinking_variants,
                     "thinkingVariantsRequested": self.config.thinking_variants,
                     "thinkingApplied": effective_thinking,
+                    # The level a thinking row ran at, and what it became on
+                    # this launcher (a GGUF budget or an MLX effort).
+                    "reasoningEffort": getattr(self.config, "reasoning_effort", None) if effective_thinking else None,
+                    "reasoningBudget": (
+                        EFFORT_REASONING_BUDGET.get(getattr(self.config, "reasoning_effort", None) or "")
+                        if effective_thinking and model.launcher in {"gguf", "beellama"}
+                        else None
+                    ),
                     "tinyGrammarApplied": effective_tiny_grammar,
                     "structuredGbnfApplied": effective_structured_gbnf,
                     "variant": model.variant,
@@ -2908,7 +3084,10 @@ class BenchmarkRunner:
             self.current_model = model
             self.current_slot = slot
             try:
-                self.run_one_model(model, slot, result_dir, benchmark, benchmark_path)
+                try:
+                    self.run_one_model(model, slot, result_dir, benchmark, benchmark_path)
+                finally:
+                    self.record_memory(benchmark, benchmark_path)
             except InterruptRequested as exc:
                 benchmark["timestamps"]["stopped"] = iso_now()
                 self.save_benchmark(benchmark_path, benchmark)
@@ -2936,6 +3115,19 @@ class BenchmarkRunner:
         if not self.config.dry_run:
             self.write_summary_safely(inventory_models)
         return exit_code
+
+    def record_memory(self, benchmark: dict[str, Any], benchmark_path: Path) -> None:
+        sampler = self._memory_sampler
+        self._memory_sampler = None
+        if sampler is None:
+            return
+        try:
+            summary = sampler.stop()
+        except Exception:  # noqa: BLE001 - memory is a side measurement
+            summary = None
+        if summary:
+            benchmark["memory"] = summary
+            self.save_benchmark(benchmark_path, benchmark)
 
     def write_summary_safely(self, models: list[ModelSpec]) -> None:
         """Never let a summary-rendering failure destroy a finished run."""
@@ -2967,6 +3159,9 @@ class BenchmarkRunner:
                 pass
 
         self.cleanup_slot(slot, load_log)
+        # The slot is empty now, so the first reading is the baseline.
+        self._memory_sampler = HostMemorySampler(slot.name)
+        self._memory_sampler.start()
 
         try:
             model_id, load_elapsed = self.launch_model_server(
@@ -3002,6 +3197,8 @@ class BenchmarkRunner:
             "seconds": round(load_elapsed, 3),
             "status": "pass",
         }
+        if self._memory_sampler is not None:
+            self._memory_sampler.ready()
         benchmark["engine"] = probe_engine(slot.public_port)
         benchmark["timestamps"]["loadComplete"] = iso_now()
         self.save_benchmark(benchmark_path, benchmark)
@@ -4264,12 +4461,25 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     config = build_config(args)
     slots = discover_slots(config.slot_count, config.selected_slot)
-    models = discover_models()
+    disk_models = discover_models()
+    server_models = load_server_models(getattr(args, "server_models", None))
+    if server_models is not None:
+        models = models_from_server(server_models, disk_models)
+    else:
+        if getattr(args, "server_models", None):
+            print(f"warning: cannot read {args.server_models}; falling back to the disk scan", file=sys.stderr)
+        models = disk_models
     selected = resolve_models(models, config)
 
     if args.discover_json:
         print(json.dumps(model_inventory_json(selected), indent=2, ensure_ascii=False))
         return 0
+
+    # Listed for the dashboard (scenes run them through the server), not run.
+    for model in selected:
+        if not model.measurable:
+            print(f"Skipping {model.label} [{model.launcher}]: {model.unmeasurable_reason}.")
+    selected = [model for model in selected if model.measurable]
 
     print(f"Discovered {len(models)} model(s); selected {len(selected)}.")
     if config.dry_run:

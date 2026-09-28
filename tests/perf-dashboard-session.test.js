@@ -94,7 +94,7 @@ async function killAndWait(pid) {
 async function quiesceSession(session) {
   if (!session) return;
   session.sceneCancelled = true;
-  session.sceneQueue.length = 0;
+  session.queue.length = 0;
   const deadline = Date.now() + 15000;
   while (session.scenePhase && Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -296,7 +296,8 @@ test("a scene interrupted by a restart is picked up again, not dropped", async (
   // A session whose runner already finished, with one scene in flight and one
   // still queued -- the shape left behind when the dashboard restarts during
   // the scene phase. The in-flight scene is only in scenePhase: the queue no
-  // longer holds it, because runSceneQueueForSession shifts before running.
+  // longer holds it, because advanceSession shifts before running. Files
+  // written before stages existed name the queue sceneQueue; this one does.
   const routes = loadRoutes(root);
   const sessionDir = path.dirname(routes._test.sessionFilePath);
   await fs.mkdir(sessionDir, { recursive: true });
@@ -323,7 +324,7 @@ test("a scene interrupted by a restart is picked up again, not dropped", async (
   // waiting at the front. Both mean it was not dropped.
   const pending = [
     ...(adopted.scenePhase ? [adopted.scenePhase.test] : []),
-    ...adopted.sceneQueue.map((job) => job.test),
+    ...adopted.queue.map((job) => job.test),
   ];
   assert.deepEqual(pending, ["pixel", "voxel"], "the interrupted scene is retried before the queued one");
 });

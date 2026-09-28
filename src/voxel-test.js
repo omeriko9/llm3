@@ -16,6 +16,7 @@ const path = require("path");
 const os = require("os");
 const http = require("http");
 const { postSseLong } = require("./voxel-stream");
+const { createMemorySampler } = require("./host-memory");
 
 const repoRoot = path.resolve(__dirname, "..");
 const DEFAULT_OUTPUT_ROOT = path.join(repoRoot, "benchmarks", "voxel-results");
@@ -38,10 +39,30 @@ const GENERATION_TIMEOUT_MS = 3_400_000;
 // needed: the whole field lands under 10k. The old 65536 was unreachable anyway
 // -- at 15 tok/s it needs 70 minutes and the proxy cuts the socket at 60.
 const MAX_TOKENS = 32_768;
+// Thinking effort, as the Benchmarks tab offers it: off, or on at low, medium
+// or high. No runtime here has one knob that means that, so each level is
+// translated for the two kinds of launcher that can act on it:
+//  - llama.cpp (GGUF) has no effort setting, only a reasoning token budget,
+//    after which it closes the think block. The level picks the budget.
+//  - the MLX launchers take --reasoning-effort, which goes to the chat
+//    template. Qwen3.8's template rejects "high" outright ("Supported types are
+//    xhigh (default), medium, and low", see DSPARK_REASONING_EFFORTS in
+//    server.js), so "high" is sent as xhigh.
+// Each launcher ignores the field it does not understand, so both are sent.
+const THINKING_EFFORTS = ["low", "medium", "high"];
+const DEFAULT_THINKING_EFFORT = "medium";
 // Thinking is worth having on a design task, but it has to terminate. Qwen3.5-4B
 // completes this entire test -- reasoning and finished HTML -- in ~6000 tokens,
-// so 8192 for the reasoning phase alone is generous rather than tight.
-const SCENE_REASONING_BUDGET = 8_192;
+// so 8192 for the reasoning phase alone is generous rather than tight. That is
+// "medium"; "high" still leaves half of MAX_TOKENS for the HTML.
+const EFFORT_REASONING_BUDGET = Object.freeze({ low: 2_048, medium: 8_192, high: 16_384 });
+const EFFORT_LAUNCHER_VALUE = Object.freeze({ low: "low", medium: "medium", high: "xhigh" });
+const SCENE_REASONING_BUDGET = EFFORT_REASONING_BUDGET[DEFAULT_THINKING_EFFORT];
+
+function normalizeThinkingEffort(value) {
+  const raw = String(value ?? "").trim().toLowerCase();
+  return THINKING_EFFORTS.includes(raw) ? raw : null;
+}
 // Scene runs are a benchmark, so every model has to generate under the same
 // sampling. They used to inherit whatever the active profile held for the slot,
 // which meant a model measured under one profile was compared against a model
@@ -310,6 +331,7 @@ function publicState(testId = DEFAULT_TEST) {
     endedAt: session.endedAt,
     slotId: session.slotId,
     thinking: typeof session.thinking === "boolean" ? session.thinking : null,
+    effort: session.effort || null,
     error: session.error || "",
     cancelRequested: Boolean(session.cancelRequested),
     models: session.models.map((entry) => ({
@@ -330,18 +352,24 @@ function publicState(testId = DEFAULT_TEST) {
       answerTokens: entry.answerTokens || 0,
       streamLog: entry.streamLog ? path.basename(entry.streamLog) : "",
       recovered: Boolean(entry.recovered),
+      effort: entry.effort || null,
+      memory: entry.memory || null,
       error: entry.error || "",
     })),
   };
 }
 
-async function persist(testId) {
+async function writeStateFile(testId) {
   try {
     await ensureOutputRoot();
     await fs.writeFile(stateFileFor(testId), JSON.stringify(publicState(testId), null, 2) + "\n", "utf8");
   } catch (_error) {
     // Best effort: losing the mirror must not abort a long run.
   }
+}
+
+async function persist(testId) {
+  await writeStateFile(testId);
   await foldIntoSceneIndex(testId);
 }
 
@@ -381,6 +409,9 @@ function sceneEntrySnapshot(entry, thinking) {
     // What the scene was generated with, so an old row stays interpretable
     // after the defaults change.
     sampling: entry.sampling || null,
+    effort: entry.effort || null,
+    // Host memory while this model generated the scene; see host-memory.js.
+    memory: entry.memory || null,
     error: entry.error || "",
     runtimeErrors: [],
   };
@@ -483,6 +514,70 @@ async function readSceneIndex() {
   return loadSceneIndexFile();
 }
 
+// Index entries that match every given filter; an empty filter matches all.
+function matchingSceneEntries(index, { tests = [], models = [], buckets = [] } = {}) {
+  const testSet = new Set(tests.map(String));
+  const modelSet = new Set(models.map(String));
+  const bucketSet = new Set(buckets.map(String));
+  const hits = [];
+  for (const testId of Object.keys(index || {})) {
+    if (testSet.size && !testSet.has(testId)) continue;
+    const perTest = index[testId];
+    if (!perTest || typeof perTest !== "object") continue;
+    for (const label of Object.keys(perTest)) {
+      if (modelSet.size && !modelSet.has(label)) continue;
+      for (const bucket of Object.keys(perTest[label] || {})) {
+        if (bucketSet.size && !bucketSet.has(bucket)) continue;
+        hits.push({ test: testId, model: label, bucket });
+      }
+    }
+  }
+  return hits;
+}
+
+async function countSceneResults(filter) {
+  return matchingSceneEntries(await readSceneIndex(), filter).length;
+}
+
+// Removes scene results from the index -- what the table shows -- and leaves
+// the generated pages on disk. The finished sessions are pruned too: the index
+// is rebuilt from them on the first read after a restart (backfillSceneIndex),
+// and a rerun of another model persists the whole session again, so an entry
+// left in a session would come back.
+async function clearSceneResults(filter = {}) {
+  await backfillSceneIndex();
+  let removed = 0;
+  await mutateSceneIndex((index) => {
+    const hits = matchingSceneEntries(index, filter);
+    for (const hit of hits) {
+      delete index[hit.test][hit.model][hit.bucket];
+      if (!Object.keys(index[hit.test][hit.model]).length) {
+        delete index[hit.test][hit.model];
+      }
+    }
+    removed = hits.length;
+    return hits.length > 0;
+  });
+  const tests = (filter.tests && filter.tests.length ? filter.tests : Object.keys(TESTS)).map(String);
+  const models = new Set((filter.models || []).map(String));
+  const buckets = new Set((filter.buckets || []).map(String));
+  for (const testId of tests) {
+    const session = sessions[testId];
+    if (!TESTS[testId] || !session || session.running || !Array.isArray(session.models)) {
+      continue;
+    }
+    if (buckets.size && !buckets.has(sceneBucket(session.thinking === true))) {
+      continue;
+    }
+    const kept = session.models.filter((entry) => models.size && !models.has(entry.model));
+    if (kept.length !== session.models.length) {
+      session.models = kept;
+      await writeStateFile(testId);
+    }
+  }
+  return removed;
+}
+
 // The scene pages are model-written and a fair number of them throw once they
 // actually run. The preview iframes already report that back through the error
 // shim; recording it here turns a transient console message into a signal the
@@ -548,6 +643,7 @@ function restoreOne(testId) {
       skipped: Array.isArray(parsed.skipped) ? parsed.skipped : [],
       // Restored so a reloaded run still reports which mode produced it.
       thinking: typeof parsed.thinking === "boolean" ? parsed.thinking : null,
+      effort: normalizeThinkingEffort(parsed.effort),
       startedAt: parsed.startedAt || null,
       endedAt: parsed.endedAt || null,
       slotId: parsed.slotId || "",
@@ -743,11 +839,26 @@ const dashboardConfigPath = process.env.LLM3_STATE_DIR
 // thinking OFF here, so every reasoning-first model was generating its scene
 // with its reasoning phase suppressed, and the result said more about the flag
 // than about the model.
-async function resolveSlotParams(slotId, thinkingOverride) {
+// `effort` is low/medium/high (THINKING_EFFORTS). An explicit thinking-on run
+// with no level gets the default one, so a "think" scene means the same thing on
+// every launcher; an explicit thinking-off run sends reasoningEffort "off",
+// without which an MLX launcher kept whatever effort the slot had saved and a
+// "no-think" scene could still think. The chosen level is returned as
+// `thinkingEffort`, which startModelInSlot keeps out of the launch request.
+async function resolveSlotParams(slotId, thinkingOverride, effort) {
   const applyOverride = (params) => {
     const next = typeof thinkingOverride === "boolean"
       ? { ...params, thinking: thinkingOverride }
       : { ...params };
+    const level = normalizeThinkingEffort(effort) || (thinkingOverride === true ? DEFAULT_THINKING_EFFORT : null);
+    next.thinkingEffort = null;
+    if (next.thinking === true && level) {
+      next.reasoningBudget = EFFORT_REASONING_BUDGET[level];
+      next.reasoningEffort = EFFORT_LAUNCHER_VALUE[level];
+      next.thinkingEffort = level;
+    } else if (thinkingOverride === false) {
+      next.reasoningEffort = "off";
+    }
     // Slots default to an unrestricted reasoning budget (-1), which is fine for
     // chat but not for a scene test. Observed on Qwen3.8-27B: the model spends
     // its whole budget re-deciding the canvas resolution in coherent prose
@@ -795,10 +906,11 @@ async function resolveSlotParams(slotId, thinkingOverride) {
 // llm3 serialises slot actions and 409s while one is in flight; a stop or a
 // previous start may still be settling when the next model comes round.
 async function startModelInSlot(slotId, modelKey, params) {
+  const { thinkingEffort: _effort, ...launch } = params;
   const deadline = nowMs() + 120_000;
   let last = null;
   while (nowMs() < deadline) {
-    last = await postJson(`${LOCAL_BASE}/api/start`, { ...params, slotId, modelKey }, 300_000);
+    last = await postJson(`${LOCAL_BASE}/api/start`, { ...launch, slotId, modelKey }, 300_000);
     if (last.ok) {
       return;
     }
@@ -874,7 +986,22 @@ async function describeOtherLoadedSlots(slotId) {
   }
 }
 
+// Host memory is sampled around the whole of one model's turn: from before the
+// load request (the previous model is unloaded inside it, so the lowest reading
+// before ready is the empty-slot baseline) to the end of generation.
 async function runOne(entry, slotId, publicBase, slotParams, test) {
+  const sampler = createMemorySampler({ slotId });
+  entry.memory = null;
+  await sampler.start();
+  try {
+    await runOneMeasured(entry, slotId, publicBase, slotParams, test, sampler);
+  } finally {
+    entry.memory = await sampler.stop().catch(() => null);
+    await persist(test.id);
+  }
+}
+
+async function runOneMeasured(entry, slotId, publicBase, slotParams, test, sampler) {
   entry.status = "running";
   entry.startedAt = nowMs();
   entry.elapsedMs = 0;
@@ -889,7 +1016,9 @@ async function runOne(entry, slotId, publicBase, slotParams, test) {
     repetitionPenalty: slotParams.repetitionPenalty,
     thinking: Boolean(slotParams.thinking),
     reasoningBudget: slotParams.reasoningBudget ?? null,
+    reasoningEffort: slotParams.reasoningEffort ?? null,
   };
+  entry.effort = slotParams.thinking === true ? slotParams.thinkingEffort || null : null;
   await persist(test.id);
 
   const fileBase = `${slugify(entry.model)}-${stamp(entry.startedAt)}-${test.id}`;
@@ -897,6 +1026,7 @@ async function runOne(entry, slotId, publicBase, slotParams, test) {
 
   await startModelInSlot(slotId, entry.modelKey, slotParams);
   const modelId = await waitForSlotReady(publicBase);
+  await sampler.ready();
 
   const session = sessions[test.id];
 
@@ -1029,9 +1159,9 @@ async function runOne(entry, slotId, publicBase, slotParams, test) {
   await persist(test.id);
 }
 
-async function runAll(slotId, publicBase, test, thinking) {
+async function runAll(slotId, publicBase, test, thinking, effort) {
   const session = sessions[test.id];
-  const slotParams = await resolveSlotParams(slotId, thinking);
+  const slotParams = await resolveSlotParams(slotId, thinking, effort);
   let anySucceeded = false;
   for (const entry of session.models) {
     if (session.cancelRequested) {
@@ -1079,7 +1209,7 @@ async function runAll(slotId, publicBase, test, thinking) {
   await persist(test.id);
 }
 
-async function startVoxelTest({ slotId, models, publicBase, skipped = [], test: testId = DEFAULT_TEST, thinking }) {
+async function startVoxelTest({ slotId, models, publicBase, skipped = [], test: testId = DEFAULT_TEST, thinking, effort }) {
   const test = resolveTest(testId);
   // Every test drives the same slot, so only one may be in flight.
   for (const id of Object.keys(TESTS)) {
@@ -1111,6 +1241,7 @@ async function startVoxelTest({ slotId, models, publicBase, skipped = [], test: 
     cancelRequested: false,
     skipped,
     thinking: typeof thinking === "boolean" ? thinking : null,
+    effort: thinking === true ? normalizeThinkingEffort(effort) || DEFAULT_THINKING_EFFORT : null,
     models: list.map((m) => ({
       model: String(m.label || m.modelKey),
       modelKey: String(m.modelKey),
@@ -1127,7 +1258,7 @@ async function startVoxelTest({ slotId, models, publicBase, skipped = [], test: 
   await persist(test.id);
   // Deliberately not awaited: the HTTP response returns immediately and the
   // run continues in the background, which is what lets it survive a refresh.
-  runAll(slotId, publicBase, test, thinking).catch(async (error) => {
+  runAll(slotId, publicBase, test, thinking, effort).catch(async (error) => {
     const session = sessions[test.id];
     session.running = false;
     session.error = String(error && error.message ? error.message : error);
@@ -1140,7 +1271,7 @@ async function startVoxelTest({ slotId, models, publicBase, skipped = [], test: 
 // Re-run one model in place, leaving every other tile's result untouched. Also
 // how a model that was never run (a fresh download) gets a single tile without
 // restarting the whole serial sweep.
-async function rerunModel({ slotId, model, modelKey, publicBase, test: testId = DEFAULT_TEST, thinking }) {
+async function rerunModel({ slotId, model, modelKey, publicBase, test: testId = DEFAULT_TEST, thinking, effort }) {
   const test = resolveTest(testId);
   for (const id of Object.keys(TESTS)) {
     if (sessions[id] && sessions[id].running) {
@@ -1169,6 +1300,7 @@ async function rerunModel({ slotId, model, modelKey, publicBase, test: testId = 
   session.cancelRequested = false;
   if (typeof thinking === "boolean") {
     session.thinking = thinking;
+    session.effort = thinking ? normalizeThinkingEffort(effort) || DEFAULT_THINKING_EFFORT : null;
   }
   let entry = session.models.find((m) => m.model === label);
   if (!entry) {
@@ -1179,6 +1311,7 @@ async function rerunModel({ slotId, model, modelKey, publicBase, test: testId = 
   Object.assign(entry, {
     modelKey: key, status: "pending", startedAt: null, endedAt: null,
     elapsedMs: 0, file: "", rawFile: "", bytes: 0, error: "", recovered: false,
+    memory: null, effort: null,
   });
   session.running = true;
   session.endedAt = null;
@@ -1186,7 +1319,7 @@ async function rerunModel({ slotId, model, modelKey, publicBase, test: testId = 
 
   (async () => {
     try {
-      const slotParams = await resolveSlotParams(slotId, thinking);
+      const slotParams = await resolveSlotParams(slotId, thinking, effort);
       await runOne(entry, slotId, publicBase, slotParams, test);
     } catch (error) {
       entry.status = "failed";
@@ -1300,6 +1433,7 @@ function activeSceneWork() {
           label: TESTS[id].label,
           model: entry.model,
           thinking: typeof session.thinking === "boolean" ? session.thinking : null,
+          effort: session.effort || null,
           startedAt: entry.startedAt || session.startedAt || null,
         });
       }
@@ -1320,8 +1454,15 @@ module.exports = {
   activeSceneWork,
   getVoxelState: publicState,
   readSceneIndex,
+  countSceneResults,
+  clearSceneResults,
   noteSceneRuntimeError,
   sceneBucket,
+  normalizeThinkingEffort,
+  THINKING_EFFORTS,
+  DEFAULT_THINKING_EFFORT,
+  EFFORT_REASONING_BUDGET,
+  EFFORT_LAUNCHER_VALUE,
   outputRoot,
-  _test: { extractHtml, looksLikeScene, slugify, TESTS, sceneEntrySnapshot },
+  _test: { extractHtml, looksLikeScene, slugify, TESTS, sceneEntrySnapshot, resolveSlotParams, matchingSceneEntries },
 };

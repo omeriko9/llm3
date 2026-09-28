@@ -40,7 +40,7 @@ const BENCHMARKS_TEMPLATE = String.raw`
           <button type="button" role="menuitem" data-bm-menu="import">Load results JSON…</button>
           <button type="button" role="menuitem" data-bm-menu="export">Save results JSON</button>
           <button type="button" role="menuitem" data-bm-menu="summary">Open SUMMARY.md</button>
-          <button type="button" role="menuitem" data-bm-menu="clear" class="is-danger">Clear all results</button>
+          <button type="button" role="menuitem" data-bm-menu="clear" class="is-danger">Delete all results…</button>
         </div>
       </div>
       <input id="bmImportInput" class="hidden" type="file" accept=".json,application/json" />
@@ -88,51 +88,66 @@ const BENCHMARKS_TEMPLATE = String.raw`
     <div class="modal-header">
       <div class="modal-header-main">
         <h3 id="bmLaunchTitle">Run benchmark</h3>
-        <p class="modal-subtitle" id="bmLaunchSubtitle">Pick what to measure and which models to measure it on.</p>
+        <p class="modal-subtitle" id="bmLaunchSubtitle">Choose the tests, the thinking modes and the models. One model is loaded at a time, on the selected slot.</p>
       </div>
       <button class="btn btn-icon" type="button" id="bmLaunchCloseBtn" aria-label="Close">×</button>
     </div>
     <div class="modal-body bm-launch-body">
-      <section class="bm-launch-section">
-        <h4>What to run</h4>
-        <div id="bmBenchmarkOptions"></div>
-        <div class="bm-launch-row">
-          <div class="bm-field">
-            <span>Thinking</span>
-            <div class="bm-view-toggle bm-variant-toggle" role="group" aria-label="Which thinking variants to run">
-              <button type="button" class="bm-view-btn active" data-bm-variant-mode="both" title="Run each model twice and compare">Both</button>
-              <button type="button" class="bm-view-btn" data-bm-variant-mode="no-think" title="Only the no-think variant — half the rows, and the fast one">No-think only</button>
-              <button type="button" class="bm-view-btn" data-bm-variant-mode="think" title="Only the thinking variant">Think only</button>
-            </div>
-            <input type="hidden" id="bmVariantSelect" value="both" />
-          </div>
-          <label class="bm-field">
-            <span>Questions per metric</span>
-            <span class="bm-limit-row">
-              <input id="bmQualityLimit" type="number" min="5" max="500" step="5" value="200" />
-              <span class="bm-limit-presets">
-                <button type="button" data-bm-limit="20">20</button>
-                <button type="button" data-bm-limit="60">60</button>
-                <button type="button" data-bm-limit="200">200</button>
-                <button type="button" data-bm-limit="500">500</button>
+      <section class="bm-launch-section bm-launch-step">
+        <span class="bm-step-num">1</span>
+        <div class="bm-step-body">
+          <h4>Tests</h4>
+          <div id="bmBenchmarkOptions"></div>
+          <div class="bm-launch-row" id="bmLimitRow">
+            <label class="bm-field bm-field-inline">
+              <span>Questions per metric</span>
+              <span class="bm-limit-row">
+                <input id="bmQualityLimit" type="number" min="5" max="500" step="5" value="200" />
+                <span class="bm-limit-presets">
+                  <button type="button" data-bm-limit="20">20</button>
+                  <button type="button" data-bm-limit="60">60</button>
+                  <button type="button" data-bm-limit="200">200</button>
+                  <button type="button" data-bm-limit="500">500</button>
+                </span>
               </span>
-            </span>
-          </label>
-          <p class="bm-field-note" id="bmSampleNote"></p>
+            </label>
+            <p class="bm-field-note" id="bmSampleNote"></p>
+          </div>
         </div>
       </section>
 
-      <section class="bm-launch-section">
-        <div class="bm-launch-section-head">
-          <h4>Models</h4>
-          <div class="bm-model-actions">
-            <input id="bmModelSearch" class="bm-search" type="search" placeholder="Search models…" spellcheck="false" />
-            <button type="button" class="btn btn-sm btn-secondary" data-bm-models="all">All</button>
-            <button type="button" class="btn btn-sm btn-secondary" data-bm-models="none">None</button>
-            <button type="button" class="btn btn-sm btn-secondary" data-bm-models="new">Not benchmarked</button>
+      <section class="bm-launch-section bm-launch-step">
+        <span class="bm-step-num">2</span>
+        <div class="bm-step-body">
+          <h4>Thinking</h4>
+          <div class="bm-mode-row">
+            <label class="bm-pill-check"><input type="checkbox" id="bmModeOff" data-bm-mode="no-think" checked /><span>Off</span></label>
+            <label class="bm-pill-check"><input type="checkbox" id="bmModeOn" data-bm-mode="think" /><span>On</span></label>
+            <div class="bm-view-toggle bm-effort-toggle" role="radiogroup" aria-label="Thinking effort" id="bmEffortToggle">
+              <button type="button" class="bm-view-btn" role="radio" data-bm-effort="low" title="GGUF: 2,048-token reasoning budget. MLX: effort low.">low</button>
+              <button type="button" class="bm-view-btn active" role="radio" data-bm-effort="medium" title="GGUF: 8,192-token reasoning budget. MLX: effort medium.">medium</button>
+              <button type="button" class="bm-view-btn" role="radio" data-bm-effort="high" title="GGUF: 16,384-token reasoning budget. MLX: effort xhigh (Qwen3.8's template has no &quot;high&quot;).">high</button>
+            </div>
           </div>
+          <p class="bm-field-note" id="bmModeNote"></p>
         </div>
-        <div class="bm-model-list" id="bmModelList">Loading models…</div>
+      </section>
+
+      <section class="bm-launch-section bm-launch-step">
+        <span class="bm-step-num">3</span>
+        <div class="bm-step-body">
+          <div class="bm-launch-section-head">
+            <h4>Models <span class="bm-model-count" id="bmModelCount"></span></h4>
+            <div class="bm-model-actions">
+              <input id="bmModelSearch" class="bm-search" type="search" placeholder="Search models…" spellcheck="false" />
+              <button type="button" class="btn btn-sm btn-secondary" data-bm-models="all">All</button>
+              <button type="button" class="btn btn-sm btn-secondary" data-bm-models="none">None</button>
+              <button type="button" class="btn btn-sm btn-secondary" data-bm-models="new">Not benchmarked</button>
+              <button type="button" class="btn btn-sm btn-secondary hidden" data-bm-models="ticked" id="bmModelsTicked">Ticked</button>
+            </div>
+          </div>
+          <div class="bm-model-list" id="bmModelList">Loading models…</div>
+        </div>
       </section>
 
       <details class="bm-advanced">
@@ -149,14 +164,21 @@ const BENCHMARKS_TEMPLATE = String.raw`
         </div>
         <label class="bm-check">
           <input type="checkbox" id="bmGrammarVariants" />
-          <span><strong>Grammar variants (4-way)</strong><small>Also run think+Tiny Grammar and think+Structured GBNF. Throughput experiments; quadruples the run.</small></span>
+          <span><strong>Grammar variants (4-way)</strong><small>Also run think+Tiny Grammar and think+Structured GBNF, in one pass per model. Throughput experiments; quadruples the run.</small></span>
         </label>
       </details>
 
       <div class="bm-launch-error hidden" id="bmLaunchError"></div>
     </div>
     <div class="modal-footer bm-launch-footer">
-      <span class="bm-plan-summary" id="bmPlanSummary">Resolving…</span>
+      <div class="bm-plan">
+        <span class="bm-plan-summary" id="bmPlanSummary">Resolving…</span>
+        <span class="bm-plan-stages" id="bmPlanStages"></span>
+      </div>
+      <label class="bm-clear-first" title="Delete the stored results this run is about to replace -- the selected models, in the selected thinking modes and tests -- before it starts. Scene pages stay on disk.">
+        <input type="checkbox" id="bmClearFirst" checked />
+        <span>Clear previous results first</span>
+      </label>
       <div class="bm-launch-actions">
         <button type="button" class="btn btn-secondary" id="bmLaunchCancelBtn">Cancel</button>
         <button type="button" class="btn btn-primary" id="bmLaunchSubmitBtn">Start</button>
@@ -179,7 +201,7 @@ const BENCHMARKS_TEMPLATE = String.raw`
     </div>
     <div class="modal-footer bm-confirm-footer">
       <button type="button" class="btn btn-secondary" id="bmConfirmNoBtn">No</button>
-      <button type="button" class="btn btn-primary" id="bmConfirmYesBtn">Yes, overwrite</button>
+      <button type="button" class="btn btn-primary" id="bmConfirmYesBtn">Yes, clear and start</button>
     </div>
   </div>
 </div>
@@ -879,6 +901,7 @@ function initBenchmarksTab(root) {
     score: (row) => (row.score ? row.score.value : null),
     speed: (row) => row.perf.answerTps,
     load: (row) => row.perf.loadS,
+    mem: (row) => memoryPeak(variantMemorySources(row)),
     status: (row) => row.status,
     ran: (row) => (row.startedAt ? Date.parse(row.startedAt) : null),
   };
@@ -892,6 +915,7 @@ function initBenchmarksTab(root) {
     speedNoThink: (row) => (row.noThink ? row.noThink.perf.answerTps : null),
     speedThink: (row) => (row.think ? row.think.perf.answerTps : null),
     load: (row) => (row.noThink || row.think || {}).perf?.loadS ?? null,
+    mem: (row) => memoryPeak(modelMemorySources(row)),
     status: (row) => row.status,
     ran: (row) => {
       const source = row.noThink || row.think;
@@ -1141,17 +1165,24 @@ function initBenchmarksTab(root) {
       return;
     }
 
+    // "pass 2/4 · measured think·medium", then what is queued behind it.
+    const stageText = status.stageTotal > 1 ? `pass ${status.stageIndex}/${status.stageTotal} · ` : "";
+    const queued = (status.queuedStages || []).length
+      ? ` · next: ${status.queuedStages.map(stageLabel).join(" → ")}`
+      : "";
     if (status.phase === "scenes") {
-      title.textContent = `Scenes · ${status.sceneLabel || status.sceneTest}`;
+      title.textContent = `${stageText}Scenes · ${status.sceneLabel || status.sceneTest}`
+        + (status.sceneThinking ? ` · think·${status.sceneEffort || "medium"}` : " · no-think");
       meta.textContent = `${status.completedModels || 0} / ${status.totalModels || 0} models`
         + (status.currentModel ? ` · ${status.currentModel}` : "")
-        + (status.sceneThinking ? " · thinking" : "")
-        + ((status.queuedScenes || []).length ? ` · ${status.queuedScenes.length} more queued` : "");
+        + queued;
     } else {
-      title.textContent = "Benchmarking";
+      const mode = status.stage && status.stage.mode ? ` · ${stageLabel(status.stage).replace(/^measured /, "")}` : "";
+      title.textContent = `${stageText}Benchmarking${mode}`;
       meta.textContent = `${status.completedModels || 0} / ${status.totalModels || 0} models`
         + (status.currentModel ? ` · ${status.currentModel}` : "")
-        + (status.currentStage ? ` · ${status.currentStage}` : "");
+        + (status.currentStage ? ` · ${status.currentStage}` : "")
+        + queued;
     }
     fill.style.width = `${Math.max(2, Number(status.progressPercent) || 0)}%`;
     log.textContent = status.currentLog || status.recentLog || "";
@@ -1237,7 +1268,7 @@ function initBenchmarksTab(root) {
         : "";
       return `<a class="bm-scene-link" target="_blank" rel="noopener"
         href="/api/perf-dashboard/voxel/file/${encodeURIComponent(entry.file)}"
-        title="${esc(test.label)} · ${Math.round((entry.bytes || 0) / 1024)} KB — opens in a new tab">${clock(entry.elapsedMs)}</a>${flag}`;
+        title="${esc(test.label)} · ${esc(modeLabel(row.thinkingBucket, entry.effort))} · ${Math.round((entry.bytes || 0) / 1024)} KB — opens in a new tab">${clock(entry.elapsedMs)}</a>${flag}`;
     }
     return `<span class="bm-scene-failed" title="${esc(entry.error || entry.status)}">${esc(entry.status === "failed" ? "failed" : entry.status)}</span>`;
   }
@@ -1247,6 +1278,9 @@ function initBenchmarksTab(root) {
     const title = status === "interrupted"
       ? ' title="The run stopped before this row finished (no runner is alive). Re-run the model to replace it."'
       : "";
+    if (status === "not benchmarked") {
+      return '<span class="badge" title="Not benchmarked yet">not run</span>';
+    }
     return `<span class="badge ${map[status] || ""}"${title}>${esc(status)}</span>`;
   }
 
@@ -1257,19 +1291,33 @@ function initBenchmarksTab(root) {
     return `<span class="bm-sort is-active">${state.sort.dir === "asc" ? "↑" : "↓"}</span>`;
   }
 
-  function head(key, label, title) {
+  // `sub` is a second, smaller header line ("no-think"), which is what lets
+  // the paired columns stay narrow enough for the table to fit the window.
+  function head(key, label, title, sub = "") {
     // The model column carries the longest strings in the table, so it is the
     // one worth being able to squeeze when you want everything else on screen.
-    const grip = key === "model" ? '<span class="bm-col-grip" data-bm-resize="model" title="Drag to resize"></span>' : "";
-    return `<th data-bm-col="${esc(key)}" data-bm-sort="${esc(key)}"${title ? ` title="${esc(title)}"` : ""}>${esc(label)} ${sortArrow(key)}${grip}</th>`;
+    const grip = key === "model" ? '<span class="bm-col-grip" data-bm-resize="model" title="Drag to resize; double-click to reset"></span>' : "";
+    return `<th data-bm-col="${esc(key)}" data-bm-sort="${esc(key)}"${title ? ` title="${esc(title)}"` : ""}><span class="bm-th-label">${esc(label)}${sortArrow(key)}</span>${sub ? `<small class="bm-th-sub">${esc(sub)}</small>` : ""}${grip}</th>`;
   }
 
-  const MODEL_WIDTH_KEY = "llm3BenchmarkModelWidthV1";
+  // V2: V1 only stored a width once someone dragged, and the column was
+  // content-sized until then -- 690px of it at 1440px, which pushed half the
+  // table off screen. The default is now narrow and the name truncates, with
+  // the full name on hover.
+  const MODEL_WIDTH_KEY = "llm3BenchmarkModelWidthV2";
+  const MODEL_WIDTH_DEFAULT = 190;
+  const MODEL_WIDTH_MIN = 120;
+  const MODEL_WIDTH_MAX = 720;
 
+  // Without a stored width the column takes whatever the other columns leave,
+  // never less than the default -- so a wide window shows whole names and a
+  // 1440px one still fits every column. A drag pins an explicit width.
   function applyModelWidth() {
-    const width = Number(readStored(MODEL_WIDTH_KEY, "")) || 0;
-    q("bmTable").style.setProperty("--bm-model-col", width ? `${width}px` : "");
-    q("bmTable").classList.toggle("bm-model-sized", Boolean(width));
+    const stored = Number(readStored(MODEL_WIDTH_KEY, "")) || 0;
+    const width = stored ? Math.max(MODEL_WIDTH_MIN, Math.min(MODEL_WIDTH_MAX, stored)) : MODEL_WIDTH_DEFAULT;
+    q("bmTable").style.setProperty("--bm-model-col", `${width}px`);
+    q("bmTable").classList.toggle("bm-model-sized", Boolean(stored));
+    q("bmTable").classList.toggle("bm-model-fill", !stored);
   }
 
   function startModelResize(event, grip) {
@@ -1280,9 +1328,10 @@ function initBenchmarksTab(root) {
     const startWidth = cell.getBoundingClientRect().width;
     document.body.classList.add("bm-resizing");
     const onMove = (moveEvent) => {
-      const next = Math.max(120, Math.min(720, startWidth + (moveEvent.clientX - startX)));
+      const next = Math.max(MODEL_WIDTH_MIN, Math.min(MODEL_WIDTH_MAX, startWidth + (moveEvent.clientX - startX)));
       q("bmTable").style.setProperty("--bm-model-col", `${Math.round(next)}px`);
       q("bmTable").classList.add("bm-model-sized");
+      q("bmTable").classList.remove("bm-model-fill");
     };
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
@@ -1316,9 +1365,72 @@ function initBenchmarksTab(root) {
     }
     const status = state.status;
     const stage = status.phase === "scenes"
-      ? `${status.sceneLabel || status.sceneTest || "scene"}${status.sceneThinking ? " · thinking" : ""}`
+      ? `${status.sceneLabel || status.sceneTest || "scene"}${status.sceneThinking ? ` · think·${status.sceneEffort || "medium"}` : ""}`
       : (status.currentStage || "running");
     return `<span class="bm-row-spinner" title="Working now — ${esc(stage)}" aria-label="running"></span>`;
+  }
+
+  // ---- memory -------------------------------------------------------------
+  // Each runner row and each scene carries the host memory recorded while that
+  // model worked (see src/host-memory.js). The cell shows the model's
+  // footprint -- host used minus the empty-slot baseline -- as peak / average,
+  // taking the largest of the runs behind the row; the hover lists every run.
+  function gb(bytes) {
+    return typeof bytes === "number" && Number.isFinite(bytes) ? (bytes / 1024 ** 3).toFixed(1) : "—";
+  }
+
+  function modeLabel(bucket, effort) {
+    return bucket === "think" ? `think${effort ? `·${effort}` : ""}` : "no-think";
+  }
+
+  function variantMemorySources(row) {
+    if (!row) {
+      return [];
+    }
+    const sources = [];
+    if (row.memory) {
+      sources.push({ label: `measured · ${modeLabel(row.thinkingBucket, row.effort)}`, memory: row.memory });
+    }
+    for (const [testId, entry] of Object.entries(row.scenes || {})) {
+      if (entry && entry.memory) {
+        sources.push({ label: `${testId} · ${modeLabel(row.thinkingBucket, entry.effort)}`, memory: entry.memory });
+      }
+    }
+    return sources;
+  }
+
+  function modelMemorySources(row) {
+    return [...variantMemorySources(row.noThink), ...variantMemorySources(row.think)];
+  }
+
+  function memoryPeak(sources) {
+    const values = sources.map((source) => source.memory.footprintPeakBytes).filter((value) => typeof value === "number");
+    return values.length ? Math.max(...values) : null;
+  }
+
+  function memCell(sources) {
+    if (!sources.length) {
+      return '<td class="bm-mem" data-bm-col="mem"><span class="bm-muted" title="Not measured: the row predates memory sampling, or has not run.">—</span></td>';
+    }
+    const top = sources.reduce((best, source) => (
+      (source.memory.footprintPeakBytes || 0) > (best.memory.footprintPeakBytes || 0) ? source : best
+    ));
+    const lines = [
+      "Model footprint = host memory used while the model worked, minus host used just before it loaded (the baseline).",
+      "Host used = wired + app + compressed memory from vm_stat, the figure the Memory gauge shows, sampled every second. llama.cpp and MLX GPU buffers are wired memory that no process reports, so the whole host is measured; one model is loaded at a time.",
+      "",
+      ...sources.map((source) => {
+        const m = source.memory;
+        return `${source.label}: peak +${gb(m.footprintPeakBytes)} GB, avg +${gb(m.footprintAvgBytes)} GB`
+          + ` (host ${gb(m.peakBytes)} / ${gb(m.avgBytes)} GB, baseline ${gb(m.baselineBytes)} GB, ${m.samples || 0} samples)`;
+      }),
+    ];
+    const shared = sources.filter((source) => (source.memory.otherSlots || []).length);
+    if (shared.length) {
+      lines.push("", `Other slots were serving during ${shared.map((source) => `${source.label} (${source.memory.otherSlots.join(", ")})`).join("; ")}: anything they allocated meanwhile is in the delta too.`);
+    }
+    const flag = shared.length ? '<span class="bm-mem-flag" aria-hidden="true">*</span>' : "";
+    return `<td class="bm-mem" data-bm-col="mem" title="${esc(lines.join("\n"))}">${gb(top.memory.footprintPeakBytes)}${flag}<small> / ${gb(top.memory.footprintAvgBytes)}</small></td>`;
   }
 
   function runStamp(row) {
@@ -1341,7 +1453,7 @@ function initBenchmarksTab(root) {
   function modelNameCell(row, extra = "") {
     return `<td class="bm-model-cell" data-bm-col="model">
       <div class="bm-model-line">
-        <span class="bm-model-name">${esc(row.model)}</span>
+        <span class="bm-model-name" title="${esc(row.model)}">${esc(row.model)}</span>
         ${liveSpinner(row.model)}
         <span class="bm-model-badges">
           ${extra}
@@ -1459,20 +1571,21 @@ function initBenchmarksTab(root) {
       <th class="bm-check-col"></th>
       ${head("model", "Model")}
       ${head("size", "Size")}
-      ${head("scoreNoThink", "Score no-think", "Weighted smartness measured with thinking off.")}
-      ${head("scoreThink", "Score think", "Weighted smartness measured with thinking on.")}
+      ${head("scoreNoThink", "Score", "Weighted smartness measured with thinking off.", "no-think")}
+      ${head("scoreThink", "Score", "Weighted smartness measured with thinking on.", "think")}
       ${head("delta", "Δ", "How many points thinking is worth on this model. Sort by it to see which models actually gain.")}
-      ${head("speedNoThink", "tok/s no-think", "Answer tokens per second with thinking off.")}
-      ${head("speedThink", "tok/s think", "Answer tokens per second with thinking on — reasoning time counts against it.")}
-      ${head("load", "Load")}
-      ${sceneTests.map((test) => head(`scene:${test.id}`, test.id, `${test.label} — no-think / think`)).join("")}
+      ${head("speedNoThink", "tok/s", "Answer tokens per second with thinking off.", "no-think")}
+      ${head("speedThink", "tok/s", "Answer tokens per second with thinking on — reasoning time counts against it.", "think")}
+      ${head("load", "Load", "Seconds to load the model.", "s")}
+      ${head("mem", "Mem", "Model memory footprint in GB: host memory used while it worked, minus the idle baseline before it loaded. Peak / average. Hover a cell for every run behind it.", "GB pk/avg")}
+      ${sceneTests.map((test) => head(`scene:${test.id}`, test.id, `${test.label} — no-think / think`, "off / think")).join("")}
       ${head("ran", "Run", "When this model was last benchmarked.")}
       ${head("status", "Status")}
       <th class="bm-actions-col"></th>
     </tr></thead>`;
 
     if (!rows.length) {
-      applyTableHtml(header + emptyBody(10 + sceneTests.length));
+      applyTableHtml(header + emptyBody(11 + sceneTests.length));
       return;
     }
 
@@ -1487,6 +1600,7 @@ function initBenchmarksTab(root) {
         ${speedCell("speedNoThink", row.noThink)}
         ${speedCell("speedThink", row.think)}
         <td data-bm-col="load">${num((row.noThink || row.think || { perf: {} }).perf.loadS)}</td>
+        ${memCell(modelMemorySources(row))}
         ${sceneTests.map((test) => `<td class="bm-scene-cell bm-scene-pair" data-bm-col="scene:${esc(test.id)}">
           ${sceneCellFor(row.noThink, test)}<span class="bm-scene-sep">/</span>${sceneCellFor(row.think, test)}
         </td>`).join("")}
@@ -1507,7 +1621,8 @@ function initBenchmarksTab(root) {
       ${head("size", "Size")}
       ${head("score", "Score", "Weighted smartness score with its 95% interval. Hover a value for the breakdown.")}
       ${head("speed", "tok/s", "Answer tokens per second — thinking time counts against it.")}
-      ${head("load", "Load")}
+      ${head("load", "Load", "Seconds to load the model.", "s")}
+      ${head("mem", "Mem", "Model memory footprint in GB: host memory used while it worked, minus the idle baseline before it loaded. Peak / average. Hover a cell for every run behind it.", "GB pk/avg")}
       ${sceneTests.map((test) => head(`scene:${test.id}`, test.id, `${test.label} — time to generate.`)).join("")}
       ${head("ran", "Run", "When this row was benchmarked.")}
       ${head("status", "Status")}
@@ -1515,7 +1630,7 @@ function initBenchmarksTab(root) {
     </tr></thead>`;
 
     if (!rows.length) {
-      applyTableHtml(header + emptyBody(9 + sceneTests.length));
+      applyTableHtml(header + emptyBody(10 + sceneTests.length));
       return;
     }
 
@@ -1523,11 +1638,12 @@ function initBenchmarksTab(root) {
       <tr data-bm-label="${esc(row.model)}" data-bm-row="${esc(row.id)}" class="${isLiveRow(row.model) ? "active-model" : ""}${row.pending ? " bm-pending" : ""}${familyClass(row.model)}">
         <td class="bm-check-col"><input type="checkbox" data-bm-select="${esc(row.model)}" ${state.selected.has(row.model) ? "checked" : ""} aria-label="Compare ${esc(row.model)}" /></td>
         ${modelNameCell(row)}
-        <td class="bm-variant" data-bm-col="variant">${esc(row.variant)}</td>
+        <td class="bm-variant" data-bm-col="variant">${esc(row.variant)}${row.effort ? `<small class="bm-effort"> ${esc(row.effort)}</small>` : ""}</td>
         <td class="bm-size" data-bm-col="size">${esc(row.sizeLabel)}</td>
         <td class="bm-score-cell" data-bm-col="score">${scoreInline(row)}</td>
         ${speedCell("speed", row)}
         <td data-bm-col="load">${num(row.perf.loadS)}</td>
+        ${memCell(variantMemorySources(row))}
         ${sceneTests.map((test) => `<td class="bm-scene-cell" data-bm-col="scene:${esc(test.id)}">${sceneCellFor(row, test)}</td>`).join("")}
         <td class="bm-stamp" data-bm-col="ran">${runStamp(row)}</td>
         <td data-bm-col="status">${statusBadge(row.status)}</td>
@@ -1845,7 +1961,7 @@ function initBenchmarksTab(root) {
     }
     sample.push(score.measuredOwnVariant === false
       ? `measured on the ${score.measuredBucket} variant and copied onto this row`
-      : `measured on the ${row.thinkingBucket} variant`);
+      : `measured on the ${row.thinkingBucket} variant${row.effort ? ` at ${row.effort} effort` : ""}`);
 
     return `<div class="bm-tt-head">
         <strong>${num(score.value, 0)} <span class="bm-tt-margin">±${score.margin == null ? "?" : num(score.margin, 0)}</span></strong>
@@ -1991,42 +2107,98 @@ function initBenchmarksTab(root) {
   }
 
   // ---- launcher -----------------------------------------------------------
+  // Three choices, in the order a person makes them: what to run, in which
+  // thinking modes, on which models. The modes run one after the other with
+  // every model in each -- all models without thinking, then all with it --
+  // and the last choices are remembered for the next launch.
 
-  function benchmarkOptionsHtml() {
+  const LAUNCH_KEY = "llm3BenchmarkLaunchV2";
+  const EFFORTS = ["low", "medium", "high"];
+
+  function readLaunchPrefs() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(LAUNCH_KEY) || "null");
+      return raw && typeof raw === "object" ? raw : {};
+    } catch (_error) {
+      return {};
+    }
+  }
+
+  function saveLaunchPrefs(config) {
+    persist(LAUNCH_KEY, JSON.stringify({
+      benchmarks: config.benchmarks,
+      modes: config.modes,
+      effort: config.effort,
+      qualityLimit: config.qualityLimit,
+      clearFirst: config.clearFirst,
+    }));
+  }
+
+  function benchmarkOptionsHtml(prefs) {
     const results = activeResults();
     const catalog = (results && results.benchmarks) || [];
     const sceneTests = (results && results.sceneTests) || [];
+    const remembered = Array.isArray(prefs.benchmarks) ? new Set(prefs.benchmarks) : null;
     const quality = catalog.filter((entry) => entry.id !== "scenes").map((entry) => {
-      const disabled = entry.available ? "" : "disabled";
       // Cost per question varies by an order of magnitude between metrics, and
       // it is the thing worth knowing before ticking a box, not after.
       const cost = entry.secondsPerQuestion
-        ? ` · ~${entry.secondsPerQuestion}s/question`
-        : (entry.fixedSeconds ? ` · ~${entry.fixedSeconds}s flat` : "");
-      const note = entry.available
-        ? `weight ${entry.weight.toFixed(2)}${cost}${entry.taskCount > 1 ? ` · ${entry.taskCount} subsets` : ""}`
-        : "not available in the runner yet";
-      return `<label class="bm-check ${entry.available ? "" : "is-disabled"}">
-        <input type="checkbox" name="bmBenchmark" value="${esc(entry.id)}" ${entry.defaultOn && entry.available ? "checked" : ""} ${disabled} />
-        <span><strong>${esc(entry.label)}</strong><small>${esc(entry.blurb)}${entry.warning ? ` ⚠ ${esc(entry.warning)}` : ""}</small><em>${esc(note)}</em></span>
+        ? `~${entry.secondsPerQuestion}s/q`
+        : (entry.fixedSeconds ? `~${entry.fixedSeconds}s` : "");
+      const title = entry.available
+        ? `${entry.blurb}${entry.warning ? ` ⚠ ${entry.warning}` : ""} Weight ${entry.weight.toFixed(2)}${entry.taskCount > 1 ? `, ${entry.taskCount} subsets` : ""}.`
+        : "Not available in the runner yet.";
+      const checked = entry.available && (remembered ? remembered.has(entry.id) : entry.defaultOn);
+      return `<label class="bm-pill-check ${entry.available ? "" : "is-disabled"}" title="${esc(title)}">
+        <input type="checkbox" name="bmBenchmark" value="${esc(entry.id)}" ${checked ? "checked" : ""} ${entry.available ? "" : "disabled"} />
+        <span>${esc(entry.label)}${entry.warning ? " ⚠" : ""}${cost ? ` <em>${esc(cost)}</em>` : ""}</span>
       </label>`;
     }).join("");
-    const scenes = sceneTests.map((test) => `<label class="bm-check">
-      <input type="checkbox" name="bmBenchmark" value="scene:${esc(test.id)}" />
-      <span><strong>${esc(test.label)}</strong><small>Generates a standalone page and times it. Runs after the measured benchmarks, on the same slot.</small></span>
-    </label>`).join("");
-    return `<div class="bm-check-grid">${quality}</div>
-      <p class="bm-group-label">Scenes — timed, opened from the results table, and scored on whether the page renders rather than on how it looks.</p>
-      <div class="bm-check-grid">${scenes}</div>`;
+    const scenes = sceneTests.map((test) => {
+      const value = `scene:${test.id}`;
+      return `<label class="bm-pill-check" title="${esc(test.label)}: generates a standalone page and times it. Scored on whether the page renders, not on how it looks.">
+        <input type="checkbox" name="bmBenchmark" value="${esc(value)}" ${remembered && remembered.has(value) ? "checked" : ""} />
+        <span>${esc(test.label)}</span>
+      </label>`;
+    }).join("");
+    return `<div class="bm-test-group">
+        <span class="bm-test-label" title="Each measured pass also records load time, decode speed, tool use and host memory.">Measured</span>
+        <div class="bm-pill-row">${quality}</div>
+      </div>
+      <div class="bm-test-group">
+        <span class="bm-test-label">Scenes</span>
+        <div class="bm-pill-row">${scenes}</div>
+      </div>`;
+  }
+
+  function selectedModes() {
+    return Array.from(root.querySelectorAll("[data-bm-mode]:checked")).map((input) => input.dataset.bmMode);
+  }
+
+  function selectedEffort() {
+    const active = root.querySelector("[data-bm-effort].active");
+    return active ? active.dataset.bmEffort : "medium";
+  }
+
+  function setEffort(effort) {
+    const value = EFFORTS.includes(effort) ? effort : "medium";
+    root.querySelectorAll("[data-bm-effort]").forEach((button) => {
+      const on = button.dataset.bmEffort === value;
+      button.classList.toggle("active", on);
+      button.setAttribute("aria-checked", String(on));
+    });
   }
 
   function collectLaunchConfig() {
     const benchmarks = Array.from(root.querySelectorAll('input[name="bmBenchmark"]:checked')).map((input) => input.value);
     const excludeRaw = q("bmExclude").value || "";
+    const modes = selectedModes();
     return {
       models: Array.from(state.launchSelection),
       benchmarks,
-      variants: q("bmVariantSelect").value,
+      modes,
+      effort: selectedEffort(),
+      clearFirst: q("bmClearFirst").checked,
       qualityLimit: Number(q("bmQualityLimit").value) || 200,
       selectedSlot: state.slot,
       contextSize: Number(q("bmContextSize").value) || 128000,
@@ -2041,30 +2213,74 @@ function initBenchmarksTab(root) {
     };
   }
 
+  // The launcher's own view of what the choices mean, so the order of the run
+  // is stated before it starts rather than discovered in the run strip.
+  function updateModeNote() {
+    const modes = selectedModes();
+    const thinking = modes.includes("think");
+    q("bmEffortToggle").classList.toggle("is-disabled", !thinking);
+    root.querySelectorAll("[data-bm-effort]").forEach((button) => { button.disabled = !thinking; });
+    const models = state.launchSelection.size;
+    const label = (mode) => (mode === "think" ? `with thinking at ${selectedEffort()} effort` : "without thinking");
+    let text = "";
+    if (modes.length === 2) {
+      text = `Runs every selected model ${label("no-think")} first, then every model ${label("think")}.`;
+    } else if (modes.length === 1) {
+      text = `Runs every selected model ${label(modes[0])}.`;
+    }
+    if (thinking) {
+      text += " Effort is a reasoning-token budget on GGUF and --reasoning-effort on MLX.";
+    }
+    q("bmModeNote").textContent = models ? text : "";
+  }
+
+  function updateLimitVisibility() {
+    const runner = Array.from(root.querySelectorAll('input[name="bmBenchmark"]:checked'))
+      .some((input) => !input.value.startsWith("scene:"));
+    q("bmLimitRow").classList.toggle("hidden", !runner);
+  }
+
   function renderModelList() {
     const host = q("bmModelList");
     const search = state.modelSearch.trim().toLowerCase();
     const benchmarked = new Set((activeResults()?.rows || []).filter((row) => !row.pending).map((row) => row.model));
     const items = state.inventory.filter((item) => !search || item.label.toLowerCase().includes(search));
+    q("bmModelCount").textContent = state.inventory.length
+      ? `${state.launchSelection.size} of ${state.inventory.length} selected`
+      : "";
     if (!items.length) {
       host.innerHTML = '<p class="bm-muted">No models discovered for this slot.</p>';
       return;
     }
-    host.innerHTML = items.map((item) => `<label class="bm-model-row">
+    // A model whose launcher only llm3's server can start (ds4, sushi, ...)
+    // gets scenes but no measured row; say so here rather than in the log.
+    host.innerHTML = items.map((item) => `<label class="bm-model-row" title="${esc(item.label)}${item.measurable === false ? ` — scenes only: ${esc(item.unmeasurableReason)}` : ""}">
       <input type="checkbox" data-bm-model="${esc(item.label)}" ${state.launchSelection.has(item.label) ? "checked" : ""} />
       <span class="bm-model-row-name">${esc(item.label)}</span>
-      <span class="bm-model-row-meta">${esc(item.sizeLabel)} · ${esc(item.runtime)}</span>
-      <span class="bm-model-row-state">${benchmarked.has(item.label) ? "has results" : "—"}</span>
+      <span class="bm-model-row-meta">${esc(item.sizeLabel)} · ${esc(item.launcher || item.runtime)}${item.measurable === false ? " · scenes only" : ""}${benchmarked.has(item.label) ? " · has results" : ""}</span>
     </label>`).join("");
   }
 
   async function openLauncher(scopedModel) {
-    q("bmBenchmarkOptions").innerHTML = benchmarkOptionsHtml();
+    const prefs = readLaunchPrefs();
+    q("bmBenchmarkOptions").innerHTML = benchmarkOptionsHtml(prefs);
+    const modes = Array.isArray(prefs.modes) && prefs.modes.length ? prefs.modes : ["no-think"];
+    q("bmModeOff").checked = modes.includes("no-think");
+    q("bmModeOn").checked = modes.includes("think");
+    setEffort(prefs.effort);
+    if (Number(prefs.qualityLimit) > 0) {
+      q("bmQualityLimit").value = String(prefs.qualityLimit);
+    }
+    q("bmClearFirst").checked = prefs.clearFirst !== false;
     q("bmLaunchError").classList.add("hidden");
     state.modelSearch = "";
     q("bmModelSearch").value = "";
+    q("bmModelsTicked").classList.toggle("hidden", !state.selected.size);
+    q("bmModelsTicked").textContent = `Ticked (${state.selected.size})`;
     q("bmLaunchModal").classList.remove("hidden");
     q("bmModelList").textContent = "Loading models…";
+    updateLimitVisibility();
+    updateSampleNote();
 
     try {
       const inventory = await getJson(`/api/perf-dashboard/inventory?slot=${encodeURIComponent(state.slot)}`);
@@ -2082,15 +2298,10 @@ function initBenchmarksTab(root) {
       showLaunchError(error.message || "Failed to list models.");
     }
 
-    state.launchSelection = new Set();
-    if (scopedModel) {
-      state.launchSelection.add(scopedModel);
-    } else if (state.selected.size) {
-      for (const label of state.selected) {
-        state.launchSelection.add(label);
-      }
-    }
+    // Every model by default; a launch from a row's menu is about that row.
+    state.launchSelection = new Set(scopedModel ? [scopedModel] : state.inventory.map((item) => item.label));
     renderModelList();
+    updateModeNote();
     schedulePlan();
   }
 
@@ -2105,26 +2316,49 @@ function initBenchmarksTab(root) {
     element.classList.remove("hidden");
   }
 
+  function stageLabel(stage) {
+    const what = stage.kind === "runner" ? "measured" : stage.test;
+    const mode = stage.mode === "think" ? `think·${stage.effort || "medium"}` : stage.mode === "no-think" ? "off" : stage.mode;
+    return `${what} ${mode}`;
+  }
+
+  function updateStartButton() {
+    const button = q("bmLaunchSubmitBtn");
+    const plan = state.plan;
+    const clearFirst = q("bmClearFirst").checked;
+    button.textContent = plan && clearFirst && plan.clear && plan.clear.models
+      ? `Start · clears previous results for ${plan.clear.models} model${plan.clear.models === 1 ? "" : "s"}`
+      : "Start";
+  }
+
   function schedulePlan() {
     window.clearTimeout(state.planTimer);
     q("bmPlanSummary").textContent = "Resolving…";
+    q("bmPlanStages").textContent = "";
+    state.plan = null;
+    updateStartButton();
     state.planTimer = window.setTimeout(async () => {
       const config = collectLaunchConfig();
       if (!config.models.length) {
-        state.plan = null;
         q("bmPlanSummary").textContent = "Pick at least one model.";
+        return;
+      }
+      if (!config.benchmarks.length) {
+        q("bmPlanSummary").textContent = "Pick at least one test.";
         return;
       }
       try {
         const plan = await postJson("/api/perf-dashboard/plan", config);
         state.plan = plan;
-        const variants = plan.variants.length;
+        const stages = plan.stages || [];
         q("bmPlanSummary").textContent =
-          `${plan.models} model${plan.models === 1 ? "" : "s"} × ${variants} variant${variants === 1 ? "" : "s"}`
+          `${plan.models} model${plan.models === 1 ? "" : "s"} · ${stages.length} pass${stages.length === 1 ? "" : "es"}`
           + ` ≈ ${duration(plan.estimateSeconds)}`
-          + (plan.existing.length ? ` · ${plan.existing.length} row${plan.existing.length === 1 ? "" : "s"} already measured` : "");
+          + (plan.runRunner && (plan.unmeasurable || []).length ? ` · ${plan.unmeasurable.length} scenes-only` : "");
+        q("bmPlanStages").textContent = stages.map(stageLabel).join(" → ");
+        q("bmPlanStages").title = "Each pass runs every selected model, one after another.";
+        updateStartButton();
       } catch (error) {
-        state.plan = null;
         q("bmPlanSummary").textContent = error.message || "Could not resolve the plan.";
       }
     }, 250);
@@ -2132,7 +2366,8 @@ function initBenchmarksTab(root) {
 
   function updateSampleNote() {
     const limit = Math.max(1, Number(q("bmQualityLimit").value) || 200);
-    const metrics = root.querySelectorAll('input[name="bmBenchmark"]:checked').length || 1;
+    const metrics = Array.from(root.querySelectorAll('input[name="bmBenchmark"]:checked'))
+      .filter((input) => !input.value.startsWith("scene:")).length || 1;
     const margin = 1.96 * Math.sqrt(0.21 / limit) * 100;
     // The interval is the point of the number, so quote it rather than leaving
     // the choice to feel arbitrary.
@@ -2142,9 +2377,15 @@ function initBenchmarksTab(root) {
         ? "enough to separate the ends of the fleet, not the middle"
         : "tight enough to rank neighbours";
     q("bmSampleNote").textContent =
-      `${limit} questions puts the 95% interval at about ±${margin.toFixed(1)} points — ${verdict}.`
-      + ` Thinking rows run half the sample and generate several times more tokens, so they dominate the estimate.`
-      + ` ${metrics} benchmark${metrics === 1 ? "" : "s"} selected.`;
+      `±${margin.toFixed(1)} points at 95% — ${verdict}. Thinking passes run half the sample.`
+      + ` ${metrics} metric${metrics === 1 ? "" : "s"}.`;
+  }
+
+  function onLaunchChoiceChange() {
+    updateLimitVisibility();
+    updateSampleNote();
+    updateModeNote();
+    schedulePlan();
   }
 
   async function submitLaunch() {
@@ -2154,16 +2395,22 @@ function initBenchmarksTab(root) {
       return;
     }
     if (!config.benchmarks.length) {
-      showLaunchError("Pick at least one benchmark.");
+      showLaunchError("Pick at least one test.");
+      return;
+    }
+    if (!config.modes.length) {
+      showLaunchError("Pick at least one thinking mode.");
       return;
     }
     const plan = state.plan;
-    if (plan && plan.existing.length) {
-      const confirmed = await confirmOverwrite(plan);
+    const toClear = plan && plan.clear ? (plan.clear.resultDirs || 0) + (plan.clear.scenes || 0) : 0;
+    if (plan && (config.clearFirst ? toClear : plan.existing.length)) {
+      const confirmed = await confirmLaunch(plan, config);
       if (!confirmed) {
         return;
       }
     }
+    saveLaunchPrefs(config);
     try {
       await postJson("/api/perf-dashboard/start", { ...config, force: true });
       closeLauncher();
@@ -2173,15 +2420,31 @@ function initBenchmarksTab(root) {
     }
   }
 
-  // One question, asked once, at the moment it matters — instead of a "force
-  // re-run" checkbox that had to be understood before anything was chosen.
-  function confirmOverwrite(plan) {
+  // One question, asked once, at the moment it matters -- and it says exactly
+  // what will be deleted, because "clear previous results" is otherwise easy
+  // to read as "clear everything".
+  function confirmLaunch(plan, config) {
     return new Promise((resolve) => {
       const modal = q("bmConfirmModal");
       const models = plan.existingModels || [];
-      q("bmConfirmBody").textContent =
-        `${plan.existing.length} of the ${plan.rows.length} rows this run would produce already have results. `
-        + `Running again overwrites them.`;
+      if (config.clearFirst) {
+        const clear = plan.clear || {};
+        const parts = [];
+        if (clear.resultDirs) parts.push(`${clear.resultDirs} benchmark row${clear.resultDirs === 1 ? "" : "s"}`);
+        if (clear.scenes) parts.push(`${clear.scenes} scene result${clear.scenes === 1 ? "" : "s"}`);
+        q("bmConfirmTitle").textContent = "Clear previous results?";
+        q("bmConfirmBody").textContent =
+          `Starting clears ${parts.join(" and ")} for the ${clear.models} selected model${clear.models === 1 ? "" : "s"}`
+          + ` (modes: ${(plan.modes || []).map((mode) => (mode === "think" ? `think at ${plan.effort || "medium"}` : "off")).join(", ")}).`
+          + " Other models, modes and tests keep their results. Generated scene pages stay on disk.";
+        q("bmConfirmYesBtn").textContent = "Yes, clear and start";
+      } else {
+        q("bmConfirmTitle").textContent = "Overwrite existing results?";
+        q("bmConfirmBody").textContent =
+          `${plan.existing.length} of the ${plan.rows.length} rows this run would produce already have results. `
+          + "Running again overwrites them.";
+        q("bmConfirmYesBtn").textContent = "Yes, overwrite";
+      }
       q("bmConfirmList").innerHTML = models.slice(0, 12).map((label) => `<li>${esc(label)}</li>`).join("")
         + (models.length > 12 ? `<li class="bm-muted">and ${models.length - 12} more</li>` : "");
       modal.classList.remove("hidden");
@@ -2337,11 +2600,13 @@ function initBenchmarksTab(root) {
     } else if (kind === "summary") {
       window.open("/api/perf-dashboard/summary", "_blank", "noopener");
     } else if (kind === "clear") {
-      if (!window.confirm("Delete every stored benchmark result? This cannot be undone.")) {
+      const counts = activeResults() && activeResults().counts;
+      const rows = counts ? counts.rows : 0;
+      if (!window.confirm(`Delete ALL benchmark results?\n\nThis removes ${rows} stored benchmark row${rows === 1 ? "" : "s"} for every model, and every scene result in the table (the generated scene pages stay on disk).\n\nThis cannot be undone.`)) {
         return;
       }
       try {
-        await postJson("/api/perf-dashboard/results/clear", {});
+        await postJson("/api/perf-dashboard/results/clear", { includeScenes: true });
       } catch (error) {
         notify(error.message || "Failed to clear results.");
       }
@@ -2379,6 +2644,14 @@ function initBenchmarksTab(root) {
     const grip = event.target.closest("[data-bm-resize]");
     if (grip) {
       startModelResize(event, grip);
+    }
+  });
+  q("bmTable").addEventListener("dblclick", (event) => {
+    if (event.target.closest("[data-bm-resize]")) {
+      try {
+        localStorage.removeItem(MODEL_WIDTH_KEY);
+      } catch (_error) { /* private mode */ }
+      applyModelWidth();
     }
   });
 
@@ -2801,16 +3074,22 @@ function initBenchmarksTab(root) {
   on("bmLaunchCloseBtn", "click", closeLauncher);
   on("bmLaunchCancelBtn", "click", closeLauncher);
   on("bmLaunchSubmitBtn", "click", submitLaunch);
-  root.querySelectorAll("[data-bm-variant-mode]").forEach((button) => {
-    button.addEventListener("click", () => {
-      q("bmVariantSelect").value = button.dataset.bmVariantMode;
-      root.querySelectorAll("[data-bm-variant-mode]").forEach((other) => {
-        other.classList.toggle("active", other === button);
-      });
-      schedulePlan();
-      updateSampleNote();
+  root.querySelectorAll("[data-bm-mode]").forEach((input) => {
+    input.addEventListener("change", () => {
+      // At least one mode: unticking the last one puts it back.
+      if (!selectedModes().length) {
+        input.checked = true;
+      }
+      onLaunchChoiceChange();
     });
   });
+  root.querySelectorAll("[data-bm-effort]").forEach((button) => {
+    button.addEventListener("click", () => {
+      setEffort(button.dataset.bmEffort);
+      onLaunchChoiceChange();
+    });
+  });
+  on("bmClearFirst", "change", updateStartButton);
   on("bmQualityLimit", "input", () => { schedulePlan(); updateSampleNote(); });
   root.querySelectorAll("[data-bm-limit]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -2825,10 +3104,7 @@ function initBenchmarksTab(root) {
     renderModelList();
   });
 
-  on("bmBenchmarkOptions", "change", () => {
-    schedulePlan();
-    updateSampleNote();
-  });
+  on("bmBenchmarkOptions", "change", onLaunchChoiceChange);
 
   on("bmModelList", "change", (event) => {
     const input = event.target.closest("[data-bm-model]");
@@ -2841,6 +3117,8 @@ function initBenchmarksTab(root) {
     } else {
       state.launchSelection.delete(label);
     }
+    q("bmModelCount").textContent = `${state.launchSelection.size} of ${state.inventory.length} selected`;
+    updateModeNote();
     schedulePlan();
   });
 
@@ -2853,8 +3131,11 @@ function initBenchmarksTab(root) {
         state.inventory.forEach((item) => state.launchSelection.add(item.label));
       } else if (mode === "new") {
         state.inventory.filter((item) => !benchmarked.has(item.label)).forEach((item) => state.launchSelection.add(item.label));
+      } else if (mode === "ticked") {
+        state.inventory.filter((item) => state.selected.has(item.label)).forEach((item) => state.launchSelection.add(item.label));
       }
       renderModelList();
+      updateModeNote();
       schedulePlan();
     });
   });

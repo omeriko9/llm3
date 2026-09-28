@@ -587,3 +587,91 @@ test("throughput warm-up count survives the args round trip, including zero", ()
   const fallback = _test.buildRunnerArgs({});
   assert.equal(fallback[fallback.indexOf("--throughput-warmup") + 1], "1");
 });
+
+// ---- Thinking modes, effort and stages ----------------------------------------
+
+test("normalizeLaunchConfig reads thinking modes, effort, scenes-only and clear-first", () => {
+  const both = _test.normalizeLaunchConfig({
+    models: ["A"],
+    benchmarks: ["mmlu_pro", "scene:voxel"],
+    modes: ["think", "no-think", "bogus"],
+    effort: "HIGH",
+  });
+  assert.deepEqual(both.modes, ["no-think", "think"], "fixed order, unknown modes dropped");
+  assert.equal(both.effort, "high");
+  assert.equal(both.runRunner, true);
+  assert.equal(both.clearFirst, true, "clear-first is on unless the caller turns it off");
+  assert.equal(both.simpleThinkingVariants, true);
+
+  const thinkDefault = _test.normalizeLaunchConfig({ benchmarks: ["mmlu_pro"], modes: ["think"], effort: "extreme" });
+  assert.equal(thinkDefault.effort, "medium", "an unknown level falls back to the default");
+  assert.equal(thinkDefault.variant, "think");
+
+  const offOnly = _test.normalizeLaunchConfig({ benchmarks: ["scene:pixel"], modes: ["no-think"], effort: "high", clearFirst: false });
+  assert.equal(offOnly.effort, null, "effort means nothing without a thinking mode");
+  assert.equal(offOnly.runRunner, false, "a launch with only scenes skips the runner");
+  assert.equal(offOnly.clearFirst, false);
+
+  const legacy = _test.normalizeLaunchConfig({ benchmarks: ["mmlu_pro"], variants: "both" });
+  assert.deepEqual(legacy.modes, ["no-think", "think"], "the older variants field still works");
+});
+
+test("buildLaunchStages runs every model per mode, off first, scenes after each pass", () => {
+  const config = _test.normalizeLaunchConfig({
+    models: ["A"],
+    benchmarks: ["mmlu_pro", "scene:voxel", "scene:rocket"],
+    modes: ["no-think", "think"],
+    effort: "low",
+    selectedSlot: "slot2",
+  });
+  const stages = _test.buildLaunchStages(config);
+  assert.deepEqual(stages.map((stage) => [stage.kind, stage.variant || stage.test, stage.effort || "-"]), [
+    ["runner", "no-think", "-"],
+    ["scene", "voxel", "-"],
+    ["scene", "rocket", "-"],
+    ["runner", "think", "low"],
+    ["scene", "voxel", "low"],
+    ["scene", "rocket", "low"],
+  ]);
+  const [offRunner, , , thinkRunner] = stages;
+  assert.ok(!offRunner.args.includes("--reasoning-effort"));
+  assert.ok(!offRunner.args.includes("--toggleable-only"));
+  assert.ok(!offRunner.args.includes("--simple-thinking-variants"), "each pass is pinned to one variant");
+  assert.equal(thinkRunner.args[thinkRunner.args.indexOf("--variant") + 1], "think");
+  assert.equal(thinkRunner.args[thinkRunner.args.indexOf("--reasoning-effort") + 1], "low");
+  assert.ok(thinkRunner.args.includes("--toggleable-only"), "a model with no thinking switch already has its one row");
+  assert.equal(stages[4].thinking, true);
+  assert.equal(stages[1].thinking, false);
+
+  const scenesOnly = _test.buildLaunchStages(_test.normalizeLaunchConfig({ benchmarks: ["scene:voxel"], modes: ["think"] }));
+  assert.deepEqual(scenesOnly.map((stage) => stage.kind), ["scene"]);
+  assert.equal(scenesOnly[0].effort, "medium");
+});
+
+test("reasoning effort and toggleable-only survive the runner args round trip", () => {
+  const args = _test.buildRunnerArgs({ variant: "think", reasoningEffort: "medium", toggleableOnly: true });
+  const parsed = _test.parseRunnerArgs(args.slice(1));
+  assert.equal(parsed.reasoningEffort, "medium");
+  assert.equal(parsed.toggleableOnly, true);
+  assert.ok(!_test.buildRunnerArgs({ reasoningEffort: "ultra" }).includes("--reasoning-effort"), "only known levels reach the runner");
+});
+
+test("normalizeMemory keeps the recorded numbers and drops rows without a peak", () => {
+  const GB = 1024 ** 3;
+  const memory = _test.normalizeMemory({
+    method: "host-used", peakBytes: 60 * GB, avgBytes: 54 * GB, baselineBytes: 30 * GB,
+    footprintPeakBytes: 30 * GB, footprintAvgBytes: 24 * GB, samples: 8, otherSlots: ["slot1", ""], junk: 1,
+  });
+  assert.equal(memory.footprintPeakBytes, 30 * GB);
+  assert.deepEqual(memory.otherSlots, ["slot1"]);
+  assert.equal(memory.junk, undefined);
+  assert.equal(_test.normalizeMemory({ avgBytes: 1 }), null);
+  assert.equal(_test.normalizeMemory(null), null);
+});
+
+test("the server's model list reaches the runner as a file argument", () => {
+  const args = _test.buildRunnerArgs({ serverModelsPath: "/tmp/server-models.json" });
+  assert.equal(args[args.indexOf("--server-models") + 1], "/tmp/server-models.json");
+  assert.equal(_test.parseRunnerArgs(args.slice(1)).serverModelsPath, "/tmp/server-models.json");
+  assert.ok(!_test.buildRunnerArgs({}).includes("--server-models"), "no list, no flag: the runner scans the disk");
+});

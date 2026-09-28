@@ -49,7 +49,14 @@ function sessionSnapshot(session) {
     args: session.args,
     command: session.command,
     selectedModels: session.selectedModels,
-    sceneQueue: session.sceneQueue,
+    // The stages still to run after the current one. Named sceneQueue in older
+    // session files, when only scenes could follow the runner.
+    queue: session.queue,
+    stage: session.stage || null,
+    stageIndex: session.stageIndex || 0,
+    stageTotal: session.stageTotal || 0,
+    stageStartedAt: session.stageStartedAt || null,
+    runnerDone: Boolean(session.runnerDone),
     // The scene being generated when the process went away. It is put back at
     // the front of the queue on adoption, so a restart mid-scene costs that
     // scene's progress and not the scene itself.
@@ -57,6 +64,7 @@ function sessionSnapshot(session) {
     sceneSlot: session.sceneSlot,
     sceneModelFilters: session.sceneModelFilters,
     sceneCancelled: Boolean(session.sceneCancelled),
+    cleared: session.cleared || null,
     logPath: session.logPath,
   };
 }
@@ -72,19 +80,29 @@ async function persistSession(session) {
   }
 }
 
+// A scenes-only run never has a runner pid, so a session is recognised by its
+// start time rather than by the pid.
 async function readPersistedSession() {
   try {
     const parsed = JSON.parse(await fs.readFile(sessionFilePath, "utf8"));
-    return parsed && typeof parsed === "object" && parsed.pid ? parsed : null;
+    return parsed && typeof parsed === "object" && (parsed.pid || parsed.startedAt) ? parsed : null;
   } catch (_error) {
     return null;
   }
 }
 
+// Scene jobs written before stages existed carry no kind.
+function normalizeStage(job) {
+  if (!job || typeof job !== "object") {
+    return { kind: "scene", test: String(job || ""), thinking: false, effort: null };
+  }
+  return job.kind === "runner" ? job : { ...job, kind: "scene" };
+}
+
 // Called when there is no in-memory session: pick up a run that an earlier
-// server process started. A live pid becomes the session again (scenes queued
-// behind it included); a dead one is recorded as ended so the run strip can
-// show the last run.
+// server process started. A live pid becomes the session again (the stages
+// queued behind it included); a dead one lets the queue carry on, or records
+// the run as ended so the run strip can show the last run.
 async function adoptPersistedSession() {
   if (benchmarkSession) {
     return benchmarkSession;
@@ -93,9 +111,10 @@ async function adoptPersistedSession() {
   if (!saved) {
     return null;
   }
+  const savedQueue = Array.isArray(saved.queue) ? saved.queue : (Array.isArray(saved.sceneQueue) ? saved.sceneQueue : []);
   benchmarkSession = {
     child: null,
-    pid: saved.pid,
+    pid: saved.pid || null,
     startedAt: saved.startedAt,
     endedAt: saved.endedAt || null,
     exitCode: saved.exitCode ?? null,
@@ -103,43 +122,90 @@ async function adoptPersistedSession() {
     command: String(saved.command || ""),
     logLines: [],
     selectedModels: Array.isArray(saved.selectedModels) ? saved.selectedModels : [],
-    sceneQueue: [
+    queue: [
       ...(saved.scenePhase ? [saved.scenePhase] : []),
-      ...(Array.isArray(saved.sceneQueue) ? saved.sceneQueue : []),
-    ],
+      ...savedQueue,
+    ].map(normalizeStage),
+    stage: saved.stage || null,
+    stageIndex: Number(saved.stageIndex) || 0,
+    stageTotal: Number(saved.stageTotal) || 0,
+    stageStartedAt: saved.stageStartedAt || null,
+    // Files from before stages existed: the runner was the only process, so a
+    // dead pid with an end time means it was handled.
+    runnerDone: Boolean(saved.runnerDone) || !saved.pid,
     scenePhase: null,
     sceneCancelled: Boolean(saved.sceneCancelled),
     sceneSlot: String(saved.sceneSlot || "slot3"),
     sceneModelFilters: Array.isArray(saved.sceneModelFilters) ? saved.sceneModelFilters : [],
+    cleared: saved.cleared || null,
     logPath: String(saved.logPath || runnerLogPath),
     adopted: true,
   };
-  if (!benchmarkSession.endedAt && !isPidAlive(benchmarkSession.pid)) {
+  const session = benchmarkSession;
+  if (saved.scenePhase && session.stageIndex > 0) {
+    // The interrupted scene goes round again under the same stage number.
+    session.stageIndex -= 1;
+  }
+  const runnerAlive = !session.endedAt && session.pid && !session.runnerDone && isPidAlive(session.pid);
+  if (runnerAlive) {
+    return session;
+  }
+  if (session.endedAt) {
+    // Older files set endedAt when the runner exited and ran the scenes after
+    // it; a queue left in one of those is resumed rather than dropped.
+    if (session.queue.length && !session.sceneCancelled) {
+      session.endedAt = null;
+      advanceSession(session).catch((error) => {
+        appendSessionLog("[stages] ", Buffer.from(String(error.message || error)));
+      });
+    }
+    return session;
+  }
+  if (session.pid && !session.runnerDone) {
     // The runner finished (or died) while no dashboard was watching. Its exit
     // code is unknown; the rows on disk say what happened.
-    await finishSession(benchmarkSession, null);
-  } else if (benchmarkSession.endedAt && benchmarkSession.sceneQueue.length && !benchmarkSession.sceneCancelled) {
-    // The runner had already finished and the scenes were being generated when
-    // the process went away. finishSession would return early on an ended
-    // session, so the queue is resumed here instead of being dropped.
-    runSceneQueueForSession(benchmarkSession).catch((error) => {
-      appendSessionLog("[scenes] ", Buffer.from(String(error.message || error)));
+    await onRunnerExit(session, null);
+  } else {
+    advanceSession(session).catch((error) => {
+      appendSessionLog("[stages] ", Buffer.from(String(error.message || error)));
     });
   }
-  return benchmarkSession;
+  return session;
 }
 
-async function finishSession(session, exitCode) {
-  if (!session || session.endedAt) {
+// The runner of the current stage is gone. Record it once, then move on to
+// whatever is queued behind it.
+async function onRunnerExit(session, exitCode) {
+  if (!session || session.runnerDone || session.endedAt) {
     return;
   }
-  session.exitCode = exitCode;
-  session.endedAt = new Date().toISOString();
+  session.runnerDone = true;
+  session.child = null;
+  if (exitCode != null || session.exitCode == null) {
+    // A later clean stage must not hide an earlier failure.
+    session.exitCode = session.exitCode ? session.exitCode : exitCode;
+  }
   benchmarkFileCache.clear();
   await persistSession(session);
-  runSceneQueueForSession(session).catch((error) => {
-    appendSessionLog("[scenes] ", Buffer.from(String(error.message || error)));
+  if (session.starting) {
+    // startBenchmarkLocked is still watching the first runner come up and
+    // decides whether the rest of the queue runs.
+    return;
+  }
+  advanceSession(session).catch((error) => {
+    appendSessionLog("[stages] ", Buffer.from(String(error.message || error)));
   });
+}
+
+async function endSession(session) {
+  session.scenePhase = null;
+  session.queue = [];
+  session.stage = null;
+  if (!session.endedAt) {
+    session.endedAt = new Date().toISOString();
+  }
+  benchmarkFileCache.clear();
+  await persistSession(session);
 }
 
 async function tailFile(filePath, maxLines) {
@@ -287,6 +353,24 @@ function buildRunnerArgs(config) {
     args.push("--include-apple-tq3-cpu");
   }
 
+  // Only meaningful on a thinking pass; the runner maps it to a reasoning
+  // budget for GGUF and to --reasoning-effort for mlx-dspark.
+  const effort = voxel.normalizeThinkingEffort(config.reasoningEffort);
+  if (effort) {
+    args.push("--reasoning-effort", effort);
+  }
+
+  // The second pass of a mode-by-mode run: a model with no thinking switch
+  // already produced its one row in the first pass.
+  if (config.toggleableOnly) {
+    args.push("--toggleable-only");
+  }
+
+  // llm3's model list (ensureServerModelsFile); absent = the runner's disk scan.
+  if (config.serverModelsPath) {
+    args.push("--server-models", String(config.serverModelsPath));
+  }
+
   return args;
 }
 
@@ -344,6 +428,9 @@ function parseRunnerArgs(args) {
     if (arg === "--simple-thinking-variants") config.simpleThinkingVariants = true;
     if (arg === "--thinking-variants") config.thinkingVariants = true;
     if (arg === "--include-apple-tq3-cpu") config.includeAppleTq3Cpu = true;
+    if (arg === "--reasoning-effort" && next) config.reasoningEffort = next;
+    if (arg === "--toggleable-only") config.toggleableOnly = true;
+    if (arg === "--server-models" && next) config.serverModelsPath = next;
   }
 
   return config;
@@ -456,7 +543,57 @@ function isPidAlive(pid) {
   }
 }
 
-async function discoverInventory(config) {
+// ---- Which models get benchmarked -----------------------------------------
+// llm3's own /api/models is the one list of models and launchers: the runner's
+// disk scan used to disagree with it (a ds4 PLE sidecar listed as a model, a
+// ds4 pack given llama.cpp, no idea of ds4/sushi/mlx-vlm/prism). The list is
+// fetched from this server's loopback port -- this module runs inside it, and
+// loopback needs no dashboard token -- and handed to the runner as a file, so
+// a detached runner started before a restart still reads the same list. Only
+// when the server cannot answer does the runner fall back to its disk scan.
+const serverModelsPath = path.join(sessionDir, "server-models.json");
+const SERVER_MODELS_TTL_MS = 10_000;
+let serverModelsFetchedAt = 0;
+let serverModelsAvailable = false;
+
+async function ensureServerModelsFile() {
+  if (Date.now() - serverModelsFetchedAt < SERVER_MODELS_TTL_MS) {
+    return serverModelsAvailable ? serverModelsPath : null;
+  }
+  serverModelsFetchedAt = Date.now();
+  try {
+    const port = Number(process.env.PORT || 7075);
+    const response = await fetch(`http://127.0.0.1:${port}/api/models`, { signal: AbortSignal.timeout(15_000) });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const models = await response.json();
+    if (!Array.isArray(models)) {
+      throw new Error("not a model list");
+    }
+    const text = JSON.stringify(models);
+    const previous = await fs.readFile(serverModelsPath, "utf8").catch(() => "");
+    if (previous !== text) {
+      await fs.mkdir(sessionDir, { recursive: true });
+      const tempPath = `${serverModelsPath}.${process.pid}.tmp`;
+      await fs.writeFile(tempPath, text, "utf8");
+      await fs.rename(tempPath, serverModelsPath);
+      inventoryCache.clear();
+    }
+    serverModelsAvailable = true;
+  } catch (_error) {
+    serverModelsAvailable = false;
+  }
+  return serverModelsAvailable ? serverModelsPath : null;
+}
+
+async function withServerModels(config) {
+  const serverModels = await ensureServerModelsFile();
+  return serverModels ? { ...config, serverModelsPath: serverModels } : { ...config, serverModelsPath: null };
+}
+
+async function discoverInventory(rawConfig) {
+  const config = await withServerModels(rawConfig);
   const cacheKey = JSON.stringify(buildRunnerArgs(config));
   const cached = inventoryCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < INVENTORY_CACHE_TTL_MS) {
@@ -1169,6 +1306,31 @@ function sceneEntryForRow(sceneIndex, testId, label, bucket) {
   return perModel[bucket] || null;
 }
 
+// Host memory recorded while a model worked (src/host-memory.js for scenes,
+// benchmarks/host_memory.py for the runner). Both write the same shape; this
+// keeps the numbers and drops anything else.
+function normalizeMemory(memory) {
+  if (!memory || typeof memory !== "object") {
+    return null;
+  }
+  const peakBytes = asNumber(memory.peakBytes);
+  if (peakBytes == null) {
+    return null;
+  }
+  return {
+    method: String(memory.method || "host-used"),
+    intervalMs: asNumber(memory.intervalMs),
+    samples: asNumber(memory.samples),
+    totalBytes: asNumber(memory.totalBytes),
+    baselineBytes: asNumber(memory.baselineBytes),
+    peakBytes,
+    avgBytes: asNumber(memory.avgBytes),
+    footprintPeakBytes: asNumber(memory.footprintPeakBytes),
+    footprintAvgBytes: asNumber(memory.footprintAvgBytes),
+    otherSlots: normalizeStringArray(memory.otherSlots),
+  };
+}
+
 function buildRowScenes(sceneIndex, sceneTests, label, bucket) {
   const scenes = {};
   for (const test of sceneTests) {
@@ -1183,6 +1345,8 @@ function buildRowScenes(sceneIndex, sceneTests, label, bucket) {
           error: entry.error || "",
           runtimeErrors: Array.isArray(entry.runtimeErrors) ? entry.runtimeErrors.length : 0,
           endedAt: entry.endedAt || null,
+          effort: entry.effort || null,
+          memory: normalizeMemory(entry.memory),
         }
       : null;
   }
@@ -1367,6 +1531,10 @@ async function buildResultsPayload(options = {}) {
       },
       score: buildScore(payload, sceneScore),
       scenes: buildRowScenes(sceneIndex, sceneTests, label, bucket),
+      // Thinking level of a think row (low/medium/high); null when the run
+      // did not choose one and the slot's own setting applied.
+      effort: String(metric(payload, "launchConfig", "reasoningEffort") || "") || null,
+      memory: normalizeMemory(payload.memory),
       hasTranslation: Boolean(String(metric(payload, "benchmarks", "quality", "translationArtifact", "translation") || "").trim()),
       startedAt: metric(payload, "timestamps", "started") || null,
       errors: Array.isArray(payload.errors)
@@ -1405,6 +1573,8 @@ async function buildResultsPayload(options = {}) {
       agentic: { result: "", toolCalls: null, toolSupport: "" },
       score: null,
       scenes: buildRowScenes(sceneIndex, sceneTests, label, "no-think"),
+      effort: null,
+      memory: null,
       hasTranslation: false,
       startedAt: null,
       errors: [],
@@ -1676,19 +1846,32 @@ async function summarizeRunProgress(run) {
 
 async function getBenchmarkStatus() {
   await adoptPersistedSession();
-  if (benchmarkSession && benchmarkSession.pid && !isPidAlive(benchmarkSession.pid) && !benchmarkSession.endedAt) {
+  if (benchmarkSession && benchmarkSession.pid && !benchmarkSession.runnerDone && !benchmarkSession.starting
+    && !isPidAlive(benchmarkSession.pid) && !benchmarkSession.endedAt) {
     // A run we started (or adopted) ended without the exit event reaching us.
-    await finishSession(benchmarkSession, benchmarkSession.child ? benchmarkSession.child.exitCode : null);
+    await onRunnerExit(benchmarkSession, benchmarkSession.child ? benchmarkSession.child.exitCode : null);
   }
 
-  const sessionRunning = benchmarkSession && benchmarkSession.pid && isPidAlive(benchmarkSession.pid) && !benchmarkSession.endedAt;
+  const sessionRunning = benchmarkSession && benchmarkSession.pid && !benchmarkSession.runnerDone
+    && isPidAlive(benchmarkSession.pid) && !benchmarkSession.endedAt;
+  // Which stage of a multi-stage launch is live, and what is queued behind it.
+  const stageInfo = benchmarkSession && !benchmarkSession.endedAt
+    ? {
+        stage: describeStage(benchmarkSession.stage),
+        stageIndex: benchmarkSession.stageIndex || 0,
+        stageTotal: benchmarkSession.stageTotal || 0,
+        queuedStages: (benchmarkSession.queue || []).map((job) => describeStage(normalizeStage(job))),
+      }
+    : {};
   // `ps` over every process is the expensive part of a status poll; it is only
   // needed to notice a runner that something other than this dashboard started.
   const externalProcesses = sessionRunning ? [] : await listBenchmarkProcesses();
   const chosen = sessionRunning
     ? {
         pid: benchmarkSession.pid,
-        startedAt: benchmarkSession.startedAt,
+        // Progress counts rows started since this stage began, not since the
+        // launch: an earlier stage's rows are not this pass's progress.
+        startedAt: benchmarkSession.stageStartedAt || benchmarkSession.startedAt,
         args: benchmarkSession.args.slice(),
         command: benchmarkSession.command,
         source: "llm3",
@@ -1710,6 +1893,7 @@ async function getBenchmarkStatus() {
       sceneTest: first.test,
       sceneLabel: first.label,
       sceneThinking: first.thinking,
+      sceneEffort: first.effort || null,
       currentModel: first.model,
       currentStage: `scene:${first.test}`,
       activeModels: [...new Set(looseSceneWork.map((item) => item.model))],
@@ -1731,6 +1915,7 @@ async function getBenchmarkStatus() {
       startedAt: benchmarkSession.startedAt,
       sceneTest: scenePhase.test,
       sceneThinking: scenePhase.thinking,
+      sceneEffort: scenePhase.effort || null,
       sceneLabel: sceneState.label || scenePhase.test,
       totalModels: total,
       completedModels: done,
@@ -1738,7 +1923,29 @@ async function getBenchmarkStatus() {
       activeModels: (sceneState.models || []).filter((item) => item.status === "running").map((item) => item.model),
       currentStage: `scene:${scenePhase.test}`,
       progressPercent: total > 0 ? Math.min(100, Math.round((done / total) * 100)) : null,
-      queuedScenes: (benchmarkSession.sceneQueue || []).map((job) => job.test),
+      queuedScenes: (benchmarkSession.queue || []).filter((job) => normalizeStage(job).kind === "scene").map((job) => job.test),
+      ...stageInfo,
+      recentLog: await sessionRecentLog(benchmarkSession),
+    };
+  }
+
+  // Between two stages: the runner of one has exited and the next is being
+  // set up. Reporting idle for that second would flash the run strip.
+  if (!chosen && benchmarkSession && !benchmarkSession.endedAt && benchmarkSession.startedAt
+    && ((benchmarkSession.queue || []).length || benchmarkSession.advancing || benchmarkSession.starting)) {
+    return {
+      running: true,
+      phase: "benchmark",
+      source: "llm3",
+      pid: null,
+      startedAt: benchmarkSession.startedAt,
+      totalModels: benchmarkSession.selectedModels.length,
+      completedModels: 0,
+      currentModel: "",
+      activeModels: [],
+      currentStage: "next stage",
+      progressPercent: null,
+      ...stageInfo,
       recentLog: await sessionRecentLog(benchmarkSession),
     };
   }
@@ -1755,6 +1962,8 @@ async function getBenchmarkStatus() {
             exitCode: benchmarkSession.exitCode,
             command: benchmarkSession.command,
             adopted: Boolean(benchmarkSession.adopted),
+            stageTotal: benchmarkSession.stageTotal || 0,
+            cleared: benchmarkSession.cleared || null,
             recentLog: await sessionRecentLog(benchmarkSession),
           }
         : null,
@@ -1808,6 +2017,8 @@ async function getBenchmarkStatus() {
     recentLog: chosen.source === "llm3" && benchmarkSession ? await sessionRecentLog(benchmarkSession) : "",
     currentLogName: currentLog.logName,
     currentLog: currentLog.logTail,
+    effort: config.reasoningEffort || null,
+    ...(chosen.source === "llm3" ? stageInfo : {}),
   };
 }
 
@@ -1840,16 +2051,39 @@ function normalizeLaunchConfig(body) {
     config.sceneTests = normalizeStringArray(raw.sceneTests);
   }
 
-  if (raw.variants && LAUNCH_VARIANT_MODES.has(String(raw.variants))) {
+  // Thinking modes: `modes` is the list to run, in order, and `effort` the
+  // level for the thinking one. `variants` ("no-think" | "think" | "both") is
+  // the older spelling of the same choice.
+  let modes = null;
+  if (Array.isArray(raw.modes)) {
+    const wanted = new Set(normalizeStringArray(raw.modes));
+    modes = THINKING_MODES.filter((mode) => wanted.has(mode));
+    if (!modes.length) {
+      modes = ["no-think"];
+    }
+  } else if (raw.variants && LAUNCH_VARIANT_MODES.has(String(raw.variants))) {
     const mode = String(raw.variants);
-    config.variants = mode;
-    config.thinking = mode === "think";
-    config.simpleThinkingVariants = mode === "both";
-    config.variant = mode === "both" ? null : mode;
+    modes = mode === "both" ? THINKING_MODES.slice() : [mode];
+  }
+  if (modes) {
+    config.modes = modes;
+    config.variants = modes.length === 2 ? "both" : modes[0];
+    config.thinking = modes.length === 1 && modes[0] === "think";
+    config.simpleThinkingVariants = modes.length === 2;
+    config.variant = modes.length === 2 ? null : modes[0];
     // The 4-way grammar sweep stays an advanced opt-in and overrides the pair.
     config.thinkingVariants = Boolean(raw.thinkingVariants);
+    config.effort = modes.includes("think")
+      ? voxel.normalizeThinkingEffort(raw.effort) || voxel.DEFAULT_THINKING_EFFORT
+      : null;
   }
 
+  // A launch that lists its benchmarks and names no runner metric is scenes
+  // only: the runner is skipped rather than falling back to MMLU-Pro.
+  config.runRunner = Array.isArray(raw.benchmarks) ? config.qualityMetrics.length > 0 : raw.runRunner !== false;
+  // On unless the caller says otherwise: the rows this launch produces are
+  // deleted before it starts (clearResultsForLaunch).
+  config.clearFirst = !(raw.clearFirst === false || raw.clearFirst === "false");
   config.force = Boolean(raw.force);
   return config;
 }
@@ -1930,7 +2164,8 @@ function estimateRowSeconds(item, config, priorByDir, decodeByModel) {
 // uses -- so the row list, the "these already have results" warning and the time
 // estimate all describe the run that is about to happen, not an approximation
 // of it.
-async function resolveLaunchPlan(config) {
+async function resolveLaunchPlan(rawConfig) {
+  const config = await withServerModels(rawConfig);
   const inventory = await discoverInventory(config);
   const priorPayloads = await readBenchmarks();
   const priorByDir = new Map();
@@ -1952,12 +2187,21 @@ async function resolveLaunchPlan(config) {
   }
 
   const rows = [];
+  const unmeasurable = [];
   let estimateSeconds = 0;
+  const allLabels = new Set();
   for (const item of inventory) {
+    const label = String(item.label || item.modelLabel || item.key || "unknown");
+    allLabels.add(label);
+    if (item.measurable === false) {
+      // Listed and given scenes, but no measured row: see RUNNER_LAUNCHERS.
+      unmeasurable.push({ model: label, launcher: String(item.launcher || ""), reason: String(item.unmeasurableReason || "") });
+      continue;
+    }
     const resultDirName = String(item.resultDirName || "");
     const variant = resultDirName.split("__")[2] || "";
     const existingPayload = priorByDir.get(resultDirName) || null;
-    const seconds = estimateRowSeconds({ ...item, variant }, config, priorByDir, decodeByModel);
+    const seconds = config.runRunner === false ? 0 : estimateRowSeconds({ ...item, variant }, config, priorByDir, decodeByModel);
     estimateSeconds += seconds;
     rows.push({
       model: String(item.label || item.modelLabel || item.key || "unknown"),
@@ -1972,81 +2216,291 @@ async function resolveLaunchPlan(config) {
   }
 
   const sceneTests = normalizeStringArray(config.sceneTests);
-  const sceneModels = new Set(rows.map((row) => row.model));
-  estimateSeconds += sceneTests.length * sceneModels.size * ESTIMATE_FALLBACK.sceneSeconds;
+  const sceneModels = allLabels;
+  const buckets = launchBuckets(config);
+  estimateSeconds += sceneTests.length * sceneModels.size * buckets.length * ESTIMATE_FALLBACK.sceneSeconds;
 
-  const existing = rows.filter((row) => row.hasResults);
+  // What "clear before run" would delete, counted the same way it deletes.
+  const clearRows = await resultRowsForLaunch(config, sceneModels);
+  const clearScenes = sceneTests.length && sceneModels.size
+    ? await voxel.countSceneResults({ tests: sceneTests, models: [...sceneModels], buckets })
+    : 0;
+
+  const existing = config.runRunner === false ? [] : rows.filter((row) => row.hasResults);
   return {
-    rows,
+    rows: config.runRunner === false ? [] : rows,
     existing: existing.map((row) => ({ model: row.model, variant: row.variant })),
     existingModels: [...new Set(existing.map((row) => row.model))],
     models: sceneModels.size,
     variants: variantBucketsForConfig(config),
+    modes: buckets,
+    effort: config.effort || null,
+    runRunner: config.runRunner !== false,
+    unmeasurable: [...new Map(unmeasurable.map((item) => [item.model, item])).values()],
     sceneTests,
+    stages: buildLaunchStages(config).map(describeStage),
+    clearFirst: config.clearFirst !== false,
+    clear: {
+      models: sceneModels.size,
+      resultDirs: clearRows.length,
+      scenes: clearScenes,
+      modelsWithResults: new Set(clearRows.map((payload) => String(payload.modelLabel || payload.modelKey || ""))).size,
+    },
     estimateSeconds: Math.round(estimateSeconds),
   };
 }
 
+// ---- Stages ----------------------------------------------------------------
+// A launch is a list of stages run one after another on one slot: a runner
+// pass (every selected model through the measured benchmarks) or a scene pass
+// (every selected model through one scene test). With several thinking modes
+// chosen the list is mode-major -- all models without thinking, then all
+// models with it -- so the first mode's results are complete before the
+// second one starts, instead of each model being loaded once per mode in turn.
+//
 // Scenes drive the same slot as the runner (voxel-test refuses to share one), so
-// they cannot overlap the benchmark -- they run after it, inside the same
-// session, and the status endpoint reports which phase is live.
-async function runSceneQueueForSession(session) {
-  if (!session || !Array.isArray(session.sceneQueue) || !session.sceneQueue.length) {
+// no two stages overlap, and the status endpoint reports which one is live.
+const THINKING_MODES = ["no-think", "think"];
+
+function buildLaunchStages(config) {
+  const scenes = normalizeStringArray(config.sceneTests);
+  const stages = [];
+  if (!Array.isArray(config.modes)) {
+    // A caller that named no modes gets the old shape: one runner pass as
+    // configured, then scenes for each bucket it produced.
+    if (config.runRunner !== false) {
+      stages.push({ kind: "runner", variant: config.variant || null, effort: null, args: buildRunnerArgs(config).slice(1) });
+    }
+    const buckets = [...new Set(variantBucketsForConfig(config).map(thinkingBucketForVariant))];
+    for (const testId of scenes) {
+      for (const bucket of buckets) {
+        stages.push({ kind: "scene", test: testId, thinking: bucket === "think", effort: null });
+      }
+    }
+    return stages;
+  }
+  if (config.thinkingVariants) {
+    // The 4-way grammar sweep is one runner pass by construction.
+    if (config.runRunner !== false) {
+      stages.push({ kind: "runner", variant: null, effort: config.effort || null, args: buildRunnerArgs({ ...config, reasoningEffort: config.effort }).slice(1) });
+    }
+    for (const mode of THINKING_MODES) {
+      for (const testId of scenes) {
+        stages.push({ kind: "scene", test: testId, thinking: mode === "think", effort: mode === "think" ? config.effort || null : null });
+      }
+    }
+    return stages;
+  }
+  let runnerQueued = false;
+  for (const mode of config.modes) {
+    const effort = mode === "think" ? config.effort || null : null;
+    if (config.runRunner !== false) {
+      const args = buildRunnerArgs({
+        ...config,
+        variant: mode,
+        thinking: mode === "think",
+        simpleThinkingVariants: false,
+        thinkingVariants: false,
+        reasoningEffort: effort,
+        toggleableOnly: runnerQueued,
+      }).slice(1);
+      stages.push({ kind: "runner", variant: mode, effort, args });
+      runnerQueued = true;
+    }
+    for (const testId of scenes) {
+      stages.push({ kind: "scene", test: testId, thinking: mode === "think", effort });
+    }
+  }
+  return stages;
+}
+
+function describeStage(stage) {
+  if (!stage) {
+    return null;
+  }
+  const mode = stage.kind === "scene"
+    ? (stage.thinking ? "think" : "no-think")
+    : (stage.variant || "as configured");
+  return {
+    kind: stage.kind,
+    test: stage.kind === "scene" ? String(stage.test || "") : null,
+    mode,
+    effort: stage.effort || null,
+  };
+}
+
+function slotPublicBase(slotId) {
+  return `http://127.0.0.1:${8036 + (Number(String(slotId).replace(/\D/g, "")) || 1) - 1}`;
+}
+
+// Runs the queue until it is empty, cancelled, or a runner stage has been
+// spawned -- the runner's exit calls back into this through onRunnerExit.
+async function advanceSession(session) {
+  if (!session || session.advancing) {
     return;
   }
-  const slotId = String(session.sceneSlot || "slot3");
-  const publicBase = `http://127.0.0.1:${8036 + (Number(slotId.replace(/\D/g, "")) || 1) - 1}`;
-  // Shift rather than iterate a copy: the status endpoint reports what is left
-  // in the queue, and a queue that never drains reports the same "1 queued"
-  // from the first job to the last.
-  while (session.sceneQueue.length) {
-    if (session.sceneCancelled) {
-      break;
-    }
-    const job = session.sceneQueue.shift();
-    const testId = String(job.test || job);
-    const thinking = typeof job.thinking === "boolean" ? job.thinking : Boolean(session.sceneThinking);
-    session.scenePhase = { test: testId, thinking };
-    // Written before the scene starts, so a process that dies during it knows
-    // on restart which scene to pick up and what is still queued behind it.
-    await persistSession(session);
-    try {
-      const inventory = await discoverInventory({
-        selectedSlot: slotId,
-        modelFilters: session.sceneModelFilters || [],
-      });
-      const wanted = [];
-      const seen = new Set();
-      for (const item of inventory) {
-        const label = String(item.label || item.modelLabel || item.key || "").trim();
-        const key = String(item.key || item.modelKey || "").trim();
-        if (!label || !key || seen.has(label)) {
-          continue;
-        }
-        seen.add(label);
-        wanted.push({ label, modelKey: key });
+  session.advancing = true;
+  try {
+    // Shift rather than iterate a copy: the status endpoint reports what is
+    // left in the queue.
+    while (session.queue.length && !session.sceneCancelled) {
+      const stage = normalizeStage(session.queue.shift());
+      session.stage = stage;
+      session.stageIndex = (session.stageIndex || 0) + 1;
+      if (stage.kind === "runner") {
+        await spawnRunnerStage(session, stage);
+        return;
       }
-      if (!wanted.length) {
+      await runSceneStage(session, stage);
+    }
+    await endSession(session);
+  } finally {
+    session.advancing = false;
+  }
+}
+
+async function runSceneStage(session, job) {
+  const slotId = String(session.sceneSlot || "slot3");
+  const testId = String(job.test || "");
+  const thinking = Boolean(job.thinking);
+  const effort = thinking ? voxel.normalizeThinkingEffort(job.effort) : null;
+  session.scenePhase = { kind: "scene", test: testId, thinking, effort };
+  session.stageStartedAt = new Date().toISOString();
+  // Written before the scene starts, so a process that dies during it knows
+  // on restart which scene to pick up and what is still queued behind it.
+  await persistSession(session);
+  try {
+    const inventory = await discoverInventory({
+      selectedSlot: slotId,
+      modelFilters: session.sceneModelFilters || [],
+    });
+    const wanted = [];
+    const seen = new Set();
+    for (const item of inventory) {
+      const label = String(item.label || item.modelLabel || item.key || "").trim();
+      const key = String(item.key || item.modelKey || "").trim();
+      if (!label || !key || seen.has(label)) {
         continue;
       }
+      seen.add(label);
+      wanted.push({ label, modelKey: key });
+    }
+    if (wanted.length) {
       await voxel.startVoxelTest({
         slotId,
         models: wanted,
-        publicBase,
+        publicBase: slotPublicBase(slotId),
         test: testId,
         thinking,
+        effort,
       });
       // startVoxelTest returns as soon as the run is under way.
       while (voxel.getVoxelState(testId).running) {
         await sleep(2000);
       }
-    } catch (error) {
-      appendSessionLog("[scenes] ", Buffer.from(`${testId}: ${error.message || error}`));
     }
+  } catch (error) {
+    appendSessionLog("[scenes] ", Buffer.from(`${testId}: ${error.message || error}`));
   }
   session.scenePhase = null;
-  session.sceneQueue = [];
   await persistSession(session);
+}
+
+// Detached, in its own session, output to a file: a `pm2 restart llm3`
+// signals the server alone (see ecosystem.config.cjs) and the run carries on;
+// the next server process re-adopts it from session.json.
+async function spawnRunnerStage(session, stage, { freshLog = false } = {}) {
+  const args = ["benchmark_runner.py", ...(Array.isArray(stage.args) ? stage.args : [])];
+  await fs.mkdir(sessionDir, { recursive: true });
+  if (freshLog) {
+    await fs.rm(runnerLogPath, { force: true });
+  }
+  const logHandle = await fs.open(runnerLogPath, "a");
+  if (!freshLog) {
+    const mode = describeStage(stage);
+    await logHandle.write(`\n=== stage ${session.stageIndex}/${session.stageTotal}: benchmark, ${mode.mode}${mode.effort ? ` (${mode.effort})` : ""} ===\n`);
+  }
+  const child = spawn("python3", ["-u", ...args], {
+    cwd: benchmarkRoot,
+    env: { ...process.env, PYTHONUNBUFFERED: "1" },
+    stdio: ["ignore", logHandle.fd, logHandle.fd],
+    detached: true,
+  });
+  child.unref();
+  child.once("spawn", () => logHandle.close().catch(() => {}));
+  child.once("error", () => logHandle.close().catch(() => {}));
+
+  session.child = child;
+  session.pid = child.pid || null;
+  session.runnerDone = false;
+  session.args = args.slice(1);
+  session.command = `python3 -u ${args.join(" ")}`;
+  session.stageStartedAt = new Date().toISOString();
+  benchmarkFileCache.clear();
+  await persistSession(session);
+
+  child.on("exit", (code) => {
+    if (benchmarkSession === session && session.child === child) {
+      onRunnerExit(session, code).catch(() => {});
+    }
+  });
+  child.on("error", (error) => {
+    appendSessionLog("[spawn-error] ", Buffer.from(String(error.message || error)));
+    if (benchmarkSession === session && session.child === child) {
+      onRunnerExit(session, 1).catch(() => {});
+    }
+  });
+  return child;
+}
+
+// "Clear before run": the rows this launch is about to produce are deleted
+// before it starts, for every selected model in every selected thinking
+// bucket -- runner rows when a runner stage is queued, scene cells for each
+// selected test. Otherwise a model that fails to load this time keeps showing
+// last month's numbers as if they were today's. Scene pages stay on disk; only
+// the index entries the table reads are removed.
+function launchBuckets(config) {
+  if (Array.isArray(config.modes)) {
+    return config.modes.slice();
+  }
+  return [...new Set(variantBucketsForConfig(config).map(thinkingBucketForVariant))];
+}
+
+async function resultRowsForLaunch(config, labels) {
+  const buckets = new Set(launchBuckets(config));
+  if (config.runRunner === false) {
+    return [];
+  }
+  return (await readBenchmarks()).filter((payload) => {
+    const label = String(payload.modelLabel || payload.modelKey || "");
+    return labels.has(label) && buckets.has(thinkingBucketForVariant(payload.variant));
+  });
+}
+
+async function clearResultsForLaunch(config, labels) {
+  const rows = await resultRowsForLaunch(config, labels);
+  const root = path.resolve(resultsRoot);
+  let resultDirs = 0;
+  for (const payload of rows) {
+    const name = path.basename(String(payload.resultDirName || ""));
+    const target = path.resolve(root, name);
+    if (!name || path.dirname(target) !== root) {
+      continue;
+    }
+    await fs.rm(target, { recursive: true, force: true });
+    resultDirs += 1;
+  }
+  const tests = normalizeStringArray(config.sceneTests);
+  const scenes = tests.length && labels.size
+    ? await voxel.clearSceneResults({ tests, models: [...labels], buckets: launchBuckets(config) })
+    : 0;
+  inventoryCache.clear();
+  benchmarkFileCache.clear();
+  if (resultDirs) {
+    const generated = await buildSummaryMarkdown();
+    await fs.writeFile(summaryPath, generated, "utf8").catch(() => {});
+  }
+  return { models: labels.size, resultDirs, scenes };
 }
 
 function startBenchmark(config) {
@@ -2061,142 +2515,145 @@ function startBenchmark(config) {
   });
 }
 
-function startBenchmarkLocked(config) {
-  return new Promise(async (resolve, reject) => {
-    try {
-      const current = await getBenchmarkStatus();
-      if (current.running) {
-        reject(Object.assign(new Error("A benchmark is already running."), { statusCode: 409 }));
-        return;
-      }
-    } catch (error) {
-      reject(error);
-      return;
-    }
+async function startBenchmarkLocked(rawConfig) {
+  const config = await withServerModels(rawConfig);
+  const current = await getBenchmarkStatus();
+  if (current.running) {
+    throw Object.assign(new Error("A benchmark is already running."), { statusCode: 409 });
+  }
 
-    let inventory;
-    try {
-      inventory = await discoverInventory(config);
-    } catch (error) {
-      reject(Object.assign(new Error(`Failed to resolve selected models: ${error.message || error}`), { statusCode: 400 }));
-      return;
-    }
-    if (!Array.isArray(inventory) || inventory.length === 0) {
-      reject(Object.assign(new Error("No models match the current benchmark filters."), { statusCode: 400 }));
-      return;
-    }
+  let inventory;
+  try {
+    inventory = await discoverInventory(config);
+  } catch (error) {
+    throw Object.assign(new Error(`Failed to resolve selected models: ${error.message || error}`), { statusCode: 400 });
+  }
+  if (!Array.isArray(inventory) || inventory.length === 0) {
+    throw Object.assign(new Error("No models match the current benchmark filters."), { statusCode: 400 });
+  }
 
-    const args = buildRunnerArgs(config);
-    // Detached, in its own session, output to a file: a `pm2 restart llm3`
-    // signals the server alone (see ecosystem.config.cjs) and the run carries
-    // on; the next server process re-adopts it from session.json.
-    let logHandle;
-    try {
-      await fs.mkdir(sessionDir, { recursive: true });
-      await fs.rm(runnerLogPath, { force: true });
-      logHandle = await fs.open(runnerLogPath, "a");
-    } catch (error) {
-      reject(Object.assign(new Error(`Cannot open the runner log: ${error.message || error}`), { statusCode: 500 }));
-      return;
-    }
-    const child = spawn("python3", ["-u", ...args], {
-      cwd: benchmarkRoot,
-      env: { ...process.env, PYTHONUNBUFFERED: "1" },
-      stdio: ["ignore", logHandle.fd, logHandle.fd],
-      detached: true,
+  // A selection of only models the runner cannot load (ds4, sushi, ...) has
+  // no measured pass to run; its scenes still do.
+  const anyMeasurable = inventory.some((item) => item.measurable !== false);
+  const stages = buildLaunchStages(config).filter((stage) => stage.kind !== "runner" || anyMeasurable);
+  if (!stages.length) {
+    throw Object.assign(new Error(anyMeasurable
+      ? "Nothing to run: pick at least one benchmark or scene."
+      : "None of the selected models can be measured by the runner (their launchers start only through llm3); pick a scene test for them."), { statusCode: 400 });
+  }
+
+  const labels = new Set(inventory.map((item) => String(item.label || item.modelLabel || item.key || item.modelKey || "")).filter(Boolean));
+  const cleared = config.clearFirst === false ? null : await clearResultsForLaunch(config, labels);
+
+  const session = {
+    child: null,
+    pid: null,
+    startedAt: new Date().toISOString(),
+    endedAt: null,
+    exitCode: null,
+    args: [],
+    command: "",
+    logLines: [],
+    selectedModels: [...labels],
+    queue: stages.slice(1),
+    stage: stages[0],
+    stageIndex: 1,
+    stageTotal: stages.length,
+    stageStartedAt: null,
+    runnerDone: true,
+    scenePhase: null,
+    sceneCancelled: false,
+    sceneSlot: String(config.selectedSlot || "slot3"),
+    sceneModelFilters: normalizeStringArray(config.modelFilters),
+    cleared,
+    logPath: runnerLogPath,
+    adopted: false,
+  };
+  benchmarkSession = session;
+
+  if (stages[0].kind !== "runner") {
+    // A scenes-only launch: nothing to spawn, the queue runs in-process.
+    await fs.mkdir(sessionDir, { recursive: true });
+    await fs.rm(runnerLogPath, { force: true });
+    session.queue = stages;
+    session.stageIndex = 0;
+    await persistSession(session);
+    advanceSession(session).catch((error) => {
+      appendSessionLog("[stages] ", Buffer.from(String(error.message || error)));
     });
-    child.unref();
-    child.once("spawn", () => logHandle.close().catch(() => {}));
-    child.once("error", () => logHandle.close().catch(() => {}));
-
-    // Scenes run after the runner exits, once per requested thinking bucket, so
-    // a "both variants" launch fills in both the think and no-think scene cells.
-    const sceneBuckets = [...new Set(variantBucketsForConfig(config).map(thinkingBucketForVariant))];
-    const sceneQueue = [];
-    for (const testId of normalizeStringArray(config.sceneTests)) {
-      for (const bucket of sceneBuckets) {
-        sceneQueue.push({ test: testId, thinking: bucket === "think" });
-      }
-    }
-
-    benchmarkSession = {
-      child,
-      pid: child.pid,
-      startedAt: new Date().toISOString(),
-      endedAt: null,
-      exitCode: null,
-      args: args.slice(1),
-      command: `python3 -u ${args.join(" ")}`,
-      logLines: [],
-      selectedModels: inventory.map((item) => item.label || item.modelLabel || item.key || item.modelKey || "unknown"),
-      sceneQueue,
-      scenePhase: null,
-      sceneCancelled: false,
-      sceneSlot: String(config.selectedSlot || "slot3"),
-      sceneModelFilters: normalizeStringArray(config.modelFilters),
-      logPath: runnerLogPath,
-      adopted: false,
+    return {
+      pid: null,
+      startedAt: session.startedAt,
+      command: "",
+      selectedModels: session.selectedModels,
+      stages: stages.map(describeStage),
+      cleared,
     };
-    benchmarkFileCache.clear();
-    await persistSession(benchmarkSession);
+  }
 
-    child.on("exit", (code) => {
-      if (!benchmarkSession || benchmarkSession.pid !== child.pid) {
-        return;
-      }
-      finishSession(benchmarkSession, code).catch(() => {});
-    });
-    child.on("error", (error) => {
-      appendSessionLog("[spawn-error] ", Buffer.from(String(error.message || error)));
-      if (benchmarkSession && benchmarkSession.pid === child.pid) {
-        finishSession(benchmarkSession, 1).catch(() => {});
-      }
-    });
-
+  let child;
+  session.starting = true;
+  try {
+    child = await spawnRunnerStage(session, stages[0], { freshLog: true });
     await sleep(START_STABILITY_WAIT_MS);
+  } catch (error) {
+    session.starting = false;
+    session.sceneCancelled = true;
+    await endSession(session);
+    throw Object.assign(new Error(`Cannot start the runner: ${error.message || error}`), { statusCode: 500 });
+  }
+  session.starting = false;
 
-    if (!benchmarkSession || benchmarkSession.pid !== child.pid) {
-      reject(Object.assign(new Error("Benchmark session was replaced before startup completed."), { statusCode: 500 }));
-      return;
-    }
-    if (!isPidAlive(child.pid) || benchmarkSession.endedAt) {
-      const recentLog = await sessionRecentLog(benchmarkSession);
-      const message = recentLog
-        ? `Benchmark exited during startup.\n${recentLog}`
-        : "Benchmark exited during startup without producing logs.";
-      reject(Object.assign(new Error(message), { statusCode: 500 }));
-      return;
-    }
+  if (benchmarkSession !== session) {
+    throw Object.assign(new Error("Benchmark session was replaced before startup completed."), { statusCode: 500 });
+  }
+  if (session.runnerDone || !isPidAlive(child.pid)) {
+    const recentLog = await sessionRecentLog(session);
+    // The queue behind a runner that could not even start would run scenes
+    // the caller did not expect on their own.
+    session.sceneCancelled = true;
+    session.queue = [];
+    await endSession(session);
+    const message = recentLog
+      ? `Benchmark exited during startup.\n${recentLog}`
+      : "Benchmark exited during startup without producing logs.";
+    throw Object.assign(new Error(message), { statusCode: 500 });
+  }
 
-    resolve({
-      pid: child.pid,
-      startedAt: benchmarkSession.startedAt,
-      command: benchmarkSession.command,
-      selectedModels: benchmarkSession.selectedModels,
-    });
-  });
+  return {
+    pid: child.pid,
+    startedAt: session.startedAt,
+    command: session.command,
+    selectedModels: session.selectedModels,
+    stages: stages.map(describeStage),
+    cleared,
+  };
 }
 
 async function cancelBenchmark() {
   const status = await getBenchmarkStatus();
+  // Cancelling stops the stage that is live and drops every stage behind it.
+  if (benchmarkSession && status.running && status.source !== "external") {
+    benchmarkSession.sceneCancelled = true;
+    benchmarkSession.queue = [];
+  }
   // A run that has moved on to its scenes has no runner pid left to signal; the
   // cancel button still has to stop it.
   if (status.running && status.phase === "scenes" && benchmarkSession) {
-    benchmarkSession.sceneCancelled = true;
-    benchmarkSession.sceneQueue = [];
     const testId = benchmarkSession.scenePhase ? benchmarkSession.scenePhase.test : null;
     if (testId) {
       voxel.cancelVoxelTest(testId);
     }
+    await persistSession(benchmarkSession);
     return { pid: null, phase: "scenes", sceneTest: testId };
   }
   if (!status.running || !status.pid) {
+    if (status.running && benchmarkSession) {
+      // Between stages: nothing to signal, the loop stops on the flag.
+      await persistSession(benchmarkSession);
+      return { pid: null, phase: status.phase };
+    }
     throw Object.assign(new Error("No benchmark is currently running."), { statusCode: 409 });
-  }
-  if (benchmarkSession) {
-    // Cancelling the runner cancels the scenes queued behind it too.
-    benchmarkSession.sceneCancelled = true;
-    benchmarkSession.sceneQueue = [];
   }
   try {
     process.kill(status.pid, "SIGTERM");
@@ -2438,7 +2895,7 @@ function attachPerfDashboardRoutes(app) {
       const publicBase = String(req.body?.publicBase || "").trim()
         || `http://127.0.0.1:${8036 + (Number(String(slotId).replace(/\D/g, "")) || 1) - 1}`;
       const thinking = typeof req.body?.thinking === "boolean" ? req.body.thinking : undefined;
-      const state = await voxel.startVoxelTest({ slotId, models: wanted, publicBase, skipped, test: req.body?.test, thinking });
+      const state = await voxel.startVoxelTest({ slotId, models: wanted, publicBase, skipped, test: req.body?.test, thinking, effort: req.body?.effort });
       res.json({ ok: true, voxel: await reconcileVoxelStateWithInventory(state, slotId) });
     } catch (error) {
       res.status(error.statusCode || 500).json({ error: error.message || "Failed to start voxel test." });
@@ -2471,6 +2928,7 @@ function attachPerfDashboardRoutes(app) {
         publicBase,
         test: req.body?.test,
         thinking: typeof req.body?.thinking === "boolean" ? req.body.thinking : undefined,
+        effort: req.body?.effort,
       });
       res.json({ ok: true, voxel: await reconcileVoxelStateWithInventory(state, slotId) });
     } catch (error) {
@@ -2640,7 +3098,10 @@ function attachPerfDashboardRoutes(app) {
         models: inventory.map((item) => ({
           label: item.label || item.modelLabel || item.key || item.modelKey || "unknown",
           runtime: item.runtime || "unknown",
+          launcher: item.launcher || item.runtime || "unknown",
           sizeLabel: item.sizeLabel || "unknown",
+          measurable: item.measurable !== false,
+          unmeasurableReason: item.unmeasurableReason || "",
         })),
       });
     } catch (error) {
@@ -2666,7 +3127,9 @@ function attachPerfDashboardRoutes(app) {
     }
   });
 
-  app.post("/api/perf-dashboard/results/clear", async (_req, res) => {
+  // Everything: every runner row, and -- unless includeScenes is false -- every
+  // scene cell (the generated pages stay on disk, see clearSceneResults).
+  app.post("/api/perf-dashboard/results/clear", async (req, res) => {
     try {
       const status = await getBenchmarkStatus();
       if (status.running) {
@@ -2674,6 +3137,9 @@ function attachPerfDashboardRoutes(app) {
         return;
       }
       const cleared = await clearBenchmarkArtifacts();
+      if (req.body?.includeScenes !== false) {
+        cleared.scenes = await voxel.clearSceneResults({});
+      }
       res.json({ ok: true, cleared });
     } catch (error) {
       res.status(500).json({ error: error.message || "Failed to clear benchmark results." });
@@ -2753,6 +3219,12 @@ module.exports = {
     buildSummaryMarkdown,
     qualityMetricsFromPayload,
     normalizeLaunchConfig,
+    buildLaunchStages,
+    describeStage,
+    clearResultsForLaunch,
+    normalizeMemory,
+    ensureServerModelsFile,
+    serverModelsPath,
     thinkingSecondsPerQuestion,
     estimateRowSeconds,
     buildResultsPayload,
