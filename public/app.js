@@ -32,6 +32,13 @@ const ALL_APPLICATION_DEFINITIONS = [
     slotKind: "llm",
   },
   {
+    key: "opencode",
+    label: "OpenCode",
+    badgeLabel: "OpenCode",
+    description: "Installs or upgrades OpenCode to the latest release, then points local opencode.json at the selected slot.",
+    slotKind: "llm",
+  },
+  {
     key: "remotejsonapp",
     label: "Remote JSON app",
     badgeLabel: "Remote JSON app",
@@ -141,6 +148,7 @@ const LLM_APPLICATION_FLAGS = [
   { appKey: "librechat", field: "setLibreChat", legacyField: "setChat", label: "LibreChat", machine: "inuc" },
   { appKey: "hermesm4", field: "setHermesM4", label: "Hermes M4", machine: "m4" },
   { appKey: "compactionm4", field: "setCompactionM4", label: "Compaction M4", machine: "m4" },
+  { appKey: "opencode", field: "setOpenCode", label: "OpenCode", machine: "m4" },
   { appKey: "sqliteapp", field: "setSqliteApp", label: "SQLite app", machine: "m4" },
   { appKey: "claudecode", field: "setClaudeCode", legacyField: "setOpenClaude", label: "Claude Code", machine: "m4" },
   { appKey: "voiceapp", field: "setVoiceApp", label: "Voice app", machine: "m4" },

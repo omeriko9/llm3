@@ -91,6 +91,11 @@ const HERMES_M4_CONFIG_PATH = process.env.HERMES_M4_CONFIG_PATH || path.join(HER
 const HERMES_M4_CACHE_PATH =
   process.env.HERMES_M4_CACHE_PATH || path.join(HERMES_M4_HOME, "context_length_cache.yaml");
 const DEFAULT_HERMES_M4_CONFIG_PATH = path.join(HERMES_M4_HOME, "config.yaml");
+// OpenCode reads $XDG_CONFIG_HOME/opencode/opencode.json, so follow the same
+// variable rather than assuming ~/.config.
+const OPENCODE_M4_CONFIG_PATH = process.env.OPENCODE_M4_CONFIG_PATH
+  || path.join(DEFAULT_XDG_CONFIG_HOME, "opencode", "opencode.json");
+const OPENCODE_NPM_PACKAGE = process.env.OPENCODE_NPM_PACKAGE || "opencode-ai";
 const PODG_HERMES_HOME = process.env.PODG_HERMES_HOME || path.join(HOME, ".hermes-podg");
 const PODG_HERMES_CONFIG_PATH = process.env.PODG_HERMES_CONFIG_PATH || path.join(PODG_HERMES_HOME, "config.yaml");
 const PODG_HERMES_CACHE_PATH =
@@ -997,6 +1002,14 @@ const APPLICATION_DEFINITIONS = [
     label: "Compaction M4",
     badgeLabel: "Compaction M4",
     description: "Points the local Hermes compaction model at the selected slot.",
+    slotKind: "llm",
+    machine: "m4",
+  },
+  {
+    key: "opencode",
+    label: "OpenCode",
+    badgeLabel: "OpenCode",
+    description: "Installs or upgrades OpenCode to the latest release, then points local opencode.json at the selected slot.",
     slotKind: "llm",
     machine: "m4",
   },
@@ -2351,6 +2364,7 @@ function requestedApplicationTargetsFromPayload(payload) {
   requested.hermesm4 = requested.hermesm4 || Boolean(payload?.setHermesM4);
   requested.compaction = requested.compaction || Boolean(payload?.setCompaction);
   requested.compactionm4 = requested.compactionm4 || Boolean(payload?.setCompactionM4);
+  requested.opencode = requested.opencode || Boolean(payload?.setOpenCode);
   requested.claudecode = requested.claudecode || Boolean(payload?.setOpenClaude);
   requested.librechat = requested.librechat || Boolean(payload?.setChat);
   requested.remotejsonapp = requested.remotejsonapp || Boolean(payload?.setRemoteJsonApp);
@@ -13541,6 +13555,260 @@ async function syncOpenCodePcAfterLaunch(target) {
     applyOpenCodePcConfig(original, requireGamingPcTarget(target)));
 }
 
+// Local OpenCode (this machine). Unlike the Gaming PC file, llm3 owns one whole
+// provider here ("llm3") instead of splicing a hand-written one, so the file is
+// parsed and rewritten as JSON. Comments do not survive a rewrite; every other
+// key -- other providers, agents, permissions, compaction -- does.
+const OPENCODE_LLM3_PROVIDER = "llm3";
+
+function stripJsoncComments(text) {
+  const src = String(text);
+  let out = "";
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    const next = src[i + 1];
+    if (inString) {
+      out += ch;
+      if (escaped) {
+        escaped = false;
+      } else if (ch === "\\") {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      out += ch;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      while (i < src.length && src[i] !== "\n") {
+        i += 1;
+      }
+      out += "\n";
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i += 2;
+      while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) {
+        i += 1;
+      }
+      i += 1;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function parseJsoncObject(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) {
+    return {};
+  }
+  const parsed = JSON.parse(stripJsoncTrailingCommas(stripJsoncComments(trimmed)));
+  return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+}
+
+function applyOpenCodeM4Config(configInput, target) {
+  const config = (configInput && typeof configInput === "object") ? configInput : {};
+  const modelId = String(target?.modelId || "").trim();
+  const baseUrl = toV1BaseUrl(target?.runtimeBaseUrl);
+  if (!modelId || !baseUrl) {
+    throw new Error("OpenCode sync requires a model id and a runtime base URL.");
+  }
+  const contextLength = Number(target?.contextLength);
+  const contextLimit = Number.isInteger(contextLength) && contextLength > 0 ? contextLength : 240000;
+  const vision = Boolean(target?.supportsVision);
+
+  const providers = (config.provider && typeof config.provider === "object") ? config.provider : {};
+  const previous = (providers[OPENCODE_LLM3_PROVIDER] && typeof providers[OPENCODE_LLM3_PROVIDER] === "object")
+    ? providers[OPENCODE_LLM3_PROVIDER]
+    : {};
+  const previousModelId = Object.keys(previous.models || {})[0] || "";
+  const previousOutput = Number(previous.models?.[previousModelId]?.limit?.output);
+  // Same rule as the Gaming PC harnesses: llm3 owns the reply cap only when the
+  // slot launched with a known reasoning effort (see resolveHarnessOutputLimit).
+  const hasEffort = target?.reasoningEffort !== undefined && target?.reasoningEffort !== null;
+  const outputLimit = hasEffort
+    ? resolveHarnessOutputLimit(target.reasoningEffort, contextLimit)
+    : (Number.isInteger(previousOutput) && previousOutput > 0 ? previousOutput : Math.min(32000, Math.floor(contextLimit / 4)));
+
+  providers[OPENCODE_LLM3_PROVIDER] = {
+    ...previous,
+    npm: "@ai-sdk/openai-compatible",
+    name: previous.name || "llm3",
+    options: {
+      ...(previous.options || {}),
+      baseURL: baseUrl,
+      apiKey: String(target?.apiKey || previous.options?.apiKey || "api-key"),
+    },
+    // One model: the one this slot serves. A stale entry would be offered in the
+    // model picker and fail on use.
+    models: {
+      [modelId]: {
+        name: modelId,
+        limit: { context: contextLimit, output: outputLimit },
+        // OpenCode's schema has no "vision" key: image input is attachment + modalities.
+        attachment: vision,
+        modalities: { input: vision ? ["text", "image"] : ["text"], output: ["text"] },
+      },
+    },
+  };
+  config.provider = providers;
+  if (!config.$schema) {
+    config.$schema = "https://opencode.ai/config.json";
+  }
+
+  // Point the default model at the slot. small_model and any agent override are
+  // repointed only when they already named this provider, so a hand-picked
+  // model elsewhere survives.
+  const selector = `${OPENCODE_LLM3_PROVIDER}/${modelId}`;
+  const ownsSelector = (value) => !value || String(value).startsWith(`${OPENCODE_LLM3_PROVIDER}/`);
+  config.model = selector;
+  if (ownsSelector(config.small_model)) {
+    config.small_model = selector;
+  }
+  for (const agent of Object.values(config.agent || {})) {
+    if (agent && typeof agent === "object" && agent.model && ownsSelector(agent.model)) {
+      agent.model = selector;
+    }
+  }
+  return config;
+}
+
+function compareSemver(a, b) {
+  const pa = String(a || "").split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
+  const pb = String(b || "").split(/[.-]/).map((part) => Number.parseInt(part, 10) || 0);
+  for (let i = 0; i < 3; i += 1) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) {
+      return (pa[i] || 0) - (pb[i] || 0);
+    }
+  }
+  return 0;
+}
+
+async function readNpmGlobalPackageVersion(pkg) {
+  try {
+    const { stdout } = await execFileAsync("npm", ["ls", "-g", pkg, "--depth=0", "--json"], getExecOptions({
+      maxBuffer: 4 * 1024 * 1024,
+      timeout: 60 * 1000,
+    }));
+    return String(JSON.parse(stdout || "{}")?.dependencies?.[pkg]?.version || "");
+  } catch (error) {
+    // `npm ls` exits 1 when the package is absent but still prints the JSON.
+    try {
+      return String(JSON.parse(error?.stdout || "{}")?.dependencies?.[pkg]?.version || "");
+    } catch {
+      return "";
+    }
+  }
+}
+
+// Installs OpenCode when it is missing and upgrades it when npm has a newer
+// release. Only the npm package is managed: a copy installed another way
+// (curl script, brew) is upgraded by its own `opencode upgrade`.
+async function ensureLatestOpenCode() {
+  const pkg = OPENCODE_NPM_PACKAGE;
+  const execOpts = getExecOptions({ maxBuffer: 8 * 1024 * 1024, timeout: 10 * 60 * 1000 });
+  const { stdout: latestOut } = await execFileAsync("npm", ["view", pkg, "version"], getExecOptions({
+    maxBuffer: 1024 * 1024,
+    timeout: 60 * 1000,
+  }));
+  const latest = String(latestOut || "").trim();
+  if (!latest) {
+    throw new Error(`npm did not report a latest version for ${pkg}.`);
+  }
+
+  const installed = await readNpmGlobalPackageVersion(pkg);
+  if (installed && compareSemver(installed, latest) >= 0) {
+    return { ok: true, action: "none", method: "npm", version: installed, latest };
+  }
+
+  if (!installed) {
+    // Not an npm install -- look for a copy installed some other way before
+    // adding a second one next to it.
+    const other = await execFileAsync("opencode", ["--version"], getExecOptions({ timeout: 30 * 1000 }))
+      .then(({ stdout }) => String(stdout || "").trim())
+      .catch(() => "");
+    if (other) {
+      if (compareSemver(other, latest) >= 0) {
+        return { ok: true, action: "none", method: "other", version: other, latest };
+      }
+      await execFileAsync("opencode", ["upgrade"], execOpts);
+      const after = await execFileAsync("opencode", ["--version"], getExecOptions({ timeout: 30 * 1000 }))
+        .then(({ stdout }) => String(stdout || "").trim())
+        .catch(() => "");
+      return { ok: true, action: "upgraded", method: "opencode upgrade", from: other, version: after || latest, latest };
+    }
+  }
+
+  await execFileAsync("npm", ["install", "-g", `${pkg}@latest`], execOpts);
+  const now = await readNpmGlobalPackageVersion(pkg);
+  if (!now) {
+    throw new Error(`npm install -g ${pkg}@latest finished, but npm does not list ${pkg}.`);
+  }
+  return {
+    ok: true,
+    action: installed ? "upgraded" : "installed",
+    method: "npm",
+    ...(installed ? { from: installed } : {}),
+    version: now,
+    latest,
+  };
+}
+
+async function syncOpenCodeM4AfterLaunch(target) {
+  // Install/upgrade first so the config is written for the version that reads it.
+  let install;
+  try {
+    install = await ensureLatestOpenCode();
+  } catch (error) {
+    install = { ok: false, error: formatExecError(error) || "OpenCode install/upgrade failed." };
+  }
+
+  try {
+    let original = "";
+    try {
+      original = await fs.readFile(OPENCODE_M4_CONFIG_PATH, "utf8");
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+    const config = applyOpenCodeM4Config(parseJsoncObject(original), target);
+    const next = `${JSON.stringify(config, null, 2)}\n`;
+    const changed = next !== original;
+    if (changed) {
+      await fs.mkdir(path.dirname(OPENCODE_M4_CONFIG_PATH), { recursive: true });
+      await fs.writeFile(OPENCODE_M4_CONFIG_PATH, next, "utf8");
+    }
+    const result = {
+      ok: install.ok !== false,
+      model: target.modelId,
+      base_url: toV1BaseUrl(target.runtimeBaseUrl),
+      config_path: OPENCODE_M4_CONFIG_PATH,
+      config_changed: changed,
+      install,
+    };
+    // The config is written either way, but a failed install/upgrade is the part
+    // the user asked for, so it must not read as success.
+    return install.ok === false
+      ? { ...result, error: `OpenCode config updated, but install/upgrade failed: ${install.error}` }
+      : result;
+  } catch (error) {
+    return {
+      ok: false,
+      install,
+      error: formatExecError(error) || "OpenCode sync failed.",
+    };
+  }
+}
+
 async function syncApplicationTarget(applicationKey, target) {
   if (applicationKey === "hermes") {
     return syncHermesAfterLaunch(target);
@@ -13550,6 +13818,9 @@ async function syncApplicationTarget(applicationKey, target) {
   }
   if (applicationKey === "compactionm4") {
     return syncHermesM4CompactionAfterLaunch(target);
+  }
+  if (applicationKey === "opencode") {
+    return syncOpenCodeM4AfterLaunch(target);
   }
   if (applicationKey === "remotejsonapp") {
     return syncRemoteJsonAppAfterLaunch(target);
@@ -15815,6 +16086,7 @@ function buildDefaultProfileSlotConfig(slotId) {
     setHermesM4: false,
     setCompaction: false,
     setCompactionM4: false,
+    setOpenCode: false,
     setRemoteJsonApp: false,
     setSqliteApp: false,
     setLibreChat: false,
@@ -15916,6 +16188,7 @@ function normalizeProfileSlotConfig(slotId, value) {
     setHermesM4: Boolean(value?.setHermesM4),
     setCompaction: Boolean(value?.setCompaction),
     setCompactionM4: Boolean(value?.setCompactionM4),
+    setOpenCode: Boolean(value?.setOpenCode),
     setRemoteJsonApp: Boolean(value?.setRemoteJsonApp),
     setSqliteApp: Boolean(value?.setSqliteApp),
     setLibreChat: Boolean(value?.setLibreChat ?? value?.setChat),
@@ -16160,6 +16433,7 @@ function buildRequestedApplicationTargetsFromProfileSlot(slotConfig) {
     hermesm4: Boolean(slotConfig?.setHermesM4),
     compaction: Boolean(slotConfig?.setCompaction),
     compactionm4: Boolean(slotConfig?.setCompactionM4),
+    opencode: Boolean(slotConfig?.setOpenCode),
     remotejsonapp: Boolean(slotConfig?.setRemoteJsonApp),
     sqliteapp: Boolean(slotConfig?.setSqliteApp),
     librechat: Boolean(slotConfig?.setLibreChat ?? slotConfig?.setChat),
@@ -16401,6 +16675,8 @@ function applicationFlagSetToProfileSlotFields(flags) {
     setHermes: Boolean(flags?.hermes),
     setHermesM4: Boolean(flags?.hermesm4),
     setCompaction: Boolean(flags?.compaction),
+    setCompactionM4: Boolean(flags?.compactionm4),
+    setOpenCode: Boolean(flags?.opencode),
     setRemoteJsonApp: Boolean(flags?.remotejsonapp),
     setSqliteApp: Boolean(flags?.sqliteapp),
     setLibreChat: Boolean(flags?.librechat),
@@ -18967,6 +19243,10 @@ module.exports = {
   syncOmpPcAfterLaunch,
   syncPiPcAfterLaunch,
   syncOpenCodePcAfterLaunch,
+  syncOpenCodeM4AfterLaunch,
+  applyOpenCodeM4Config,
+  parseJsoncObject,
+  ensureLatestOpenCode,
   syncHermesAfterLaunch,
   syncHermesCompactionAfterLaunch,
   syncHermesCompactionAfterStop,
