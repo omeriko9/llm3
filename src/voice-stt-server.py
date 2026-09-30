@@ -139,16 +139,25 @@ def root():
     return jsonify({"service": "voice-stt", "loaded": MODEL is not None, "model": MODEL_KEY, "backend": BACKEND})
 
 
-def _transcribe(tmp_path: str, language):
-    """Run the loaded backend. Return the text, the language, and its probability."""
+def _transcribe(tmp_path: str, language, prompt=None):
+    """Run the loaded backend. Return the text, the language, and its probability.
+
+    prompt is the text before this audio (Whisper's initial_prompt). A caller
+    that cuts a long recording into pieces sends the end of the last piece, so
+    names and terms keep one spelling from piece to piece.
+    """
     # One request at a time: the model is not safe to call from two threads.
     with INFERENCE_LOCK:
         if BACKEND == "faster-whisper":
-            segments, info = MODEL.transcribe(tmp_path, language=language)
+            segments, info = MODEL.transcribe(tmp_path, language=language, initial_prompt=prompt)
             text = "".join(segment.text for segment in segments).strip()
             return text, info.language, info.language_probability
-        result = MODEL.transcribe(tmp_path, language=language, fp16=False)
+        result = MODEL.transcribe(tmp_path, language=language, fp16=False, initial_prompt=prompt)
         return str(result.get("text", "")).strip(), result.get("language") or language, None
+
+
+# faster-whisper keeps the last 223 prompt tokens (max_length 448 // 2 - 1).
+MAX_PROMPT_CHARS = 400
 
 
 def transcribe_uploaded_file(field_name: str):
@@ -162,12 +171,13 @@ def transcribe_uploaded_file(field_name: str):
     # "auto" overrides the slot's default language: the model detects it.
     if language == "auto":
         language = None
+    prompt = (request.form.get("prompt") or "").strip()[-MAX_PROMPT_CHARS:] or None
     with tempfile.NamedTemporaryFile(delete=False, suffix=Path(upload.filename or "audio.wav").suffix or ".wav") as handle:
         upload.save(handle)
         tmp_path = handle.name
 
     try:
-        text, detected, probability = _transcribe(tmp_path, language)
+        text, detected, probability = _transcribe(tmp_path, language, prompt)
         response = {"text": text}
         if language or detected:
             response["language"] = language or detected
