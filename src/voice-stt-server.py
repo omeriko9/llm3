@@ -140,14 +140,15 @@ def root():
 
 
 def _transcribe(tmp_path: str, language):
-    """Run the loaded backend and return the transcribed text."""
+    """Run the loaded backend. Return the text, the language, and its probability."""
     # One request at a time: the model is not safe to call from two threads.
     with INFERENCE_LOCK:
         if BACKEND == "faster-whisper":
-            segments, _info = MODEL.transcribe(tmp_path, language=language)
-            return "".join(segment.text for segment in segments).strip()
+            segments, info = MODEL.transcribe(tmp_path, language=language)
+            text = "".join(segment.text for segment in segments).strip()
+            return text, info.language, info.language_probability
         result = MODEL.transcribe(tmp_path, language=language, fp16=False)
-        return str(result.get("text", "")).strip()
+        return str(result.get("text", "")).strip(), result.get("language") or language, None
 
 
 def transcribe_uploaded_file(field_name: str):
@@ -158,15 +159,20 @@ def transcribe_uploaded_file(field_name: str):
         return jsonify({"error": f"Missing file field: {field_name}"}), 400
 
     language = (request.form.get("language") or "").strip() or DEFAULT_LANGUAGE
+    # "auto" overrides the slot's default language: the model detects it.
+    if language == "auto":
+        language = None
     with tempfile.NamedTemporaryFile(delete=False, suffix=Path(upload.filename or "audio.wav").suffix or ".wav") as handle:
         upload.save(handle)
         tmp_path = handle.name
 
     try:
-        text = _transcribe(tmp_path, language)
+        text, detected, probability = _transcribe(tmp_path, language)
         response = {"text": text}
-        if language:
-            response["language"] = language
+        if language or detected:
+            response["language"] = language or detected
+        if language is None and probability is not None:
+            response["language_probability"] = round(float(probability), 3)
         return jsonify(response)
     finally:
         try:
