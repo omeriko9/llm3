@@ -3473,15 +3473,32 @@ const CHAT_TEMPLATE_CACHE_DIR = process.env.LLM3_CHAT_TEMPLATE_CACHE_DIR
   || path.join(HOME, "models", ".llm3-chat-templates");
 const CHAT_TEMPLATE_CATALOG = [
   {
-    // Default for every Qwen 3.5 / 3.6 / 3.8 GGUF (one file covers all sizes and
-    // Flash-Next). froggeric's Qwen-Fixed v22.5 (medium reasoning by default,
-    // robust tool calls, prefix-cache-safe history) plus a terse-answer system
-    // prompt. Pinned to a commit so an upstream edit cannot change a running
+    // Default for every Qwen 3.5 / 3.6 GGUF (any size). Fixes the official
+    // templates' xhigh-by-default reasoning (which ran replies into max_tokens),
+    // empty-think poisoning, stringified tool-argument crashes and history
+    // re-rendering that broke the prefix KV cache. Qwen 3.8 gets Qwen Sharp
+    // instead. Pinned to a commit so an upstream edit cannot change a running
+    // setup; bump revision and fileName together to update.
+    key: "qwen-fixed",
+    label: "Qwen Fixed (froggeric)",
+    source: "froggeric",
+    description: "Fixed Qwen 3.5/3.6 template (v22.5): medium reasoning by default instead of xhigh, reasoning-effort aliases and inline <|think_*|> tags, robust tool calls, prefix-cache-safe history.",
+    repoId: "froggeric/Qwen-Fixed-Chat-Templates",
+    revision: "855bffc49448e299789730ff92c9b8d834d6cc14",
+    remotePath: "chat_template.jinja",
+    fileName: "qwen-fixed-froggeric-v22.5.jinja",
+    preferred: true,
+    supports: (model) => isQwenFixedTemplateModel(model),
+  },
+  {
+    // Default for every Qwen 3.8 GGUF (any size, including Flash-Next).
+    // froggeric's Qwen-Fixed v22.5 plus a terse-answer system prompt.
+    // Pinned to a commit so an upstream edit cannot change a running
     // setup; bump revision and fileName together to update.
     key: "qwen-sharp",
     label: "Qwen Sharp",
     source: "peculiar-ragdoll",
-    description: "Token-efficient Qwen 3.5/3.6/3.8 template (v22.5.0): terse-answer system prompt, reasoning-effort control, tool-call format enforcement and consecutive-tool-failure warnings.",
+    description: "Token-efficient Qwen 3.8 template (v22.5.0): terse-answer system prompt, reasoning-effort control, tool-call format enforcement and consecutive-tool-failure warnings.",
     repoId: "peculiar-ragdoll/Qwen-Sharp-Chat-Templates",
     revision: "85461fc118aaf25e7319c7ecf2481f944aac3a32",
     remotePath: "chat_template.jinja",
@@ -3491,11 +3508,19 @@ const CHAT_TEMPLATE_CATALOG = [
   },
 ];
 
-// Qwen 3.5, 3.6 and 3.8 in any size, dense or MoE, including 3.8 Flash-Next.
+// Strip separators so "Qwen3.8-27B", "qwen_3_8 27b" and "Qwen3.8 27B" all match.
+function compactQwenTraitText(model) {
+  return modelTraitText(model).replace(/[\s._\-/]/g, "");
+}
+
+// Qwen 3.5 and 3.6 in any size, dense or MoE.
+function isQwenFixedTemplateModel(model) {
+  return /qwen3(5|6)/.test(compactQwenTraitText(model));
+}
+
+// Qwen 3.8 in any size, including Flash-Next.
 function isQwenSharpTemplateModel(model) {
-  // Strip separators so "Qwen3.8-27B", "qwen_3_8 27b" and "Qwen3.8 27B" all match.
-  const compact = modelTraitText(model).replace(/[\s._\-/]/g, "");
-  return /qwen3(5|6|8)/.test(compact);
+  return compactQwenTraitText(model).includes("qwen38");
 }
 
 function getChatTemplateOptionsForModel(model) {
@@ -19201,6 +19226,7 @@ module.exports = {
   getSlotStatus,
   isVisionProjectorFile,
   getChatTemplateOptionsForModel,
+  isQwenFixedTemplateModel,
   isQwenSharpTemplateModel,
   parseIoAcceleratorStats,
   isPrivateLan16Host,
