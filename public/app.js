@@ -5438,6 +5438,7 @@ function buildModelsSlotRuntimeDetails(item) {
     ...contextRows,
     { label: "Parallel", value: String(NumberFmt(params.parallel) || "n/a") },
     { label: "Thinking", value: params.thinking ? "on" : "off" },
+    { label: "Thinking budget", value: params.reasoningBudget === -1 ? "Unlimited" : (Number.isInteger(params.reasoningBudget) && params.reasoningBudget >= 0 ? `${NumberFmt(params.reasoningBudget)} tokens` : "n/a") },
     ...reasoningEffortDetailRows(params),
     { label: "Temperature", value: Number.isFinite(Number(params.temperature)) ? String(params.temperature) : "n/a" },
     { label: "Top P", value: Number.isFinite(Number(params.topP)) ? String(params.topP) : "n/a" },
