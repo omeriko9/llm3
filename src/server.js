@@ -3589,7 +3589,15 @@ async function ensureChatTemplateFile(templateKey) {
   }
 
   const url = `https://huggingface.co/${entry.repoId}/resolve/${entry.revision}/${entry.remotePath}`;
-  const response = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(HF_FETCH_TIMEOUT_MS) });
+  // A bare "fetch failed" gave no hint that the model itself was fine and only
+  // this download (DNS, offline) stopped the launch.
+  let response;
+  try {
+    response = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(HF_FETCH_TIMEOUT_MS) });
+  } catch (error) {
+    const cause = error?.cause?.code || error?.cause?.message || error?.message || String(error);
+    throw new Error(`Chat template download failed for ${entry.label} (${cause}). Pick "Model default" in the template menu to launch without it.`);
+  }
   if (!response.ok) {
     throw new Error(`Chat template download failed for ${entry.label} (HTTP ${response.status}).`);
   }
