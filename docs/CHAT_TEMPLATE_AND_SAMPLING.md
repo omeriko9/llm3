@@ -1,5 +1,29 @@
 # Chat templates & sampling: what actually reaches the model
 
+## Application output budgets
+
+Launch/rebind sync carries the live slot's `thinking` and `reasoningBudget`, as well
+as mlx-dspark's `reasoningEffort`. A finite thinking budget requires at least that
+many output tokens **plus 4,000 answer tokens**. For example, a 4,096-token budget
+needs an 8,096-token output allowance. Thinking disabled uses a 4,000-token baseline;
+unbounded thinking uses the existing effort policy (32,000 by default), which is
+an allowance, not a guarantee that an unbounded reasoning run finishes.
+
+This policy updates OpenCode's model output limit on both machines, Pi/OMP's
+`maxTokens`, Hermes's `model.max_tokens` (local, remote, PC and dedicated profiles),
+Claude Code's `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, and the SQLite application's inherited
+`HERMES_MAX_TOKENS` on its PM2 refresh. Pi/OpenCode vision providers use the vision
+slot's own context and budget. Hermes auxiliary calls have separate per-task
+controls; the main-agent setting does not override their explicit request limits.
+
+Existing larger Pi/OMP/Hermes allowances are retained when they fit the context.
+Sync rejects a finite budget that cannot leave input space and 4,000 answer tokens
+inside the context window. Application sessions may cache their configuration;
+restart/reload the client after a rebind. Explicit per-request or agent overrides
+can still impose a smaller limit. Endpoint-only integrations and third-party apps
+must account for those request limits themselves; syncing a model URL alone does
+not change the token allowance of every request they send.
+
 Findings from 2026-07-31. Theme: llm3 was silently substituting something other than what the
 model was packaged or configured with — the **chat template** (HF download path) and the
 **sampling params** (public slot proxy) — and its logging destroyed the evidence needed to tell

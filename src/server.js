@@ -11681,8 +11681,42 @@ function resolveHarnessOutputLimit(reasoningEffort, contextLength = 0) {
   return base;
 }
 
-// Only launchers that actually expose a reasoning-effort knob get an llm3-owned
-// output cap; everything else keeps whatever the file already had. The launcher
+// Output includes reasoning. Reserve answer space in addition to a finite
+// reasoning budget; an unbounded budget gets a generous (not guaranteed) cap.
+function resolveTargetOutputLimit(target, previous = null) {
+  const raw = target?.reasoningBudget;
+  const budget = raw === null || raw === undefined ? null : Number(raw);
+  const hasBudget = Number.isInteger(budget) && budget >= -1;
+  const hasEffort = target?.reasoningEffort !== undefined && target?.reasoningEffort !== null;
+  if (!hasBudget && !hasEffort && typeof target?.thinking !== "boolean") return null;
+  const thinking = target?.thinking !== false && target?.reasoningEffort !== "off";
+  const minimum = thinking && hasBudget && budget >= 0 ? budget + 4000 : 4000;
+  const desired = thinking
+    ? (hasBudget && budget >= 0 ? minimum : resolveHarnessOutputLimit(target?.reasoningEffort, target?.contextLength))
+    : 4000;
+  const ctx = Number(target?.contextLength);
+  const ceiling = Number.isInteger(ctx) && ctx > 0 ? ctx - Math.min(4096, Math.floor(ctx / 2)) : Infinity;
+  if (minimum > ceiling) {
+    throw new Error(`Reasoning budget ${budget} leaves insufficient context for input and a 4000-token answer; reduce the thinking budget or increase context size.`);
+  }
+  return Math.min(ceiling, Math.max(desired, Number(previous) || 0));
+}
+
+function syncTargetThinkingParams(params) {
+  return { thinking: params?.thinking, reasoningBudget: params?.reasoningBudget };
+}
+
+function visionOutputTarget(target) {
+  return {
+    contextLength: target?.visionContextLength,
+    thinking: target?.visionThinking,
+    reasoningBudget: target?.visionReasoningBudget,
+    reasoningEffort: target?.visionReasoningEffort,
+  };
+}
+
+// Only mlx-dspark exposes reasoning effort; GGUF uses a numeric budget instead.
+// The launcher
 // name arrives as `launcher` on a launch request but as `runtime` in the state file
 // the launcher writes, so accept either rather than depending on normalisation.
 function syncTargetReasoningEffort(model, source) {
@@ -11710,6 +11744,7 @@ async function buildLaunchSyncTarget(slot, model, params) {
     slotId: slot.id,
     modelId,
     contextLength,
+    ...syncTargetThinkingParams({ ...params, ...status?.params }),
     reasoningEffort: syncTargetReasoningEffort(
       [params?.launcher, status?.model?.launcher, status?.model?.runtime],
       params?.reasoningEffort ?? status?.params?.reasoningEffort),
@@ -11738,6 +11773,7 @@ async function buildSlotSyncTarget(slot, status) {
     slotId: slot.id,
     modelId,
     contextLength,
+    ...syncTargetThinkingParams(status?.params),
     reasoningEffort: syncTargetReasoningEffort(
       [status?.model?.launcher, status?.model?.runtime],
       status?.params?.reasoningEffort),
@@ -11747,6 +11783,8 @@ async function buildSlotSyncTarget(slot, status) {
 }
 
 async function enrichSyncTargetWithVision(target, preferredSlotIds = []) {
+  // Validate before concurrent app syncs can partially update their configs.
+  resolveTargetOutputLimit(target);
   const visionTarget = await resolveVisionSyncTarget(preferredSlotIds);
   return {
     ...target,
@@ -11762,6 +11800,10 @@ async function enrichSyncTargetWithVision(target, preferredSlotIds = []) {
     visionApiKey: visionTarget?.apiKey || target.apiKey,
     visionRuntimeBaseUrl: visionTarget?.runtimeBaseUrl || target.runtimeBaseUrl,
     visionSlotId: visionTarget?.slotId || target.slotId,
+    visionContextLength: visionTarget?.contextLength,
+    visionThinking: visionTarget?.thinking,
+    visionReasoningBudget: visionTarget?.reasoningBudget,
+    visionReasoningEffort: visionTarget?.reasoningEffort,
   };
 }
 
@@ -11793,6 +11835,10 @@ async function resolveVisionSyncTarget(preferredSlotIds = []) {
     return {
       slotId,
       modelId,
+      contextLength: await resolveSlotContextLength(slot, status),
+      ...syncTargetThinkingParams(status?.params),
+      reasoningEffort: syncTargetReasoningEffort(
+        [status?.model?.launcher, status?.model?.runtime], status?.params?.reasoningEffort),
       apiKey: getRuntimeApiKey(status?.model?.runtime),
       runtimeBaseUrl: await resolveLiveSlotRuntimeBaseUrl(slot, status),
     };
@@ -11936,6 +11982,7 @@ async function syncHermesAfterLaunch(target) {
     vision_api_key: String(target?.visionApiKey || target?.apiKey || "api"),
     vision_model: target.visionModelId || target.modelId,
     context_length: target.contextLength,
+    max_tokens: resolveTargetOutputLimit(target),
     base_url: HERMES_SYNC_BASE_URL || target.runtimeBaseUrl,
     vision_base_url: HERMES_SYNC_BASE_URL || target.visionRuntimeBaseUrl || target.runtimeBaseUrl,
   };
@@ -12100,6 +12147,8 @@ function applyLocalHermesModelTarget(configInput, target) {
   }
 
   const config = ensureObject(configInput);
+  const previousOutput = config.model?.max_tokens;
+  const outputLimit = resolveTargetOutputLimit(target, previousOutput);
   const modelCfg = ensureObject(config.model);
   const prevModelBaseUrl = String(modelCfg.base_url || "");
   const prevModelId = String(modelCfg.model || modelCfg.default || "");
@@ -12112,6 +12161,7 @@ function applyLocalHermesModelTarget(configInput, target) {
   modelCfg.provider = "custom";
   modelCfg.api_key = String(target?.apiKey || "api");
   modelCfg.context_length = contextLength;
+  if (outputLimit !== null) modelCfg.max_tokens = outputLimit;
   config.model = modelCfg;
 
   const auxiliaryCfg = ensureObject(config.auxiliary);
@@ -12160,7 +12210,8 @@ function applyLocalHermesModelTarget(configInput, target) {
   config.auxiliary = auxiliaryCfg;
 
   const configChanged = (
-    prevModelBaseUrl !== String(target.runtimeBaseUrl || "")
+    previousOutput !== modelCfg.max_tokens
+    || prevModelBaseUrl !== String(target.runtimeBaseUrl || "")
     || prevModelId !== String(target.modelId || "")
     || prevProvider !== "custom"
     || prevApiKey !== String(modelCfg.api_key || "")
@@ -12820,6 +12871,7 @@ function buildSqliteAppSyncScript(target) {
   const modelId = String(target?.modelId || "").trim();
   const apiKey = String(SQLITE_APP_SYNC_API_KEY || "api").trim() || "api";
   const pm2App = String(SQLITE_APP_SYNC_PM2_APP || "").trim();
+  const outputLimit = resolveTargetOutputLimit(target);
 
   const sql = [
     "BEGIN IMMEDIATE;",
@@ -12852,7 +12904,7 @@ function buildSqliteAppSyncScript(target) {
     ...(pm2App
       ? [
           "if command -v pm2 >/dev/null 2>&1 && pm2 describe " + shellQuote(pm2App) + " >/dev/null 2>&1; then",
-          `  pm2 restart ${shellQuote(pm2App)} >/dev/null`,
+          `  ${outputLimit === null ? "" : `HERMES_MAX_TOKENS=${outputLimit} `}pm2 restart ${shellQuote(pm2App)} --update-env >/dev/null`,
           `  printf '__SQLITE_APP_PM2__%s__END__\\n' ${shellQuote(pm2App)}`,
           "else",
           `  printf '__SQLITE_APP_PM2_MISSING__%s__END__\\n' ${shellQuote(pm2App)}`,
@@ -13093,6 +13145,11 @@ function requireGamingPcTarget(target) {
   }
   const contextLength = Number(target?.contextLength);
   return {
+    ...syncTargetThinkingParams(target),
+    visionContextLength: target?.visionContextLength,
+    visionThinking: target?.visionThinking,
+    visionReasoningBudget: target?.visionReasoningBudget,
+    visionReasoningEffort: target?.visionReasoningEffort,
     modelId,
     runtimeBaseUrl,
     // OMP addresses the server root; PI/OpenCode want the /v1 suffix.
@@ -13104,10 +13161,8 @@ function requireGamingPcTarget(target) {
     hasVisionTarget: Boolean(target?.hasVisionTarget),
     visionModelId: String(target?.visionModelId || "").trim(),
     visionV1BaseUrl: toV1BaseUrl(target?.visionRuntimeBaseUrl || target?.runtimeBaseUrl),
-    // Deliberately preserves undefined-vs-"" : undefined means the launcher has no
-    // reasoning knob and the harness keeps its own output cap, while "" means the
-    // slot launched on the model template's own default. Collapsing them would make
-    // every GGUF slot claim a 32k reply budget it never asked for.
+    // Keep an absent effort distinct from the template's default effort.
+    // GGUF thinking/budget travel separately above.
     reasoningEffort: target?.reasoningEffort === undefined || target?.reasoningEffort === null
       ? undefined
       : String(target.reasoningEffort).trim().toLowerCase(),
@@ -13179,6 +13234,8 @@ function applyOmpPcConfig(original, spec) {
   // syncOmpPcAfterLaunch repoints those in the same sync via applyOmpPcSettings.
   primary.id = spec.modelId;
   primary.name = spec.modelId;
+  const outputLimit = resolveTargetOutputLimit(spec, primary.maxTokens);
+  if (outputLimit !== null) primary.maxTokens = outputLimit;
   primary.input = spec.supportsVision ? ["text", "image"] : ["text"];
   if (spec.contextLength) {
     primary.contextWindow = spec.contextLength;
@@ -13257,6 +13314,8 @@ function applyPiPcConfig(original, spec) {
   // the alias it reads back, so the global default stays valid across the rename;
   // only a per-project override needs reselecting once.
   primary.id = spec.modelId;
+  const outputLimit = resolveTargetOutputLimit(spec, primary.maxTokens);
+  if (outputLimit !== null) primary.maxTokens = outputLimit;
   primary.input = spec.supportsVision ? ["text", "image"] : ["text"];
   if (spec.contextLength) {
     primary.contextWindow = spec.contextLength;
@@ -13278,8 +13337,11 @@ function applyPiPcConfig(original, spec) {
     // Follows whichever slot serves images, which may not be the launched one.
     visionPrimary.id = spec.visionModelId;
     visionPrimary.input = ["text", "image"];
-    if (spec.contextLength) {
-      visionPrimary.contextWindow = spec.contextLength;
+    const visionTarget = visionOutputTarget(spec);
+    const visionOutput = resolveTargetOutputLimit(visionTarget, visionPrimary.maxTokens);
+    if (visionOutput !== null) visionPrimary.maxTokens = visionOutput;
+    if (visionTarget.contextLength) {
+      visionPrimary.contextWindow = visionTarget.contextLength;
     }
     visionModels[0] = visionPrimary;
     visionProvider.models = visionModels;
@@ -13525,12 +13587,8 @@ function stripJsoncTrailingCommas(text) {
 
 function applyOpenCodePcConfig(original, spec) {
   const contextLimit = spec.contextLength || 240000;
-  // undefined = this launcher has no reasoning-effort knob, so keep the file's own
-  // hand-tuned "output". A string (including "") means llm3 launched the slot with a
-  // known thinking budget and owns the cap. See resolveHarnessOutputLimit.
-  const outputLimit = spec.reasoningEffort === undefined || spec.reasoningEffort === null
-    ? null
-    : resolveHarnessOutputLimit(spec.reasoningEffort, contextLimit);
+  // Numeric GGUF budgets and mlx-dspark effort both determine the output cap.
+  const outputLimit = resolveTargetOutputLimit({ ...spec, contextLength: contextLimit });
   let updated = rewriteOpenCodeProvider(original, "llama.cpp", {
     baseUrl: spec.v1BaseUrl,
     contextLimit,
@@ -13547,7 +13605,8 @@ function applyOpenCodePcConfig(original, spec) {
   if (spec.hasVisionTarget && spec.visionModelId) {
     updated = rewriteOpenCodeProvider(updated, "llama.cpp-vision", {
       baseUrl: spec.visionV1BaseUrl,
-      contextLimit,
+      contextLimit: spec.visionContextLength || contextLimit,
+      outputLimit: resolveTargetOutputLimit(visionOutputTarget(spec)),
       vision: true,
       modelId: spec.visionModelId,
     }) || updated;
@@ -13646,12 +13705,9 @@ function applyOpenCodeM4Config(configInput, target) {
     : {};
   const previousModelId = Object.keys(previous.models || {})[0] || "";
   const previousOutput = Number(previous.models?.[previousModelId]?.limit?.output);
-  // Same rule as the Gaming PC harnesses: llm3 owns the reply cap only when the
-  // slot launched with a known reasoning effort (see resolveHarnessOutputLimit).
-  const hasEffort = target?.reasoningEffort !== undefined && target?.reasoningEffort !== null;
-  const outputLimit = hasEffort
-    ? resolveHarnessOutputLimit(target.reasoningEffort, contextLimit)
-    : (Number.isInteger(previousOutput) && previousOutput > 0 ? previousOutput : Math.min(32000, Math.floor(contextLimit / 4)));
+  // Match the Gaming PC policy, including numeric GGUF reasoning budgets.
+  const outputLimit = resolveTargetOutputLimit({ ...target, contextLength: contextLimit })
+    ?? (Number.isInteger(previousOutput) && previousOutput > 0 ? previousOutput : Math.min(32000, Math.floor(contextLimit / 4)));
 
   providers[OPENCODE_LLM3_PROVIDER] = {
     ...previous,
@@ -15019,6 +15075,8 @@ async function updateClaudeSettings(target) {
     }
   }
   const env = settings.env && typeof settings.env === "object" ? settings.env : {};
+  const outputLimit = resolveTargetOutputLimit(target, env.CLAUDE_CODE_MAX_OUTPUT_TOKENS);
+  if (outputLimit !== null) env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = String(outputLimit);
   const label = `${target.modelId} local`;
   const description = `Local OpenClaude proxy to ${target.runtimeBaseUrl} · ctx ${formatContextLength(target.contextLength)}`;
 
@@ -15162,6 +15220,8 @@ function buildHermesSyncRemoteScript(payload) {
     "model_cfg['model'] = effective_model",
     "model_cfg['default'] = effective_model",
     "model_cfg['context_length'] = int(payload['context_length'])",
+    "if payload.get('max_tokens') is not None:",
+    "    model_cfg['max_tokens'] = int(payload['max_tokens'])",
     "if effective_base_url:",
     "    model_cfg['base_url'] = effective_base_url",
     "auxiliary_cfg = config.setdefault('auxiliary', {})",
@@ -19252,6 +19312,9 @@ module.exports = {
   applyOmpPcSettings,
   applyPiPcSettings,
   applyPiPcConfig,
+  applyLocalHermesModelTarget,
+  resolveTargetOutputLimit,
+  syncTargetThinkingParams,
   applyOpenCodePcConfig,
   requireGamingPcTarget,
   syncHermesPcAfterLaunch,
