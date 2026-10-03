@@ -1990,6 +1990,54 @@ app.get("/api/websites", async (_req, res) => {
   }
 });
 
+// The /fav page: favorites only, each with the address a tap should open.
+// Without ?status=1 it skips the health checks, so the list shows at once
+// (a full /api/websites waits on every site); the page asks again with
+// ?status=1 for the online dots.
+const websitesFavorites = websitesDb.prepare(
+  "SELECT * FROM websites WHERE favorite = 1 ORDER BY category, name"
+);
+
+function favoriteOpenUrl(website, embedPath) {
+  if (embedPath && EMBED_OPEN_DEFAULT.has(embedPath.split("/")[2])) return embedPath;
+  if (String(website.external_url || "").trim()) return website.external_url.trim();
+  const lanHost = String(website.machine_ip || "").trim() || getLanIp() || "127.0.0.1";
+  return String(website.internal_url || "").replace(/\/\/(127\.0\.0\.1|localhost)(?=[:/]|$)/, `//${lanHost}`);
+}
+
+app.get("/api/websites/favorites", async (req, res) => {
+  try {
+    const withStatus = req.query.status === "1";
+    const websiteIcons = loadWebsiteIcons();
+    const rows = await Promise.all(
+      websitesFavorites.all().map(async (w) => {
+        const embedPath = embedPathForWebsite(w, EMBED_PROXIES, LOCAL_IPV4_ADDRESSES);
+        const row = {
+          id: w.id,
+          name: w.name,
+          category: w.category,
+          url: favoriteOpenUrl(w, embedPath),
+          embedded: Boolean(embedPath && EMBED_OPEN_DEFAULT.has(embedPath.split("/")[2])),
+          iconPath: typeof websiteIcons[w.name] === "string" ? websiteIcons[w.name] : null,
+        };
+        if (withStatus) {
+          const health = await checkWebsiteHealth(w);
+          row.online = health.online;
+          row.sleeping = health.sleeping;
+        }
+        return row;
+      })
+    );
+    res.json(rows);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get(["/fav", "/fav/"], (_req, res) => {
+  res.sendFile(path.join(__dirname, "..", "public", "fav.html"));
+});
+
 // Pinned Websites-tab cards for embed sites that carry a card title in .env.
 // Negative ids keep them apart from database rows.
 app.get("/api/embed-sites", (_req, res) => {

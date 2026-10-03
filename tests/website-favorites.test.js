@@ -43,9 +43,23 @@ test("POST /api/websites/favorite sets and clears the favorite flag", async (t) 
   assert.equal((await post({ id: seeded.id, favorite: "yes" })).status, 400);
   assert.equal((await post({ id: 999999, favorite: true })).status, 404);
 
+  const favorites = async (query = "") => (await fetch(`${base}/api/websites/favorites${query}`)).json();
+  assert.deepEqual(await favorites(), []);
+
   assert.equal((await post({ id: seeded.id, favorite: true })).status, 200);
   assert.equal((await list()).find((w) => w.id === seeded.id).favorite, true);
 
+  // /fav lists only favorites, each with a tap address. Health only on request.
+  const [fav] = await favorites();
+  assert.equal(fav.id, seeded.id);
+  assert.match(fav.url, /^http:\/\/[^/]+:\d+$/);
+  assert.equal("online" in fav, false);
+  assert.equal(typeof (await favorites("?status=1"))[0].online, "boolean");
+  const page = await fetch(`${base}/fav`);
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /api\/websites\/favorites/);
+
   assert.equal((await post({ id: seeded.id, favorite: false })).status, 200);
   assert.equal((await list()).find((w) => w.id === seeded.id).favorite, false);
+  assert.deepEqual(await favorites(), []);
 });

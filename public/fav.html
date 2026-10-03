@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#09090b">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Favorites">
+  <title>llm3 Favorites</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="apple-touch-icon" href="/favicon-180.png">
+  <!-- The quick list of starred Websites-tab rows, for a phone. Star a site on
+       the Websites tab (or its right-click menu) to put it here. -->
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg: #09090b;
+      --bg-card: #1c1c20;
+      --bg-hover: #26262c;
+      --border: #2a2a33;
+      --text: #efeff1;
+      --text-muted: #6b6c7a;
+      --accent: #7c5cfc;
+      --star: #facc15;
+      --green: #22c55e;
+      --red: #ef4444;
+      --amber: #f59e0b;
+    }
+    html { -webkit-text-size-adjust: 100%; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      min-height: 100vh;
+      padding: max(16px, env(safe-area-inset-top)) max(16px, env(safe-area-inset-right))
+               max(16px, env(safe-area-inset-bottom)) max(16px, env(safe-area-inset-left));
+    }
+    .wrap { max-width: 640px; margin: 0 auto; }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    h1 svg { width: 20px; height: 20px; fill: var(--star); stroke: var(--star); }
+    header a {
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      text-decoration: none;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    header a:hover, header a:focus-visible { color: var(--text); border-color: var(--accent); outline: none; }
+    ul { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+    .fav {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-height: 64px;
+      padding: 12px 14px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      color: var(--text);
+      text-decoration: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .fav:hover, .fav:focus-visible { background: var(--bg-hover); border-color: var(--icon); outline: none; }
+    .fav:active { transform: scale(0.99); }
+    .icon {
+      flex: none;
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--icon);
+      background: color-mix(in srgb, var(--icon) 14%, transparent);
+    }
+    .icon svg { width: 22px; height: 22px; }
+    .text { flex: 1; min-width: 0; }
+    .name {
+      font-size: 1rem;
+      font-weight: 500;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .meta { font-size: 0.78rem; color: var(--text-muted); margin-top: 2px; }
+    .cat { text-transform: capitalize; }
+    .dot {
+      flex: none;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--border);
+    }
+    .dot.online { background: var(--green); box-shadow: 0 0 5px rgba(34,197,94,0.5); }
+    .dot.offline { background: var(--red); box-shadow: 0 0 5px rgba(239,68,68,0.5); }
+    .dot.sleeping { background: transparent; border: 2px solid var(--amber); }
+    .note {
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      line-height: 1.5;
+      text-align: center;
+      padding: 48px 16px;
+      border: 1px dashed var(--border);
+      border-radius: 12px;
+    }
+    .note a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1><svg viewBox="0 0 24 24" stroke-width="2" stroke-linejoin="round"><path d="M12 2.5l2.94 5.96 6.58.96-4.76 4.64 1.12 6.55L12 17.52l-5.88 3.09 1.12-6.55L2.48 9.42l6.58-.96z"/></svg>Favorites</h1>
+      <a href="/">Dashboard</a>
+    </header>
+    <main id="list"><p class="note">Loading…</p></main>
+  </div>
+  <script>
+    // Same icon colors and name hash as the Websites-tab tiles, so a site keeps
+    // its color here.
+    const ICON_COLORS = ["#818cf8", "#34d399", "#fbbf24", "#f87171", "#a78bfa", "#22d3ee", "#f472b6", "#4ade80",
+      "#fb923c", "#38bdf8", "#f472b6", "#c084fc", "#2dd4bf", "#d97706", "#60a5fa", "#a16207"];
+    const GLOBE = '<circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>';
+    const list = document.getElementById("list");
+
+    function nameColor(name) {
+      let hash = 0;
+      for (let i = 0; i < name.length; i++) hash = ((hash << 5) - hash + name.charCodeAt(i)) | 0;
+      return ICON_COLORS[Math.abs(hash) % ICON_COLORS.length];
+    }
+
+    function esc(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+    }
+
+    function safeHref(url) {
+      return /^(https?:\/\/|\/)/i.test(url) ? url : "#";
+    }
+
+    function dotClass(site) {
+      if (site.online === undefined) return "dot";
+      return site.sleeping ? "dot sleeping" : site.online ? "dot online" : "dot offline";
+    }
+
+    function dotTitle(site) {
+      if (site.online === undefined) return "Checking…";
+      return site.sleeping ? "Asleep" : site.online ? "Online" : "Offline";
+    }
+
+    function render(sites) {
+      if (!sites.length) {
+        list.innerHTML = '<p class="note">No favorites yet.<br>Tap the star on a site in the <a href="/">Websites tab</a> to add it here.</p>';
+        return;
+      }
+      list.innerHTML = "<ul>" + sites.map((site) => {
+        const icon = site.iconPath ? `<path d="${esc(site.iconPath)}"/>` : GLOBE;
+        const cat = `<span class="cat">${esc(site.category)}</span>`;
+        const meta = site.embedded ? `${cat} · inside llm3` : cat;
+        return `<li><a class="fav" href="${esc(safeHref(site.url))}" style="--icon:${nameColor(site.name)}">
+          <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${icon}</svg></span>
+          <span class="text"><span class="name" style="display:block">${esc(site.name)}</span><span class="meta" style="display:block">${meta}</span></span>
+          <span class="${dotClass(site)}" title="${dotTitle(site)}" aria-label="${dotTitle(site)}"></span>
+        </a></li>`;
+      }).join("") + "</ul>";
+    }
+
+    async function load(status) {
+      const res = await fetch(`/api/websites/favorites${status ? "?status=1" : ""}`, { cache: "no-store" });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.json();
+    }
+
+    // The list first, then the status dots: the health checks take seconds.
+    load(false)
+      .then((sites) => {
+        render(sites);
+        if (sites.length) return load(true).then(render);
+      })
+      .catch((error) => {
+        list.innerHTML = `<p class="note">Favorites did not load: ${esc(error.message)}</p>`;
+      });
+  </script>
+</body>
+</html>
