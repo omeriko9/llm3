@@ -950,12 +950,11 @@ const els = {
   pm2Categories: $("#pm2Categories"),
   pm2Table: $("#pm2Table"),
   websiteContextMenu: $("#websiteContextMenu"),
-  embedOverlay: $("#embedOverlay"),
-  embedOverlayClose: $("#embedOverlayClose"),
   ctxRename: $("#ctxRename"),
   ctxInternal: $("#ctxInternal"),
   ctxExternal: $("#ctxExternal"),
-  ctxEmbed: $("#ctxEmbed"),
+  ctxExpose: $("#ctxExpose"),
+  ctxExposeText: $("#ctxExposeText"),
   ctxFavorite: $("#ctxFavorite"),
   ctxFavoriteText: $("#ctxFavoriteText"),
   ctxDelete: $("#ctxDelete"),
@@ -1078,6 +1077,9 @@ function handleWebsiteAction(event) {
     case "pm2-memory":
       updateWebsitePm2Memory(id);
       break;
+    case "expose":
+      toggleWebsiteExpose(id);
+      break;
     default:
       break;
   }
@@ -1094,16 +1096,11 @@ function wireEvents() {
   });
   // Website context menu
   els.ctxRename?.addEventListener("click", () => renameWebsite(state.websiteContext.id));
-  els.embedOverlayClose?.addEventListener("click", closeEmbedOverlay);
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && els.embedOverlay && !els.embedOverlay.hidden) closeEmbedOverlay();
-  });
   els.ctxInternal?.addEventListener("click", () => openInternalUrl(state.websiteContext.id));
   els.ctxExternal?.addEventListener("click", () => openExternalUrl(state.websiteContext.id));
-  els.ctxEmbed?.addEventListener("click", () => {
-    const w = state.websites.find((we) => we.id === state.websiteContext.id);
+  els.ctxExpose?.addEventListener("click", () => {
     hideWebsiteContextMenu();
-    if (w?.embedPath) openEmbedOverlay(w.embedPath, w.name);
+    toggleWebsiteExpose(state.websiteContext.id);
   });
   els.ctxFavorite?.addEventListener("click", () => {
     hideWebsiteContextMenu();
@@ -4262,13 +4259,16 @@ function renderWebsites() {
   els.websitesGrid.innerHTML = filtered.map((w, idx) => {
     const colorIdx = nameColorHash(w.name);
     const color = cardColors[colorIdx];
-    const url = resolveUrl(w);
-    const lanOnly = !hasExternalSubdomain(w);
+    // An exposed site is always opened at its llm3 address, /embed/<slug>/.
+    const url = w.embedPath || resolveUrl(w);
+    const lanOnly = !w.embedPath && !hasExternalSubdomain(w);
     const iconSvg = w.iconPath
       ? `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="${esc(w.iconPath)}"/></svg>`
       : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`;
     const shortName = w.name.length > 16 ? w.name.slice(0, 15) + "…" : w.name;
-    const lanBadge = lanOnly ? `<span class="website-lan-badge">Local</span>` : "";
+    const lanBadge = w.embedPath
+      ? `<span class="website-lan-badge website-llm3-badge">llm3</span>`
+      : lanOnly ? `<span class="website-lan-badge">Local</span>` : "";
     // Three states, not two. A waker keeps the address answering while the
     // service behind it is stopped, so "the port is open" no longer means the
     // service runs -- see wakerLabel.
@@ -4277,21 +4277,20 @@ function renderWebsites() {
       : w.online
         ? `<span class="website-status-dot website-status-dot-online" title="Online"></span>`
         : `<span class="website-status-dot website-status-dot-offline" title="Offline"></span>`;
-    // An embedded site opens inside llm3 as an iframe, not a new tab. It is a
-    // button, not a link: no href to leak, no target, and a small badge so it is
-    // visibly a different kind of card.
+    // A pinned card (a titled LLM3_EMBED_SITES entry) is not a database row: it
+    // only links to its llm3 address, and has no menu, star or toggle.
     if (w.embed) {
       return `
-        <button type="button" class="website-card website-card-embed" data-embed="${esc(w.embed)}" data-embed-title="${esc(w.name)}" title="Open ${esc(w.name)} inside llm3"
+        <a class="website-card website-card-embed" href="${safeHref(w.embed)}" target="_blank" rel="noopener" title="${esc(w.embed)}" draggable="false"
            style="--wb-bg:${color.bg};--wb-border:${color.border};--wb-icon:${color.icon}">
           <div class="website-card-icon">${iconSvg}</div>
           <span class="website-card-name">${shortName}</span>
           <span class="website-card-cat">${esc(w.category)}</span>
           <span class="website-embed-badge">Embed</span>
-        </button>`;
+        </a>`;
     }
     return `
-      <a class="website-card" data-id="${w.id}" data-online="${w.online ? "1" : "0"}"${w.embedDefault ? ` data-embed-default="${esc(w.embedPath)}" data-embed-title="${esc(w.name)}"` : ""} href="${safeHref(url)}" target="_blank" rel="noopener" title="${esc(url)}" draggable="false"
+      <a class="website-card" data-id="${w.id}" data-online="${w.online ? "1" : "0"}" href="${safeHref(url)}" target="_blank" rel="noopener" title="${esc(url)}" draggable="false"
          style="--wb-bg:${color.bg};--wb-border:${color.border};--wb-icon:${color.icon}">
         <div class="website-card-icon">${iconSvg}</div>
         <span class="website-card-name">${shortName}</span>
@@ -4299,36 +4298,25 @@ function renderWebsites() {
         ${lanBadge}
         ${onlineDot}
         ${websiteFavoriteStar(w)}
+        ${websiteExposeToggle(w)}
       </a>`;
   }).join("");
 
-  // The star toggles the favorite. It sits inside the card's link, so it must
-  // stop the click before the link navigates or the embed overlay opens.
-  els.websitesGrid.querySelectorAll(".website-fav-star").forEach((star) => {
+  // The star and the expose switch sit inside the card's link, so they must
+  // stop the click before the link navigates.
+  els.websitesGrid.querySelectorAll(".website-fav-star, .website-expose-toggle").forEach((star) => {
     const toggle = (e) => {
       e.preventDefault();
       e.stopPropagation();
-      toggleWebsiteFavorite(Number(star.closest(".website-card").dataset.id));
+      const id = Number(star.closest(".website-card").dataset.id);
+      if (star.classList.contains("website-expose-toggle")) toggleWebsiteExpose(id);
+      else toggleWebsiteFavorite(id);
     };
     star.addEventListener("click", toggle);
     star.addEventListener("keydown", (e) => {
       if (e.key === "Enter" || e.key === " ") toggle(e);
     });
     star.addEventListener("contextmenu", (e) => e.stopPropagation());
-  });
-
-  // Embedded cards open the in-page iframe overlay.
-  els.websitesGrid.querySelectorAll(".website-card-embed").forEach((card) => {
-    card.addEventListener("click", () => openEmbedOverlay(card.dataset.embed, card.dataset.embedTitle));
-  });
-  // Rows listed in LLM3_EMBED_OPEN_DEFAULT open inside llm3. Ctrl/Cmd/middle click
-  // still opens the site in a new tab.
-  els.websitesGrid.querySelectorAll(".website-card[data-embed-default]").forEach((card) => {
-    card.addEventListener("click", (e) => {
-      if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.shiftKey || e.button !== 0) return;
-      e.preventDefault();
-      openEmbedOverlay(card.dataset.embedDefault, card.dataset.embedTitle);
-    });
   });
 
   // Add right-click handler to website cards (desktop) and long-press (mobile)
@@ -4410,39 +4398,17 @@ function renderWebsites() {
 }
 
 
-// The in-page iframe overlay for embedded sites. One overlay, reused: set the
-// src on open, clear it on close so the framed page (and its polling, its audio)
-// stops when the overlay is hidden rather than running unseen.
-function openEmbedOverlay(src, title) {
-  const overlay = els.embedOverlay || $("#embedOverlay");
-  if (!overlay) return;
-  const frame = overlay.querySelector(".embed-overlay-frame");
-  const label = overlay.querySelector(".embed-overlay-title");
-  const openBtn = overlay.querySelector(".embed-overlay-open");
-  if (label) label.textContent = title || "Embedded site";
-  if (openBtn) openBtn.href = src;
-  if (frame) frame.src = src;
-  overlay.hidden = false;
-  document.body.classList.add("embed-overlay-active");
-}
-
-function closeEmbedOverlay() {
-  const overlay = els.embedOverlay || $("#embedOverlay");
-  if (!overlay) return;
-  const frame = overlay.querySelector(".embed-overlay-frame");
-  if (frame) frame.src = "about:blank";
-  overlay.hidden = true;
-  document.body.classList.remove("embed-overlay-active");
-}
-
 function showWebsiteContextMenu(x, y, id) {
   state.websiteContext = { id, x, y };
   const w = state.websites.find((we) => we.id === id);
   const menu = els.websiteContextMenu;
   // Disable External URL button if no external URL exists
   els.ctxExternal?.classList.toggle("ctx-disabled", !w || !w.external_url || w.external_url.trim() === "");
-  // Only rows llm3 reverse-proxies (see EMBED_PROXIES in server.js) can open inside it.
-  els.ctxEmbed?.classList.toggle("hidden", !w?.embedPath);
+  els.ctxExpose?.classList.toggle("hidden", !w?.canExpose && !w?.exposed);
+  els.ctxExpose?.classList.toggle("ctx-checked", Boolean(w?.exposed));
+  if (els.ctxExposeText) {
+    els.ctxExposeText.textContent = w?.exposed ? "Stop exposing from llm3" : "Expose from llm3";
+  }
   if (els.ctxFavoriteText) {
     els.ctxFavoriteText.textContent = w?.favorite ? "Remove from favorites" : "Add to favorites";
   }
@@ -4464,6 +4430,36 @@ function showWebsiteContextMenu(x, y, id) {
 function websiteFavoriteStar(w) {
   const label = w.favorite ? `Remove ${w.name} from favorites` : `Add ${w.name} to favorites`;
   return `<span class="website-fav-star${w.favorite ? " is-favorite" : ""}" role="button" tabindex="0" aria-pressed="${w.favorite ? "true" : "false"}" title="${esc(label)}" aria-label="${esc(label)}"><svg viewBox="0 0 24 24" stroke-width="2" stroke-linejoin="round"><path d="M12 2.5l2.94 5.96 6.58.96-4.76 4.64 1.12 6.55L12 17.52l-5.88 3.09 1.12-6.55L2.48 9.42l6.58-.96z"/></svg></span>`;
+}
+
+// The "Expose from llm3" switch, bottom-left on a card. On, llm3 serves the
+// site at /embed/<slug>/ and the card opens that address.
+const EXPOSE_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 0 1 0 8.49"/><path d="M7.76 16.24a6 6 0 0 1 0-8.49"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M4.93 19.07a10 10 0 0 1 0-14.14"/></svg>';
+function websiteExposeToggle(w) {
+  if (!w.canExpose && !w.exposed) return "";
+  const label = w.exposed
+    ? `Exposed from llm3 at ${w.embedPath} (click to stop)`
+    : "Expose from llm3";
+  return `<span class="website-expose-toggle${w.exposed ? " is-exposed" : ""}" role="switch" tabindex="0" aria-checked="${w.exposed ? "true" : "false"}" title="${esc(label)}" aria-label="${esc(label)}">${EXPOSE_ICON}</span>`;
+}
+
+async function toggleWebsiteExpose(id) {
+  const w = state.websites.find((we) => we.id === id);
+  if (!w || w.embed) return;
+  try {
+    const result = await fetchJson("/api/websites/expose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, exposed: !w.exposed }),
+    });
+    w.exposed = result.exposed;
+    w.embedPath = result.embedPath;
+    showToast(result.exposed ? `${w.name} is exposed at ${result.embedPath}` : `${w.name} is no longer exposed from llm3`, 3000);
+  } catch (error) {
+    showToast(`Expose not changed: ${error.message}`, 5000);
+  }
+  if (state.websiteView === "table") renderWebsitesTable();
+  else renderWebsites();
 }
 
 // Optimistic: the card moves at once, and goes back if the server refuses.
@@ -4913,6 +4909,7 @@ function renderWebsitesTable() {
           <th>URL</th>
           <th>Category</th>
           <th>Status</th>
+          <th>Exposed</th>
           <th>Actions</th>
         </tr>
       </thead>
@@ -4930,10 +4927,11 @@ function renderWebsitesTable() {
 
           return `
             <tr>
-              <td><a href="${safeHref(w.external_url || url)}" target="_blank" rel="noreferrer">${esc(w.name)}</a></td>
+              <td><a href="${safeHref(w.embedPath || w.external_url || url)}" target="_blank" rel="noreferrer">${esc(w.name)}</a></td>
               <td><a href="${safeHref(url)}" target="_blank" rel="noreferrer">${esc(url)}</a></td>
               <td>${esc(w.category)}</td>
               <td>${statusDot}</td>
+              <td>${w.embed || (!w.canExpose && !w.exposed) ? "" : `<button class="website-expose-switch${w.exposed ? " is-exposed" : ""}" role="switch" aria-checked="${w.exposed ? "true" : "false"}" title="${w.exposed ? `Exposed at ${esc(w.embedPath)} (click to stop)` : "Expose from llm3"}" data-website-action="expose" data-id="${w.id}"><span></span></button>`}</td>
               <td class="table-actions">
                 <button class="btn-icon" title="Settings" data-website-action="settings" data-id="${w.id}">
                   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>

@@ -168,7 +168,7 @@
       list.innerHTML = "<ul>" + sites.map((site) => {
         const icon = site.iconPath ? `<path d="${esc(site.iconPath)}"/>` : GLOBE;
         const cat = `<span class="cat">${esc(site.category)}</span>`;
-        const meta = site.embedded ? `${cat} · inside llm3` : cat;
+        const meta = site.exposed ? `${cat} · via llm3` : cat;
         return `<li><a class="fav" href="${esc(safeHref(site.url))}" style="--icon:${nameColor(site.name)}">
           <span class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${icon}</svg></span>
           <span class="text"><span class="name" style="display:block">${esc(site.name)}</span><span class="meta" style="display:block">${meta}</span></span>

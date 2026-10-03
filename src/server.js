@@ -1236,9 +1236,21 @@ websitesDb.exec(`
 `);
 // Favorites sort first on the Websites tab. Added after the table shipped, so
 // older databases get the column here.
-if (!websitesDb.prepare("PRAGMA table_info(websites)").all().some((c) => c.name === "favorite")) {
-  websitesDb.exec("ALTER TABLE websites ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0");
+// "Expose from llm3": exposed rows are served at /embed/<expose_slug>/. The
+// slug stays with the row when it is hidden again, so its address never moves.
+{
+  const columns = new Set(websitesDb.prepare("PRAGMA table_info(websites)").all().map((c) => c.name));
+  if (!columns.has("favorite")) {
+    websitesDb.exec("ALTER TABLE websites ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!columns.has("exposed")) {
+    websitesDb.exec("ALTER TABLE websites ADD COLUMN exposed INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!columns.has("expose_slug")) {
+    websitesDb.exec("ALTER TABLE websites ADD COLUMN expose_slug TEXT NOT NULL DEFAULT ''");
+  }
 }
+websitesDb.exec("CREATE TABLE IF NOT EXISTS websites_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
 // Seed if empty (first run)
 try {
   const count = websitesDb.prepare("SELECT COUNT(*) as cnt FROM websites").get();
@@ -1331,23 +1343,82 @@ function buildVoiceSlotDefinition(index) {
 // and is called cross-origin by the Immich UI, so it stays open.
 app.use(createDashboardAuth({ token: DASHBOARD_AUTH_TOKEN, exempt: ["/api/pm2/control"] }));
 
-// Embedded LAN sites, reverse-proxied so the Websites tab can frame them on
-// llm3's own origin. Mounted BEFORE express.json so the request body streams
-// through untouched (uploads, POSTs the site forwards). See embed_proxy.js
-// for why this is a server-side proxy and not a direct iframe, and why it is
-// intentionally unguarded here (nginx gates the public origin). The sites come
-// from LLM3_EMBED_SITES in .env only; the public code names none. A site works
-// under its mount only if its pages use relative URLs.
-const { createEmbedProxy, parseEmbedSites, embedPathForWebsite } = require("./embed_proxy");
-const EMBED_PROXIES = parseEmbedSites(process.env.LLM3_EMBED_SITES);
-// Embed site names whose Websites row opens inside llm3 on a normal click
-// (not in a new tab). From .env only, like LLM3_EMBED_SITES.
-const EMBED_OPEN_DEFAULT = new Set(
-  String(process.env.LLM3_EMBED_OPEN_DEFAULT || "").split(",").map((s) => s.trim()).filter(Boolean)
+// Websites exposed from llm3, reverse-proxied at /embed/<slug>/ on llm3's own
+// origin. Which rows, and their slugs, live in the websites database (the
+// "Expose from llm3" toggle), so the public code names no site. Mounted BEFORE
+// express.json so the request body streams through untouched (uploads, POSTs
+// the site forwards). See embed_proxy.js for why this is a server-side proxy.
+// A site works under its mount only if its pages use relative URLs.
+const {
+  createEmbedRouter,
+  parseEmbedSites,
+  embedPathForWebsite,
+  embedMountPath,
+  slugForWebsiteName,
+  upstreamForWebsite,
+} = require("./embed_proxy");
+// LLM3_EMBED_SITES (.env) is only imported once, see importEmbedSitesOnce.
+const EMBED_ENV_SITES = parseEmbedSites(process.env.LLM3_EMBED_SITES);
+const websitesGetExposedBySlug = websitesDb.prepare(
+  "SELECT * FROM websites WHERE exposed = 1 AND expose_slug = ?"
 );
-for (const proxy of EMBED_PROXIES) {
-  app.use(createEmbedProxy(proxy));
+const websitesTakenSlugs = websitesDb.prepare(
+  "SELECT id, expose_slug FROM websites WHERE expose_slug <> ''"
+);
+const websitesSetExposed = websitesDb.prepare(
+  "UPDATE websites SET exposed = ?, expose_slug = ? WHERE id = ?"
+);
+const websitesMetaGet = websitesDb.prepare("SELECT value FROM websites_meta WHERE key = ?");
+const websitesMetaSet = websitesDb.prepare(
+  "INSERT INTO websites_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+);
+
+// llm3's own address is never exposed through itself: the request would loop.
+function isLlm3OwnUrl(website) {
+  const upstream = upstreamForWebsite(website);
+  if (!upstream || upstream.upstreamPort !== PORT) return false;
+  return upstream.upstreamHost === "127.0.0.1" || LOCAL_IPV4_ADDRESSES.has(upstream.upstreamHost);
 }
+
+function canExposeWebsite(website) {
+  return Boolean(upstreamForWebsite(website)) && !isLlm3OwnUrl(website);
+}
+
+function exposedEmbedPath(website) {
+  return website?.exposed && website.expose_slug ? embedMountPath(website.expose_slug) + "/" : null;
+}
+
+// Before the toggle, the exposed sites were the LLM3_EMBED_SITES list. Bring
+// that list into the database once, keeping each site's /embed/<name>/
+// address; after that the toggle alone decides, so hiding a site sticks.
+// An entry with no row on its port gets one, so no exposed site disappears.
+function importEmbedSitesOnce() {
+  if (websitesMetaGet.get("embed_env_imported")) return;
+  const rows = websitesList.all();
+  const taken = new Set(websitesTakenSlugs.all().map((r) => r.expose_slug));
+  for (const site of EMBED_ENV_SITES) {
+    const slug = site.mountPath.split("/")[2];
+    if (taken.has(slug)) continue;
+    let row = rows.find((w) => embedPathForWebsite(w, [site], LOCAL_IPV4_ADDRESSES));
+    if (!row) {
+      const info = websitesInsert.run(site.cardTitle || slug, `http://127.0.0.1:${site.upstreamPort}`, "", "Embedded");
+      row = { id: info.lastInsertRowid };
+    }
+    websitesSetExposed.run(1, slug, row.id);
+    taken.add(slug);
+  }
+  websitesMetaSet.run("embed_env_imported", new Date().toISOString());
+}
+try {
+  importEmbedSitesOnce();
+} catch (error) {
+  console.warn(`Importing LLM3_EMBED_SITES into the websites database failed: ${error.message}`);
+}
+
+app.use(createEmbedRouter((slug) => {
+  const website = websitesGetExposedBySlug.get(slug);
+  return website && canExposeWebsite(website) ? upstreamForWebsite(website) : null;
+}));
 
 app.use(express.json({ limit: "25mb" }));
 
@@ -1967,7 +2038,7 @@ app.get("/api/websites", async (_req, res) => {
       rows.map(async (w) => {
         const health = await checkWebsiteHealth(w);
         const pm2 = getPm2MetadataForWebsite(w, { wakerPm2App: health.waker?.pm2App || "" });
-        const embedPath = embedPathForWebsite(w, EMBED_PROXIES, LOCAL_IPV4_ADDRESSES);
+        const embedPath = exposedEmbedPath(w);
         const iconPath = typeof websiteIcons[w.name] === "string" ? websiteIcons[w.name] : null;
         return {
           ...w,
@@ -1978,8 +2049,9 @@ app.get("/api/websites", async (_req, res) => {
           wakerName: health.waker?.waker || null,
           pm2,
           pm2App: pm2?.name || null,
+          exposed: Boolean(embedPath),
+          canExpose: canExposeWebsite(w),
           embedPath,
-          embedDefault: Boolean(embedPath && EMBED_OPEN_DEFAULT.has(embedPath.split("/")[2])),
           iconPath,
         };
       })
@@ -1999,7 +2071,7 @@ const websitesFavorites = websitesDb.prepare(
 );
 
 function favoriteOpenUrl(website, embedPath) {
-  if (embedPath && EMBED_OPEN_DEFAULT.has(embedPath.split("/")[2])) return embedPath;
+  if (embedPath) return embedPath;
   if (String(website.external_url || "").trim()) return website.external_url.trim();
   const lanHost = String(website.machine_ip || "").trim() || getLanIp() || "127.0.0.1";
   return String(website.internal_url || "").replace(/\/\/(127\.0\.0\.1|localhost)(?=[:/]|$)/, `//${lanHost}`);
@@ -2011,13 +2083,13 @@ app.get("/api/websites/favorites", async (req, res) => {
     const websiteIcons = loadWebsiteIcons();
     const rows = await Promise.all(
       websitesFavorites.all().map(async (w) => {
-        const embedPath = embedPathForWebsite(w, EMBED_PROXIES, LOCAL_IPV4_ADDRESSES);
+        const embedPath = exposedEmbedPath(w);
         const row = {
           id: w.id,
           name: w.name,
           category: w.category,
           url: favoriteOpenUrl(w, embedPath),
-          embedded: Boolean(embedPath && EMBED_OPEN_DEFAULT.has(embedPath.split("/")[2])),
+          exposed: Boolean(embedPath),
           iconPath: typeof websiteIcons[w.name] === "string" ? websiteIcons[w.name] : null,
         };
         if (withStatus) {
@@ -2038,18 +2110,53 @@ app.get(["/fav", "/fav/"], (_req, res) => {
   res.sendFile(path.join(__dirname, "..", "public", "fav.html"));
 });
 
-// Pinned Websites-tab cards for embed sites that carry a card title in .env.
-// Negative ids keep them apart from database rows.
+// Pinned Websites-tab cards for LLM3_EMBED_SITES entries that carry a card
+// title in .env, shown while that slug is exposed. Negative ids keep them
+// apart from database rows.
 app.get("/api/embed-sites", (_req, res) => {
   res.json(
-    EMBED_PROXIES.filter((site) => site.cardTitle).map((site, index) => ({
-      id: -1001 - index,
-      name: site.cardTitle,
-      embed: site.mountPath + "/",
-      category: "Embedded",
-      online: true,
-    }))
+    EMBED_ENV_SITES.map((site, index) => ({ site, index }))
+      .filter(({ site }) => site.cardTitle && websitesGetExposedBySlug.get(site.mountPath.split("/")[2]))
+      .map(({ site, index }) => ({
+        id: -1001 - index,
+        name: site.cardTitle,
+        embed: site.mountPath + "/",
+        category: "Embedded",
+        online: true,
+      }))
   );
+});
+
+// "Expose from llm3" toggle. The first expose gives the row a slug from its
+// name; hiding keeps the slug, so a later expose brings back the same address.
+app.post("/api/websites/expose", (req, res) => {
+  const { id, exposed } = req.body || {};
+  if (!id || typeof exposed !== "boolean") {
+    return res.status(400).json({ error: "id and a boolean exposed are required" });
+  }
+  try {
+    const website = websitesGetOne.get(id);
+    if (!website) {
+      return res.status(404).json({ error: "website not found" });
+    }
+    if (exposed && !canExposeWebsite(website)) {
+      return res.status(400).json({
+        error: isLlm3OwnUrl(website)
+          ? "llm3 cannot expose itself."
+          : "The internal URL must be an http:// or https:// address.",
+      });
+    }
+    let slug = website.expose_slug;
+    if (exposed && !slug) {
+      const taken = new Set(websitesTakenSlugs.all().filter((r) => r.id !== website.id).map((r) => r.expose_slug));
+      slug = slugForWebsiteName(website.name, taken);
+    }
+    websitesSetExposed.run(exposed ? 1 : 0, slug || "", website.id);
+    const embedPath = exposed ? embedMountPath(slug) + "/" : null;
+    res.json({ ok: true, id: website.id, exposed, embedPath });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // Control endpoint: start/stop/restart a PM2-managed website
