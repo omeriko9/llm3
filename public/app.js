@@ -956,6 +956,8 @@ const els = {
   ctxInternal: $("#ctxInternal"),
   ctxExternal: $("#ctxExternal"),
   ctxEmbed: $("#ctxEmbed"),
+  ctxFavorite: $("#ctxFavorite"),
+  ctxFavoriteText: $("#ctxFavoriteText"),
   ctxDelete: $("#ctxDelete"),
   ctxControl: $("#ctxControl"),
   ctxControlText: $("#ctxControlText"),
@@ -1102,6 +1104,10 @@ function wireEvents() {
     const w = state.websites.find((we) => we.id === state.websiteContext.id);
     hideWebsiteContextMenu();
     if (w?.embedPath) openEmbedOverlay(w.embedPath, w.name);
+  });
+  els.ctxFavorite?.addEventListener("click", () => {
+    hideWebsiteContextMenu();
+    toggleWebsiteFavorite(state.websiteContext.id);
   });
   els.ctxControl?.addEventListener("click", () => controlWebsite(state.websiteContext.id));
   els.ctxDelete?.addEventListener("click", () => deleteWebsite(state.websiteContext.id));
@@ -4239,8 +4245,11 @@ function renderWebsites() {
     });
   });
 
-  // Filter by active category (or "All")
-  const filtered = activeCat === "All" ? searched : searched.filter((w) => w.category === activeCat);
+  // Filter by active category (or "All"). Favorites go first; the sort is
+  // stable, so each group keeps the server's category/name order.
+  const filtered = (activeCat === "All" ? searched : searched.filter((w) => w.category === activeCat))
+    .slice()
+    .sort((a, b) => Number(Boolean(b.favorite)) - Number(Boolean(a.favorite)));
 
   if (!filtered.length) {
     els.websitesGrid.innerHTML = `<p class="websites-empty">${
@@ -4289,8 +4298,24 @@ function renderWebsites() {
         <span class="website-card-cat">${esc(w.category)}</span>
         ${lanBadge}
         ${onlineDot}
+        ${websiteFavoriteStar(w)}
       </a>`;
   }).join("");
+
+  // The star toggles the favorite. It sits inside the card's link, so it must
+  // stop the click before the link navigates or the embed overlay opens.
+  els.websitesGrid.querySelectorAll(".website-fav-star").forEach((star) => {
+    const toggle = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleWebsiteFavorite(Number(star.closest(".website-card").dataset.id));
+    };
+    star.addEventListener("click", toggle);
+    star.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") toggle(e);
+    });
+    star.addEventListener("contextmenu", (e) => e.stopPropagation());
+  });
 
   // Embedded cards open the in-page iframe overlay.
   els.websitesGrid.querySelectorAll(".website-card-embed").forEach((card) => {
@@ -4418,6 +4443,9 @@ function showWebsiteContextMenu(x, y, id) {
   els.ctxExternal?.classList.toggle("ctx-disabled", !w || !w.external_url || w.external_url.trim() === "");
   // Only rows llm3 reverse-proxies (see EMBED_PROXIES in server.js) can open inside it.
   els.ctxEmbed?.classList.toggle("hidden", !w?.embedPath);
+  if (els.ctxFavoriteText) {
+    els.ctxFavoriteText.textContent = w?.favorite ? "Remove from favorites" : "Add to favorites";
+  }
   // Set control button text: Start if offline, Restart if online
   if (w) {
     els.ctxControlText.textContent = w.online ? "Restart" : "Start";
@@ -4429,6 +4457,33 @@ function showWebsiteContextMenu(x, y, id) {
   const menuHeight = menu.offsetHeight || 140;
   menu.style.left = Math.max(0, Math.min(x, window.innerWidth - menuWidth)) + "px";
   menu.style.top = Math.max(0, Math.min(y, window.innerHeight - menuHeight)) + "px";
+}
+
+// A span, not a button: the card is an <a>, and a button inside a link is
+// invalid HTML.
+function websiteFavoriteStar(w) {
+  const label = w.favorite ? `Remove ${w.name} from favorites` : `Add ${w.name} to favorites`;
+  return `<span class="website-fav-star${w.favorite ? " is-favorite" : ""}" role="button" tabindex="0" aria-pressed="${w.favorite ? "true" : "false"}" title="${esc(label)}" aria-label="${esc(label)}"><svg viewBox="0 0 24 24" stroke-width="2" stroke-linejoin="round"><path d="M12 2.5l2.94 5.96 6.58.96-4.76 4.64 1.12 6.55L12 17.52l-5.88 3.09 1.12-6.55L2.48 9.42l6.58-.96z"/></svg></span>`;
+}
+
+// Optimistic: the card moves at once, and goes back if the server refuses.
+async function toggleWebsiteFavorite(id) {
+  const w = state.websites.find((we) => we.id === id);
+  if (!w || w.embed) return;
+  const favorite = !w.favorite;
+  w.favorite = favorite;
+  renderWebsites();
+  try {
+    await fetchJson("/api/websites/favorite", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id, favorite }),
+    });
+  } catch (error) {
+    w.favorite = !favorite;
+    renderWebsites();
+    showToast(`Favorite not saved: ${error.message}`, 5000);
+  }
 }
 
 function hideWebsiteContextMenu() {

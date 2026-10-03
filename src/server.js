@@ -1234,6 +1234,11 @@ websitesDb.exec(`
     updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
   )
 `);
+// Favorites sort first on the Websites tab. Added after the table shipped, so
+// older databases get the column here.
+if (!websitesDb.prepare("PRAGMA table_info(websites)").all().some((c) => c.name === "favorite")) {
+  websitesDb.exec("ALTER TABLE websites ADD COLUMN favorite INTEGER NOT NULL DEFAULT 0");
+}
 // Seed if empty (first run)
 try {
   const count = websitesDb.prepare("SELECT COUNT(*) as cnt FROM websites").get();
@@ -1261,6 +1266,9 @@ const websitesInsert = websitesDb.prepare(
 );
 const websitesUpdate = websitesDb.prepare(
   "UPDATE websites SET name = ?, internal_url = ?, external_url = ?, category = ?, updated_at = datetime('now') WHERE id = ?"
+);
+const websitesSetFavorite = websitesDb.prepare(
+  "UPDATE websites SET favorite = ? WHERE id = ?"
 );
 const websitesDelete = websitesDb.prepare(
   "DELETE FROM websites WHERE id = ?"
@@ -1381,6 +1389,22 @@ app.post("/api/websites/update", (req, res) => {
   try {
     websitesUpdate.run(name, internal_url, external_url, category, id);
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/api/websites/favorite", (req, res) => {
+  const { id, favorite } = req.body || {};
+  if (!id || typeof favorite !== "boolean") {
+    return res.status(400).json({ error: "id and a boolean favorite are required" });
+  }
+  try {
+    const result = websitesSetFavorite.run(favorite ? 1 : 0, id);
+    if (!result.changes) {
+      return res.status(404).json({ error: "website not found" });
+    }
+    res.json({ ok: true, id, favorite });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1947,6 +1971,7 @@ app.get("/api/websites", async (_req, res) => {
         const iconPath = typeof websiteIcons[w.name] === "string" ? websiteIcons[w.name] : null;
         return {
           ...w,
+          favorite: Boolean(w.favorite),
           online: health.online,
           sleeping: health.sleeping,
           waking: Boolean(health.waker?.waking),

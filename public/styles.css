@@ -7215,6 +7215,45 @@ button.home-indicator:not(:disabled):hover {
   right: 0.25rem;
 }
 
+/* Favorite star, top-left (the Local badge holds top-right). Empty outline
+   until it is a favorite, then a full yellow star. */
+.website-fav-star {
+  position: absolute;
+  top: 0.2rem;
+  left: 0.2rem;
+  width: 20px;
+  height: 20px;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.website-fav-star svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+}
+
+.website-fav-star:hover,
+.website-fav-star:focus-visible {
+  color: #facc15;
+  outline: none;
+  background: rgba(250,204,21,0.12);
+}
+
+.website-fav-star.is-favorite {
+  color: #facc15;
+}
+
+.website-fav-star.is-favorite svg {
+  fill: #facc15;
+}
+
 /* Online/Offline status dot */
 .website-status-dot {
   width: 8px;
